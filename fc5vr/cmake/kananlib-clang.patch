@@ -1,0 +1,15 @@
+﻿diff --git a/src/RTTI.cpp b/src/RTTI.cpp
+index 37b767f..94a85ed 100644
+--- a/src/RTTI.cpp
++++ b/src/RTTI.cpp
+@@ -2,6 +2,10 @@
+ 
+ // Include MSVC internal RTTI headers
+ #include <vcruntime.h>
++#ifdef __clang__
++// clang-cl doesn't have these hardcoded types available, correct ehdata_forceinclude.h that relies on it
++#define _ThrowInfo ThrowInfo
++#endif
+ #include <rttidata.h>
+ 
+ #include <regex>

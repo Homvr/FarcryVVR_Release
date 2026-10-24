@@ -1,0 +1,34 @@
+FAR CRY 5 VR MOD - ACKNOWLEDGMENTS
+
+This mod exists thanks to the work, tools and generosity of many people. Thank you all.
+
+COMMUNITY
+- The Flat2VR Discord and its people: for the encouragement, the advice, the testing and the shared know-how
+  that keep flat-to-VR modding alive.
+- Everyone who tested the early builds and sent logs, videos and feedback.
+
+CODE THIS MOD IS BUILT ON
+- VR Framework by mutars (MIT licence), from the fork by Fribur (https://github.com/Fribur/vrframework), and
+  starfield2vr, whose project skeleton this mod started from. Both are based on praydog's REFramework
+  (https://github.com/praydog/REFramework).
+- Dishonored VR by VR-Stereo-Hub (https://github.com/VR-Stereo-Hub/Dishonored-VR): its alternate-eye (AFW)
+  design, per-eye DLAA work and in-game menu shaped this mod's.
+- fc5-dlss by HenDGS (https://github.com/HenDGS/fc5-dlss), built on Luma Framework by Filippo Tarpini (Filoppi,
+  https://github.com/Filoppi/Luma-Framework): the reference for DLSS in Far Cry 5 and its shader ids.
+- CryHook5 by Force67 (https://github.com/Force67/CryHook5): the route into Far Cry 5's own script engine.
+
+LIBRARIES AND SDKS
+- Khronos OpenXR SDK and loader, NVIDIA DLSS (NGX) SDK, NVIDIA Streamline, AMD FidelityFX, Valve OpenVR.
+- ViGEmBus and ViGEmClient by Benjamin Hoeglinger-Stelzer (nefarius, https://github.com/nefarius/ViGEmBus).
+- Dear ImGui (Omar Cornut), ImGuizmo (Cedric Guillemet), spdlog (Gabi Melman), MinHook (Tsuda Kageyu),
+  SafetyHook and kananlib (cursey), Zydis (zyantific), bddisasm (Bitdefender), xbyak (herumi), GLM (G-Truc),
+  JSON for Modern C++ (Niels Lohmann), DirectXTK and DirectXTK12 (Microsoft).
+
+PRIOR ART THAT INSPIRED IT
+- praydog's UEVR and REFramework, and PureDark's alternate-eye (AFW) and upscaler work.
+- Luke Ross and his R.E.A.L. VR mods.
+- The Helix Mod and 3DMigoto stereo community (DarkStarSword and others), whose Far Cry 4 and Far Cry Primal
+  stereo fixes showed which Dunia engine effects need care in each eye.
+- VR-Stereo-Hub's other ports (BioShock trilogy VR, Far Cry 3 VR), and Pande4360's scope work for UEVR.
+
+Far Cry 5 is a trademark of Ubisoft. This is an unofficial fan mod, not made or endorsed by Ubisoft or NVIDIA.

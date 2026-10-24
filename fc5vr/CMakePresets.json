@@ -1,0 +1,186 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 27,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "environment": {
+        "WINDOWS_FLAGS": "-DWIN32_LEAN_AND_MEAN -DNOMINMAX"
+      },
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "/EHsc /fp:contract /fp:except-  /W4 /Zc:__cplusplus /D_ITERATOR_DEBUG_LEVEL=0 $env{COMPILER_FLAGS} $env{WINDOWS_FLAGS} $penv{CXXFLAGS}",
+        "CMAKE_SHARED_LINKER_FLAGS": "$env{COMMONLIBSF_LINKER} $penv{SHARED_LINKER_FLAGS}",
+        "USE_STARFIELD_SDK_LITE": "ON",
+        "SFVR_EXPERIMENTAL": "OFF",
+        "SIGNATURE_SCAN": "ON",
+        "USE_DXGI_HOOK": "ON",
+        "POLYHOOK2_FUNCTION_HOOK": "OFF"
+      },
+      "cmakeExecutable": "C:/Program Files/CMake/bin/cmake.exe",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    {
+      "name": "clang-cl",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_C_COMPILER": "clang-cl"
+      },
+      "environment": {
+        "COMPILER_FLAGS": "/cgthreads:8 -fms-extensions -fdelayed-template-parsing -Wno-unused-private-field -Wno-unused-parameter -Wno-overloaded-virtual -Wno-delete-non-abstract-non-virtual-dtor -Wno-unused-command-line-argument"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "intelliSenseMode": "windows-clang-x64",
+          "enableMicrosoftCodeAnalysis": true,
+          "enableClangTidyCodeAnalysis": true
+        }
+      }
+    },
+    {
+      "name": "msvc",
+      "hidden": true,
+      "generator": "Ninja",
+      "environment": {
+        "COMPILER_FLAGS": "/favor:blend /Zc:enumTypes /Zc:preprocessor /Zc:templateScope",
+        "COMMONLIBSF_LINKER": "/CGTHREADS:8 /MACHINE:x64 /DEBUG:FULL"
+      },
+      "vendor": {
+        "microsoft.com/VisualStudioSettings/CMake/1.0": {
+          "intelliSenseMode": "windows-msvc-x64",
+          "enableMicrosoftCodeAnalysis": true
+        }
+      }
+    },
+    {
+      "name": "build-release-clang-cl",
+      "inherits": ["base", "clang-cl"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "/fp:fast /GR- /Gw /O2"
+      }
+    },
+    {
+      "name": "build-debug-clang-cl",
+      "inherits": ["base", "clang-cl"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS_DEBUG": "/Zi"
+      }
+    },
+    {
+      "name": "build-release-msvc",
+      "inherits": ["base", "msvc"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "/fp:fast /GR- /Gw /O2 /Ob3 /Qpar",
+        "CMAKE_SHARED_LINKER_FLAGS_RELWITHDEBINFO": "/LTCG:INCREMENTAL /OPT:ICF=4"
+      }
+    },
+    {
+      "name": "build-debug-msvc",
+      "inherits": [ "base", "msvc" ],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS_DEBUG": "/Zi",
+        "CMAKE_SHARED_LINKER_FLAGS_DEBUG": "/DEBUGTYPE:FIXUP /INCREMENTAL:NO"
+      }
+    },
+    {
+      "name": "build-release-no-debug-clang-cl",
+      "inherits": ["base", "clang-cl"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS_RELEASE": "/O3 /fp:fast /GR- /Gw /DNDEBUG -flto -ffast-math -fvectorize -fslp-vectorize -funroll-loops -march=native",
+        "CMAKE_SHARED_LINKER_FLAGS_RELEASE": "-flto"
+      }
+    },
+    {
+      "name": "build-release-no-debug-clang-cl-xbox",
+      "inherits": ["base", "clang-cl"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS_RELEASE": "/O3 /fp:fast /GR- /Gw /DNDEBUG -flto -ffast-math -fvectorize -fslp-vectorize -funroll-loops -march=native",
+        "CMAKE_SHARED_LINKER_FLAGS_RELEASE": "-flto",
+        "XBOX_STORE": "ON"
+      }
+    },
+    {
+      "name": "build-release-no-debug-msvc",
+      "inherits": ["base", "msvc"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS_RELEASE": "/Ox /Ot /GL /fp:fast /GR- /Gw /Gy /arch:AVX2 /MP /DNDEBUG",
+        "CMAKE_SHARED_LINKER_FLAGS_RELEASE": "/LTCG /OPT:ICF=4 /OPT:REF /INCREMENTAL:NO",
+        "USE_STARFIELD_SDK_LITE": "ON"
+      }
+    },
+    {
+      "name": "build-release-no-debug-msvc-xbox",
+      "inherits": ["base", "msvc"],
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS_RELEASE": "/Ox /Ot /GL /fp:fast /GR- /Gw /Gy /arch:AVX2 /MP /DNDEBUG",
+        "CMAKE_SHARED_LINKER_FLAGS_RELEASE": "/LTCG /OPT:ICF=4 /OPT:REF /INCREMENTAL:NO",
+        "XBOX_STORE": "ON",
+        "USE_STARFIELD_SDK_LITE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "release-msvc",
+      "displayName": "1. Release (MSVC)",
+      "configurePreset": "build-release-msvc",
+      "description": "Optimized release build with debug info."
+    },
+    {
+      "name": "debug-msvc",
+      "displayName": "2. Debug (MSVC)",
+      "configurePreset": "build-debug-msvc",
+      "description": "Debug build."
+    },
+    {
+      "name": "release-clang-cl",
+      "displayName": "3. Release (clang-cl)",
+      "configurePreset": "build-release-clang-cl",
+      "description": "Optimized release build with debug info."
+    },
+    {
+      "name": "debug-clang-cl",
+      "displayName": "4. Debug (clang-cl)",
+      "configurePreset": "build-debug-clang-cl",
+      "description": "Debug build."
+    },
+    {
+      "name": "release-no-debug-msvc",
+      "displayName": "5. Release without debug symbols (MSVC)",
+      "configurePreset": "build-release-no-debug-msvc",
+      "description": "Optimized release build without debug symbols."
+    },
+    {
+      "name": "release-no-debug-msvc-xbox",
+      "displayName": "6. Release without debug symbols (MSVC) xbox",
+      "configurePreset": "build-release-no-debug-msvc-xbox",
+      "description": "Optimized release build(dxgi) without debug symbols."
+    },
+    {
+      "name": "release-no-debug-clang-cl",
+      "displayName": "7. Release without debug symbols (clang-cl)",
+      "configurePreset": "build-release-no-debug-clang-cl",
+      "description": "Optimized release build without debug symbols."
+    },
+    {
+      "name": "release-no-debug-clang-cl-xbox",
+      "displayName": "8. Release without debug symbols (clang-cl) xbox",
+      "configurePreset": "build-release-no-debug-clang-cl-xbox",
+      "description": "Optimized release build(dxgi hook) without debug symbols."
+    }
+  ]
+}

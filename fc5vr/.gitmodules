@@ -1,0 +1,6 @@
+[submodule "extern/CommonLibSF"]
+	path = extern/CommonLibSF
+	url = https://github.com/mutars/CommonLibSF.git
+[submodule "extern/vrframework"]
+	path = extern/vrframework
+	url = https://github.com/Fribur/vrframework.git

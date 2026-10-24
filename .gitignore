@@ -1,0 +1,4 @@
+fc5vr/build/
+launcher/out/
+deps/ngx/*
+!deps/ngx/PUT_DLSS_SDK_HERE.txt

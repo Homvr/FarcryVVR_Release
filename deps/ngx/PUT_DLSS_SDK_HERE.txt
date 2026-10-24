@@ -1,0 +1,1 @@
+Put the NVIDIA DLSS SDK files here (include\, lib\Windows_x86_64\nvsdk_ngx_d.lib, nvngx_dlss.dll): see BUILDING.md.
