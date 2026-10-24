@@ -35,12 +35,116 @@ static void fc5_window_title(HWND w, char* out, int n)
     if (fn && fn(w, wide, 256) > 0) WideCharToMultiByte(CP_UTF8, 0, wide, -1, out, n, nullptr, nullptr);
 }
 
+// D3D11 can switch the immediate context to other methods after the mod hooked it. With OFXR Bridge armed the
+// context's (heap) method table gets new entries twice when OFXR binds its D3D11 bridge; the new methods wrap the
+// previous set's, never the originals, so the mod's hooks never ran: no views, the game stayed flat (24 Oct).
+// ctxvar hooks the current entry of each hooked method with the same handler and unhooks the set it replaced
+// (hooking both ran the handler again inside the wrapper, without end); call_orig calls the current set's original.
+namespace fc5::ctxvar
+{
+    constexpr int kSlots = 149;   // ID3D11DeviceContext4
+    struct Variant { void* target; safetyhook::InlineHook hook; };
+    struct Slot { int idx; void* handler; safetyhook::InlineHook* primary; };
+    static std::atomic<Variant*> g_cur[kSlots];   // the current set's hook; replaced on the render thread, never freed
+    static std::atomic<bool>     g_any{ false };
+    static std::atomic<uint64_t> g_nested{ 0 };
+    static std::vector<Slot>     g_slots;
+    static int                   g_switches = 0;
+    thread_local int             t_depth[kSlots]{};
+
+    static void add(int idx, safetyhook::InlineHook* primary, void* handler)
+    {
+        if (idx >= 0 && idx < kSlots && primary && *primary) g_slots.push_back({ idx, handler, primary });
+    }
+
+    // Code in a loaded module (d3d11.dll's method sets); the recorder's own thunks are private memory.
+    static bool in_image(void* fn)
+    {
+        MEMORY_BASIC_INFORMATION mbi{};
+        return VirtualQuery(fn, &mbi, sizeof(mbi)) && mbi.Type == MEM_IMAGE;
+    }
+
+    static std::string module_of(void* fn)
+    {
+        HMODULE m = nullptr;
+        char    name[MAX_PATH]{};
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)fn, &m) && m)
+            GetModuleFileNameA(m, name, MAX_PATH);
+        const char* base = std::strrchr(name, '\\');
+        return fmt::format("{}+{:x}", base ? base + 1 : (name[0] ? name : "?"), m ? (uintptr_t)fn - (uintptr_t)m : (uintptr_t)fn);
+    }
+
+    // Once per frame on the render thread, outside any context call. The entries are compared one by one: the
+    // table pointer stays while its entries change. D3D11 also flips some methods to another set and back within a
+    // frame or two (16 of them, about twice a second while loading, also without OFXR): only an entry that stays
+    // on the same function for kStable frames is followed, so those flips are left alone as before ctxvar.
+    constexpr int kStable = 30;
+    static void* g_cand[kSlots];
+    static int   g_cand_n[kSlots];
+    static int   g_flips = 0;
+
+    static void check(ID3D11DeviceContext* imm)
+    {
+        if (g_slots.empty()) return;
+        void** vt = *reinterpret_cast<void***>(imm);
+        static uint64_t n = 0;
+        if (++n % 1800 == 1 && g_any.load()) {
+            spdlog::info("[Ctx] check {}: {} switches followed, {} short flips ignored, {} nested calls passed to the inner set", n,
+                         g_switches, g_flips, g_nested.load());
+        }
+        int back = 0, added = 0, failed = 0, due = 0;
+        std::string first;
+        for (const auto& s : g_slots) {
+            void*    fn   = vt[s.idx];
+            Variant* cur  = g_cur[s.idx].load(std::memory_order_acquire);
+            void*    have = cur ? cur->target : nullptr;
+            void*    want = fn == s.primary->target() ? nullptr : fn;
+            if (want == have || (want && !in_image(want))) {
+                // Settled (or the recorder's thunks): a candidate that did not last was a flip.
+                if (g_cand_n[s.idx] > 0) { g_cand_n[s.idx] = 0; g_flips++; }
+                continue;
+            }
+            if (g_cand[s.idx] != want) { g_cand[s.idx] = want; g_cand_n[s.idx] = 0; }
+            if (++g_cand_n[s.idx] < kStable) continue;
+            g_cand_n[s.idx] = 0;
+            due++;
+            if (cur) { g_cur[s.idx].store(nullptr, std::memory_order_release); cur->hook.reset(); }
+            if (!want) { back++; continue; }
+            auto hook = safetyhook::create_inline(want, s.handler);
+            if (!hook) { failed++; continue; }
+            if (first.empty()) first = fmt::format(" (#{}: {} -> {})", s.idx, module_of(have ? have : s.primary->target()), module_of(want));
+            g_cur[s.idx].store(new Variant{ want, std::move(hook) }, std::memory_order_release);
+            g_any = true;
+            added++;
+        }
+        if (due == 0) return;
+        g_switches++;
+        spdlog::info("[Ctx] immediate context methods switched (table {}): {} of {} hooked methods followed to a new set{}, {} back on "
+                     "the originals, {} failed", (void*)vt, added, g_slots.size(), first, back, failed);
+    }
+}
+
 // The original of a hooked context method: the deferred context's own while recording (stereo
-// research), else the hook's trampoline.
+// research), the current set's own after D3D11 switched the immediate context (ctxvar), else the hook's trampoline.
 template <typename R, typename... A>
 static R call_orig(safetyhook::InlineHook& h, int idx, ID3D11DeviceContext* ctx, A... a)
 {
     if (fc5::rec::is_deferred(ctx)) return reinterpret_cast<R(STDMETHODCALLTYPE*)(ID3D11DeviceContext*, A...)>(fc5::rec::deferred_method(idx))(ctx, a...);
+    if (fc5::ctxvar::g_any.load(std::memory_order_relaxed)) {
+        void* fn = (*reinterpret_cast<void***>(ctx))[idx];
+        auto* v  = fc5::ctxvar::g_cur[idx].load(std::memory_order_acquire);
+        if (v && fn != h.target()) {
+            // Off the originals with a followed set: the hook that fired is that set's (also during a short flip to a
+            // set wrapping it), unless it fired inside that set's own call (it called the originals).
+            int& depth = fc5::ctxvar::t_depth[idx];
+            if (depth > 0) {
+                fc5::ctxvar::g_nested++;
+                return h.call<R>(ctx, a...);
+            }
+            struct Guard { int& d; ~Guard() { d--; } } g{ ++depth };
+            return v->hook.call<R>(ctx, a...);
+        }
+    }
     return h.call<R>(ctx, a...);
 }
 #include <ModSettings.h>
@@ -1571,6 +1675,24 @@ bool FarCry5Stereo::install_hooks(ID3D11Device* device)
     m_query_end_hook   = safetyhook::create_inline(ctx_vt[28], reinterpret_cast<void*>(&FarCry5Stereo::hk_query_end));
     // asmlog (research): OMSetRenderTargetsAndUnorderedAccessViews = 34, CopySubresourceRegion = 46, CopyResource = 47.
     asm_install_hooks(reinterpret_cast<void**>(ctx_vt));
+    {
+        // ctxvar: the same handlers for any later method set of the immediate context.
+        const std::pair<int, std::pair<safetyhook::InlineHook*, void*>> ctx_hooks[]{
+            { 14, { &m_map_hook, (void*)&FarCry5Stereo::hk_map } }, { 15, { &m_unmap_hook, (void*)&FarCry5Stereo::hk_unmap } },
+            { 33, { &m_om_set_rts_hook, (void*)&FarCry5Stereo::hk_om_set_rts } }, { 7, { &m_vs_cb_hook, (void*)&FarCry5Stereo::hk_vs_set_cbs } },
+            { 9, { &m_ps_set_hook, (void*)&FarCry5Stereo::hk_ps_set_shader } }, { 10, { &m_ps_samplers_hook, (void*)&FarCry5Stereo::hk_ps_set_samplers } },
+            { 41, { &m_dispatch_hook, (void*)&FarCry5Stereo::hk_dispatch } }, { 42, { &m_dispatch_ind_hook, (void*)&FarCry5Stereo::hk_dispatch_indirect } },
+            { 38, { &m_dauto_hook, (void*)&FarCry5Stereo::hk_draw_auto } }, { 39, { &m_dii_hook, (void*)&FarCry5Stereo::hk_draw_idx_inst_indirect } },
+            { 40, { &m_di_hook, (void*)&FarCry5Stereo::hk_draw_inst_indirect } }, { 69, { &m_cs_set_hook, (void*)&FarCry5Stereo::hk_cs_set_shader } },
+            { 48, { &m_update_sub_hook, (void*)&FarCry5Stereo::hk_update_subresource } }, { 12, { &m_draw_idx_hook, (void*)&FarCry5Stereo::hk_draw_indexed } },
+            { 13, { &m_draw_hook, (void*)&FarCry5Stereo::hk_draw } }, { 20, { &m_draw_idx_i_hook, (void*)&FarCry5Stereo::hk_draw_indexed_instanced } },
+            { 21, { &m_draw_i_hook, (void*)&FarCry5Stereo::hk_draw_instanced } }, { 53, { &m_clear_dsv_hook, (void*)&FarCry5Stereo::hk_clear_dsv } },
+            { 50, { &m_clear_rtv_hook, (void*)&FarCry5Stereo::hk_clear_rtv } }, { 51, { &m_clear_uavu_hook, (void*)&FarCry5Stereo::hk_clear_uav_uint } },
+            { 52, { &m_clear_uavf_hook, (void*)&FarCry5Stereo::hk_clear_uav_float } }, { 29, { &m_get_data_hook, (void*)&FarCry5Stereo::hk_get_data } },
+            { 30, { &m_set_pred_hook, (void*)&FarCry5Stereo::hk_set_predication } }, { 27, { &m_query_begin_hook, (void*)&FarCry5Stereo::hk_query_begin } },
+            { 28, { &m_query_end_hook, (void*)&FarCry5Stereo::hk_query_end } } };
+        for (const auto& [idx, hk] : ctx_hooks) fc5::ctxvar::add(idx, hk.first, hk.second);
+    }
     ctx->Release();
 
     install_scene_hook();
@@ -1612,6 +1734,7 @@ void FarCry5Stereo::install_scene_hook()
         }
     }
     fc5::bullet::install_speed_hook(base);   // bulletspeed (FarCry5BulletSpeed.cpp)
+    fc5::bullet::set_player_shot_callback([] { FarCry5Stereo::Get()->shot_buzz(); });   // shotbuzz
     // The frame function calls the scene at +0x4ccfc7 (E8 rel32 -> +0x4d3c70): checked so another
     // game build is refused instead of patched blindly.
     const uint8_t* call = base + 0x4ccfc7;
@@ -1806,7 +1929,7 @@ void WINAPI asm_hk_omuav(ID3D11DeviceContext* ctx, UINT n, ID3D11RenderTargetVie
         const DWORD rt = g_wd_render_tid.load();
         if (rt == 0 || GetCurrentThreadId() == rt) g_asm_bound = b;
     }
-    g_asm_omuav_hook.call<void>(ctx, n, rtvs, dsv, s0, nu, uavs, counts);
+    call_orig<void>(g_asm_omuav_hook, 34, ctx, n, rtvs, dsv, s0, nu, uavs, counts);
 }
 void asm_note_copy(ID3D11Resource* dst, ID3D11Resource* src)
 {
@@ -1828,12 +1951,12 @@ void asm_note_copy(ID3D11Resource* dst, ID3D11Resource* src)
 void WINAPI asm_hk_copyreg(ID3D11DeviceContext* ctx, ID3D11Resource* dst, UINT ds, UINT x, UINT y, UINT z, ID3D11Resource* src, UINT ss, const D3D11_BOX* box)
 {
     if (g_asm_log.load() > 0) asm_note_copy(dst, src);
-    g_asm_copyreg_hook.call<void>(ctx, dst, ds, x, y, z, src, ss, box);
+    call_orig<void>(g_asm_copyreg_hook, 46, ctx, dst, ds, x, y, z, src, ss, box);
 }
 void WINAPI asm_hk_copy(ID3D11DeviceContext* ctx, ID3D11Resource* dst, ID3D11Resource* src)
 {
     if (g_asm_log.load() > 0) asm_note_copy(dst, src);
-    g_asm_copy_hook.call<void>(ctx, dst, src);
+    call_orig<void>(g_asm_copy_hook, 47, ctx, dst, src);
 }
 }
 // asmlog: UpdateSubresource into the atlas.
@@ -1850,6 +1973,10 @@ void asm_install_hooks(void** vt)
     g_asm_omuav_hook   = safetyhook::create_inline(vt[34], reinterpret_cast<void*>(&asm_hk_omuav));
     g_asm_copyreg_hook = safetyhook::create_inline(vt[46], reinterpret_cast<void*>(&asm_hk_copyreg));
     g_asm_copy_hook    = safetyhook::create_inline(vt[47], reinterpret_cast<void*>(&asm_hk_copy));
+    fc5::ctxvar::add(58, &g_asm_exec_hook, reinterpret_cast<void*>(&asm_hk_exec));
+    fc5::ctxvar::add(34, &g_asm_omuav_hook, reinterpret_cast<void*>(&asm_hk_omuav));
+    fc5::ctxvar::add(46, &g_asm_copyreg_hook, reinterpret_cast<void*>(&asm_hk_copyreg));
+    fc5::ctxvar::add(47, &g_asm_copy_hook, reinterpret_cast<void*>(&asm_hk_copy));
 }
 namespace {
 void asm_flush(int frame, int call)
@@ -6281,9 +6408,10 @@ bool FarCry5Stereo::world_character_draw(ID3D11DeviceContext* ctx, UINT count, U
         if (!hide) m_body_spared++;
     }
     if (hide) {
-        // The player's body root, once per stereo pair (the anchor of "steady view while shooting").
+        // The player's body root, once per stereo pair (the anchor of "steady view while shooting"); afwroot: in AFW every
+        // frame, each its own game update.
         const int bf = m_frame.load();
-        if ((bf & 1) == 0 && m_body_root_frame != bf) {
+        if (((bf & 1) == 0 || (afw_mode() && m_afw_root_every.load())) && m_body_root_frame != bf) {
             m_body_root_prev       = m_body_root;
             m_body_root_prev_frame = m_body_root_frame;
             m_body_root            = origin;
@@ -6356,6 +6484,7 @@ bool FarCry5Stereo::weapon_draw(ID3D11DeviceContext* ctx, UINT count, UINT start
     m_hud_pending   = false;
     const bool skip = weapon_draw_impl(ctx, count, start, base, instances);
     if (!skip && m_skin_pose.load()) skin_pose_draw(ctx, count);   // skinpose: this weapon-pass draw's object constants moved (restored after it)
+    if (!skip && m_flame_world.load() && m_vs_cb0 && is_weapon_cb(m_vs_cb0) && !m_flame_cb_swapped) flame_cb_swap(ctx);   // flameworld: a weapon-pass particle draw in the world
     if (!skip && (fc5::skelhand::mode() > 0 || m_skh_stat.load())) skel_hand_draw(ctx, count);   // skelhand: the arms' root, the drawn gun's measure
     // asmfloor: a far-shadow tile copied into the atlas keeps its depth off the light's near plane (restored after the draw).
     if (!skip && m_asm_dsv_atlas && m_asm_floor.load() && !m_asm_floor_swapped) asm_floor_swap(ctx);
@@ -6482,7 +6611,7 @@ namespace
 // placed again before it is drawn.
 void FarCry5Stereo::gun_still_late_part(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base)
 {
-    if (m_skin_pose.load()) return;   // skinpose moves each weapon-pass draw itself
+    if (skin_pose_active()) return;   // skinpose moves each weapon-pass draw itself (Stereo only: saved on, it is idle in AFW, where the camera places the pass)
     if (skel_hand_active()) return;   // skelhand: the game holds the gun itself, the pass's camera is the eye's (FC2 VR thread, fc2-headset)
     const int fr = m_frame.load();
     float     obj[12]{};
@@ -6531,7 +6660,7 @@ void FarCry5Stereo::gun_still_late_part(ID3D11DeviceContext* ctx, UINT count, UI
 // with the gun's own pose (exact from here on), and a guess from a part is checked against it.
 void FarCry5Stereo::gun_still_late(ID3D11DeviceContext* ctx)
 {
-    if (m_skin_pose.load()) return;   // skinpose moves each weapon-pass draw itself
+    if (skin_pose_active()) return;   // skinpose moves each weapon-pass draw itself (Stereo only: saved on, it is idle in AFW, where the camera places the pass)
     if (skel_hand_active()) return;   // skelhand: the game holds the gun itself, the pass's camera is the eye's (FC2 VR thread, fc2-headset)
     auto&     lc = m_gst_late_cam;
     const int fr = m_frame.load();
@@ -7705,7 +7834,7 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
         }
     }
     if (m_vs_cb0 != nullptr && is_world_cb(m_vs_cb0)) {
-        vehicle_probe(ctx);
+        vehicle_probe(ctx, count);
         return world_character_draw(ctx, count, instances);
     }
     if (m_vs_cb0 == nullptr || !is_weapon_cb(m_vs_cb0)) {
@@ -7862,6 +7991,7 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
                         m_gun_obj_seen  = m_frame.load();
                         gun_still_gun_cb(c1);   // probe (a key only, no reference kept)
                         gun_mesh = count == m_weapon_sig.load();
+                        if (gun_mesh) m_gun_world[m_frame.load() & 3] = { m_frame.load(), obj_mat(m_gun_obj_now) };   // afwgunpose, afwgunmvpose
                     }
                 }
                 c1->Release();
@@ -7891,13 +8021,14 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
     }
     // Red dot sights (reddot): the game's reticle on the sight's glass draws the sight-window mask instead (reddot_end
     // after the draw puts the game's state back); the dot itself is drawn per eye at present.
-    if (m_cur_ps && (m_reddot.load() || m_reddot_glass.load() > 0)) {
+    if (m_cur_ps) {
         bool reticle = false;
         {
             std::lock_guard _{ m_ps_mtx };
             reticle = m_reticle_shaders.contains(m_cur_ps);
         }
         if (reticle) m_reddot_reticle_sig = m_weapon_sig.load();
+        if (reticle) m_optic_this_frame = true;   // this frame's weapon has sight glass (scope_frame: only those magnify)
         if (reticle && m_reddot.load()) reddot_begin(ctx);
     }
     // Closed red dot sights (reddotglass): the dark disc in the tube (and at 2 the glass over it) left out.
@@ -7945,7 +8076,7 @@ void WINAPI FarCry5Stereo::hk_draw_idx_inst_indirect(ID3D11DeviceContext* ctx, I
     FC5_FP_AGAIN(call_orig<void>(self->m_dii_hook, 39, ctx, args, offset));
     if (self->m_gimp_swapped) self->impostor_up_restore(ctx);
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
     if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -7972,7 +8103,7 @@ void WINAPI FarCry5Stereo::hk_draw_inst_indirect(ID3D11DeviceContext* ctx, ID3D1
     FC5_FP_AGAIN(call_orig<void>(self->m_di_hook, 40, ctx, args, offset));
     if (self->m_gimp_swapped) self->impostor_up_restore(ctx);
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
     if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -7992,7 +8123,7 @@ void WINAPI FarCry5Stereo::hk_draw_auto(ID3D11DeviceContext* ctx)
     call_orig<void>(self->m_dauto_hook, 38, ctx);
     FC5_FP_AGAIN(call_orig<void>(self->m_dauto_hook, 38, ctx));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
     if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -8037,7 +8168,7 @@ void WINAPI FarCry5Stereo::hk_draw_indexed(ID3D11DeviceContext* ctx, UINT count,
         FC5_FP_AGAIN(call_orig<void>(self->m_draw_idx_hook, 12, ctx, count, start, base));
         self->restore_textures(ctx);
         if (self->m_hud_redirected) self->hud_end(ctx);
-        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
         if (self->m_menu_blit_pending) self->menu_blit(ctx);
         if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
         if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -8049,7 +8180,7 @@ void WINAPI FarCry5Stereo::hk_draw_indexed(ID3D11DeviceContext* ctx, UINT count,
     call_orig<void>(self->m_draw_idx_hook, 12, ctx, count, start, base);
     FC5_FP_AGAIN(call_orig<void>(self->m_draw_idx_hook, 12, ctx, count, start, base));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
     if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -8297,7 +8428,7 @@ void WINAPI FarCry5Stereo::hk_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
         FC5_FP_AGAIN(call_orig<void>(self->m_draw_hook, 13, ctx, count, start));
         self->restore_textures(ctx);
         if (self->m_hud_redirected) self->hud_end(ctx);
-        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
         if (self->m_menu_blit_pending) self->menu_blit(ctx);
         if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
         if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -8309,7 +8440,7 @@ void WINAPI FarCry5Stereo::hk_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
     call_orig<void>(self->m_draw_hook, 13, ctx, count, start);
     FC5_FP_AGAIN(call_orig<void>(self->m_draw_hook, 13, ctx, count, start));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
     if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -8347,7 +8478,7 @@ void WINAPI FarCry5Stereo::hk_draw_indexed_instanced(ID3D11DeviceContext* ctx, U
         FC5_FP_AGAIN(call_orig<void>(self->m_draw_idx_i_hook, 20, ctx, count, inst, start, base, start_inst));
         self->restore_textures(ctx);
         if (self->m_hud_redirected) self->hud_end(ctx);
-        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
         if (self->m_menu_blit_pending) self->menu_blit(ctx);
         if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
         if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -8359,7 +8490,7 @@ void WINAPI FarCry5Stereo::hk_draw_indexed_instanced(ID3D11DeviceContext* ctx, U
     call_orig<void>(self->m_draw_idx_i_hook, 20, ctx, count, inst, start, base, start_inst);
     FC5_FP_AGAIN(call_orig<void>(self->m_draw_idx_i_hook, 20, ctx, count, inst, start, base, start_inst));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
     if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -8397,7 +8528,7 @@ void WINAPI FarCry5Stereo::hk_draw_instanced(ID3D11DeviceContext* ctx, UINT coun
         FC5_FP_AGAIN(call_orig<void>(self->m_draw_i_hook, 21, ctx, count, inst, start, start_inst));
         self->restore_textures(ctx);
         if (self->m_hud_redirected) self->hud_end(ctx);
-        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
         if (self->m_menu_blit_pending) self->menu_blit(ctx);
         if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
         if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -8409,7 +8540,7 @@ void WINAPI FarCry5Stereo::hk_draw_instanced(ID3D11DeviceContext* ctx, UINT coun
     call_orig<void>(self->m_draw_i_hook, 21, ctx, count, inst, start, start_inst);
     FC5_FP_AGAIN(call_orig<void>(self->m_draw_i_hook, 21, ctx, count, inst, start, start_inst));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
     if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
@@ -9146,6 +9277,7 @@ void FarCry5Stereo::afw_present(ID3D11DeviceContext* ctx)
         return;
     }
     const int frame = m_frame.load();
+    afw_veh_own_stamp(frame);   // afwvehown
     const auto& rec = m_afw_cams[frame & 3];
     if (rec.frame != frame || !rec.cam[frame & 1].valid) {
         afw_record(frame, frame & 1, 3, -1, -1, 0.0f, rec.frame != frame ? "no camera record for this frame" : "camera not valid");
@@ -9364,6 +9496,15 @@ void FarCry5Stereo::on_present()
         }
     }
     FC5_TRACE("on_present");
+    if (m_hooked) {
+        // ctxvar: a new method set of the immediate context (OFXR Bridge) gets the mod's hooks too.
+        ID3D11DeviceContext* vimm = nullptr;
+        g_framework->get_d3d11_hook()->get_device()->GetImmediateContext(&vimm);
+        if (vimm) {
+            fc5::ctxvar::check(vimm);
+            vimm->Release();
+        }
+    }
     g_wd_last_present = GetTickCount64();
     // camscanfwd [neg]: the scan and tracking follow the game camera's view-matrix Z row (or its negation, the
     // forward direction) instead of its position.
@@ -9966,6 +10107,10 @@ void FarCry5Stereo::note_pixel_shader(ID3D11PixelShader* ps, const void* code, s
             r2->Release();
         }
     }
+    if (names.find("CSceneParticleEmitterRendererParameterProvider") != std::string::npos) {
+        // flameworld: a particle shader (flames, smoke, sparks; world-space particles).
+        m_particle_ps.insert(ps);
+    }
     if (crc == 0xFD85674Eu || crc == 0x3437AFA6u) {
         // Firing particles (flash/spark #FD85674E, smoke #3437AFA6): their world-pass copies sit at the
         // game's own muzzle, in front of the head, while the drawn gun is in the hand.
@@ -10280,6 +10425,139 @@ void FarCry5Stereo::streak_cb_restore(ID3D11DeviceContext* ctx)
 {
     m_streak_cb_swapped = false;
     ID3D11Buffer* b     = std::exchange(m_streak_cb_orig, nullptr);
+    call_orig<void>(m_vs_cb_hook, 7, ctx, 0u, 1u, static_cast<ID3D11Buffer* const*>(&b));
+    if (b) b->Release();
+}
+
+// flameworld (default on, saved; F11 Weapon > Bullet tracers; Homard 24 Oct video: "the flame effect follows the controller,
+// the flames in the air follow our movement"). The weapon pass is put on the controller by its camera: one rigid move of
+// everything drawn in it, world' = A (world - cam) + off (on_viewport_constants: w_full, w_off). The game also draws its
+// weapon's particles in that pass (the flamethrower's stream, the muzzle's smoke and sparks), but they are world-space: the
+// game leaves them where they were emitted. Moved with the pass, every flame already in the air swung with each turn and move
+// of the hand. Their draws get a copy of the pass's camera that is the eye's own, shifted by the one move that puts the game's
+// muzzle on the drawn one (the controller's barrel point): the stream leaves the drawn barrel and then stays where the game
+// put it, as on a flat screen. The pass's projection, depth terms and exposure are kept.
+void FarCry5Stereo::flame_upload(const float* d, uint32_t size, int frame, const glm::mat3& eye_rot, const glm::vec3& eye_cam, const glm::vec3& cam,
+                                 const glm::mat3& w_full, const glm::vec3& w_off, const glm::mat4& proj)
+{
+    if (!m_flame_world.load() || afw_mode() || skin_pose_active() || skel_hand_active() || m_mo.slung || m_scope_call || size < 4 * (kTanHalfFov + 1) || size > 8192) return;
+    // The drawn muzzle D and the game's own point p that the pass's move puts there: p = cam + A^-1 (D - off).
+    const glm::vec3 D     = m_mo.ctrl_pos_world + m_mo.ctrl_rot_world * glm::vec3{ m_barrel_off[0].load(), m_barrel_off[1].load(), m_barrel_off[2].load() };
+    const glm::vec3 p     = cam + glm::inverse(w_full) * (D - w_off);
+    const glm::vec3 shift = D - p;
+    if (!std::isfinite(shift.x + shift.y + shift.z) || glm::length(shift) > 3.0f) return;
+    // flamehold (Homard 24 Oct 21:57: "the little flame at the end of the flamethrower does not follow the flamethrower
+    // perfectly"): the pilot flame is drawn all the time, also when not firing, and belongs on the gun. Away from firing the
+    // particles go with the gun again (the pass's own move, as before flameworld); firing, and for flamehold seconds after
+    // the trigger is let go (the flames still in the air), they stay in the world; then they turn back onto the gun over
+    // 0.4 s. Both moves put the game's point p on D, so the blend turns about it: world' = D + R (world - p),
+    // R from the identity (in the world) to A (with the gun).
+    const auto now = std::chrono::steady_clock::now();
+    if (m_trigger.load() || m_dbg_trigger.load()) m_flame_fire_t = now;
+    const float since  = std::chrono::duration<float>(now - m_flame_fire_t).count();
+    const float attach = std::clamp((since - std::max(0.0f, m_flame_hold.load())) / 0.4f, 0.0f, 1.0f);
+    m_flame_attach     = attach;
+    glm::mat3 R{ 1.0f };
+    if (attach > 0.0f) R = glm::mat3_cast(glm::slerp(glm::quat{ 1.0f, 0.0f, 0.0f, 0.0f }, glm::normalize(glm::quat_cast(w_full)), attach));
+    // Seen by the eye: view = eye_rot R (world - (p - R^T (D - eye_cam))); with R = I that is eye_rot (world + shift - eye_cam).
+    const glm::mat3 vr = eye_rot * R;
+    const glm::vec3 vc = p - glm::transpose(R) * (D - eye_cam);
+    glm::mat4       view{ vr };
+    view[3]             = glm::vec4{ -(vr * vc), 1.0f };
+    const glm::mat4 vrp = proj * glm::mat4{ vr };
+    // The previous frame's particle camera (the other eye), as the passes' own previous-frame values.
+    auto& hs = m_flame_hist;
+    if (hs.cur_frame != frame) {
+        hs.prev_valid = hs.cur_frame == frame - 1;
+        hs.prev_vrp   = hs.cur_vrp;
+        hs.prev_cam   = hs.cur_cam;
+        hs.cur_frame  = frame;
+    }
+    hs.cur_vrp = vrp;
+    hs.cur_cam = vc;
+    std::vector<float> f(d, d + size / 4);
+    store_rows(glm::inverse(view), f.data() + kInvView);
+    store_rows(view, f.data() + kView);
+    store_rows(proj * view, f.data() + kViewProj);
+    store_rows(vrp, f.data() + kViewRotProj);
+    store_rows(hs.prev_valid ? hs.prev_vrp : vrp, f.data() + kViewRotProjPv);
+    store3(hs.prev_valid ? hs.prev_cam : vc, f.data() + kCameraPosPv);
+    store3(vc, f.data() + kCameraPos);
+    store3(vc, f.data() + kViewPoint);
+    const glm::mat4 er{ vr };
+    store3(glm::vec3{ glm::row(er, 0) }, f.data() + kCameraRight);
+    store3(glm::vec3{ glm::row(er, 1) }, f.data() + kCameraUp);
+    store3(-glm::vec3{ glm::row(er, 2) }, f.data() + kCameraDir);
+    // One copy per game buffer (the game cycles its weapon camera through several): this buffer's slot, else the oldest.
+    int slot = -1;
+    for (int i = 0; i < kFlameSlots && slot < 0; ++i) if (m_flame_cb[i].res == m_unmap_res) slot = i;
+    if (slot < 0) {
+        slot = 0;
+        for (int i = 1; i < kFlameSlots; ++i) if (m_flame_cb[i].frame < m_flame_cb[slot].frame) slot = i;
+    }
+    auto& c = m_flame_cb[slot];
+    c.res   = m_unmap_res;
+    c.frame = frame;
+    c.data  = std::move(f);
+    m_flame_shift = shift;
+}
+
+// flameworld, at a weapon-pass draw: a particle shader's draw is given the particle camera made at this buffer's upload.
+bool FarCry5Stereo::flame_cb_swap(ID3D11DeviceContext* ctx)
+{
+    if (!m_cur_ps || m_scope_call || m_menu_screen_on || m_hand_cb_swapped || m_skp_swapped || m_streak_cb_swapped) return false;
+    {
+        std::lock_guard _{ m_ps_mtx };
+        if (!m_particle_ps.contains(m_cur_ps) || m_tracer_shaders.contains(m_cur_ps)) return false;   // the bullet streak keeps its own placing
+    }
+    const int frame = m_frame.load();
+    int       slot  = -1;
+    for (int i = 0; i < kFlameSlots && slot < 0; ++i) if (m_flame_cb[i].res == m_vs_cb0 && m_flame_cb[i].frame == frame) slot = i;
+    if (slot < 0) { m_flame_missed++; return false; }
+    ID3D11Buffer* orig = nullptr;
+    ctx->VSGetConstantBuffers(0, 1, &orig);
+    if (!orig) return false;
+    D3D11_BUFFER_DESC bd{};
+    orig->GetDesc(&bd);
+    auto& c = m_flame_cb[slot];
+    if (bd.ByteWidth > c.data.size() * 4) {
+        orig->Release();
+        m_flame_missed++;
+        return false;
+    }
+    if (!m_flame_standin[slot] || m_flame_standin_size[slot] != bd.ByteWidth) {
+        if (m_flame_standin[slot]) m_flame_standin[slot]->Release();
+        m_flame_standin[slot] = nullptr;
+        D3D11_BUFFER_DESC sd{};
+        sd.ByteWidth = bd.ByteWidth;
+        sd.Usage     = D3D11_USAGE_DEFAULT;
+        sd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        ID3D11Device* dev = nullptr;
+        ctx->GetDevice(&dev);
+        if (dev) {
+            dev->CreateBuffer(&sd, nullptr, &m_flame_standin[slot]);
+            dev->Release();
+        }
+        m_flame_standin_size[slot] = bd.ByteWidth;
+    }
+    if (!m_flame_standin[slot]) {
+        orig->Release();
+        return false;
+    }
+    call_orig<void>(m_update_sub_hook, 48, ctx, static_cast<ID3D11Resource*>(m_flame_standin[slot]), 0u, static_cast<const D3D11_BOX*>(nullptr),
+                    static_cast<const void*>(c.data.data()), 0u, 0u);
+    ID3D11Buffer* b = m_flame_standin[slot];
+    call_orig<void>(m_vs_cb_hook, 7, ctx, 0u, 1u, static_cast<ID3D11Buffer* const*>(&b));
+    m_flame_cb_orig    = orig;   // released at the restore
+    m_flame_cb_swapped = true;
+    m_flame_draws++;
+    return true;
+}
+
+void FarCry5Stereo::flame_cb_restore(ID3D11DeviceContext* ctx)
+{
+    m_flame_cb_swapped = false;
+    ID3D11Buffer* b    = std::exchange(m_flame_cb_orig, nullptr);
     call_orig<void>(m_vs_cb_hook, 7, ctx, 0u, 1u, static_cast<ID3D11Buffer* const*>(&b));
     if (b) b->Release();
 }
@@ -10607,6 +10885,35 @@ void FarCry5Stereo::fp_eye_feed(int frame, int eye)
         in.held_ok    = p.frame == m_afw_cap_frame[held] && p.frame >= frame - 2;
         in.to_held    = p.G * hi;
         in.to_held_o  = p.t - in.to_held * h.t;
+        if (in.held_ok && m_afw_gun_pose.load()) {
+            // afwgunpose: the gun's own move in gun space between the two images, q_p = D q_h with D = Q_p Q_h^-1, Q = A Om (the
+            // gun mesh's world transform Om seen from that frame's game camera A): v_p = Gp (D q_h) + tp.
+            auto gun_q = [&](int f, glm::mat4& Q) {
+                const auto& g = m_gun_world[f & 3];
+                const auto& w = m_wgame[f & 3];
+                if (g.frame != f || w.frame != f) return false;
+                glm::mat4 A{ w.axes };
+                A[3] = glm::vec4{ -(w.axes * w.cam), 1.0f };
+                Q    = A * g.Om;
+                return true;
+            };
+            glm::mat4 Qh{ 1.0f }, Qp{ 1.0f };
+            if (gun_q(frame, Qh) && gun_q(p.frame, Qp)) {
+                const glm::mat4 D = Qp * glm::inverse(Qh);
+                const glm::mat3 Dr{ D };
+                in.to_held        = p.G * Dr * hi;
+                in.to_held_o      = p.G * glm::vec3{ D[3] } + p.t - in.to_held * h.t;
+                const float     cm  = 100.0f * glm::length(glm::vec3{ Qp[3] } - glm::vec3{ Qh[3] });
+                const glm::quat q   = glm::normalize(glm::quat_cast(Dr));
+                const float     deg = glm::degrees(2.0f * std::acos(std::clamp(std::abs(q.w), 0.0f, 1.0f)));
+                m_fp_pose_n++;
+                m_fp_pose_cm += cm;
+                m_fp_pose_max_cm  = std::max(m_fp_pose_max_cm, cm);
+                m_fp_pose_max_deg = std::max(m_fp_pose_max_deg, deg);
+            } else {
+                m_fp_pose_miss++;   // no gun mesh in one of the frames (empty hands, gunstill off): through the game camera's space
+            }
+        }
         m_fp_composed++;
     }
     if (m_fp_trace.load() > 0) {
@@ -11830,6 +12137,17 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
                     prev_vrp = eh.vrp * glm::mat4{ glm::transpose(g2.axes) * g1.axes };
                     prev_cam = g1.cam - glm::transpose(g1.axes) * g2.axes * (g2.cam - eh.cam);
                     m_gun_mv_fixed++;
+                    const auto& o1 = m_gun_world[(frame - 1) & 3];
+                    const auto& o2 = m_gun_world[(frame - 2) & 3];
+                    if (m_afw_gun_mv_pose.load() && o1.frame == frame - 1 && o2.frame == frame - 2) {
+                        // afwgunmvpose: through the gun's own transforms instead: a gun point at p1 = Om1 m was at p2 = K p1 with
+                        // K = Om2 Om1^-1, where this eye saw it as R2 (p2 - v2) = R2 Kr (p1 - Kr^-1 (v2 - Kt)).
+                        const glm::mat4 K  = o2.Om * glm::inverse(o1.Om);
+                        const glm::mat3 Kr{ K };
+                        prev_vrp = eh.vrp * glm::mat4{ Kr };
+                        prev_cam = glm::inverse(Kr) * (eh.cam - glm::vec3{ K[3] });
+                        m_gun_mv_pose_n++;
+                    }
                 }
             } else if (!weapon_view) {
                 m_prev_fallback[frame & 1]++;   // this eye's previous camera missing: the other eye's is used
@@ -11882,6 +12200,7 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
         d[kFovDeg]         = glm::degrees(2.0f * std::atan(half_h));
     }
     if (weapon_view) fp_eye_upload(d, size, frame, base, base_cam, w_axes, cam, w_floating, w_full, w_off, game_proj, proj, headset_fov, view_rot, view_cam);
+    if (weapon_view && w_floating) flame_upload(d, size, frame, eye_rot, eye_cam, cam, w_full, w_off, proj);   // flameworld
     if (!weapon_view) {
         // For the tracer-from-the-gun draws (streak_cb_swap): this upload as written, and the game camera.
         const uint32_t n = std::min<uint32_t>(size / 4, 2048);
@@ -13713,6 +14032,13 @@ void FarCry5Stereo::rumble_hands(float left_motor, float right_motor, float amp[
             if (two) amp[1 - gun] = m;
         }
     }
+    // shotbuzz: while a shot's pulse runs, the game's rumble is sent only where it is stronger (a new buzz replaces the one
+    // running, so the game's weaker shot rumble, sent a moment later, cut the pulse short: the uneven feel).
+    if (mode != 0 && std::chrono::steady_clock::now().time_since_epoch().count() < m_shot_buzz_until.load()) {
+        const float kick = std::clamp(m_shot_buzz_amp.load(), 0.1f, 1.0f);
+        for (int h = 0; h < 2; ++h)
+            if (amp[h] <= kick) amp[h] = 0.0f;
+    }
     if (m_rumble_log.load()) {
         // Once per change of the motors (the game may repeat the same values every frame).
         static float last[2]{ -1.0f, -1.0f };
@@ -13723,6 +14049,33 @@ void FarCry5Stereo::rumble_hands(float left_motor, float right_motor, float amp[
                          left_motor, right_motor, amp[0], amp[1], mode, armed, two);
         }
     }
+}
+
+// shotbuzz: one fixed pulse per shot on the hands holding the gun (the weapon hand, the other one too with two hands; both with
+// rumble both). The game's own shot rumble varies from shot to shot and comes on the pad's motors; this one is the same every
+// time. Not with rumble game (the old way).
+void FarCry5Stereo::shot_buzz()
+{
+    if (!m_shot_buzz.load() || m_rumble_mode.load() == 0) return;
+    const int64_t now = std::chrono::steady_clock::now().time_since_epoch().count();
+    if (now - m_shot_buzz_last.load() < 30000000ll) return;   // 30 ms: a shotgun's pellets
+    m_shot_buzz_last = now;
+    const float a   = std::clamp(m_shot_buzz_amp.load(), 0.1f, 1.0f);
+    const int   ms  = std::clamp(m_shot_buzz_ms.load(), 20, 250);
+    const float sec = float(ms) / 1000.0f;
+    float       amp[2]{};
+    if (m_rumble_mode.load() == 2) {
+        amp[0] = amp[1] = a;
+    } else {
+        const int gun = m_left_handed.load() ? 0 : 1;
+        amp[gun]      = a;
+        if (m_two_hand.load()) amp[1 - gun] = a;
+    }
+    m_shot_buzz_until = now + int64_t(ms) * 1000000ll;
+    static auto vr = VR::get();
+    if (amp[0] > 0.0f) vr->trigger_haptic_vibration(0.0f, sec, 1.0f, amp[0], vr->get_left_joystick());
+    if (amp[1] > 0.0f) vr->trigger_haptic_vibration(0.0f, sec, 1.0f, amp[1], vr->get_right_joystick());
+    if (m_rumble_log.load()) spdlog::info("[Rumble] shot: {:.2f} for {} ms -> left controller {:.2f}, right controller {:.2f}", a, ms, amp[0], amp[1]);
 }
 
 // throwable: the throw's direction (FarCry5Gesture, tracking space) in the world, as the aim loop steers the game camera:
@@ -14010,10 +14363,12 @@ void FarCry5Stereo::probe_tick()
 // The vehicle the player sits in: a draw with a Vehicle_* material whose object origin is right under
 // the game camera (within 0.8 m sideways, 0.3-2.2 m below). Its world matrix (VS b1, 3x4 rows) gives the
 // vehicle's axes. Once per frame, with motion controls on.
-void FarCry5Stereo::vehicle_probe(ID3D11DeviceContext* ctx)
+void FarCry5Stereo::vehicle_probe(ID3D11DeviceContext* ctx, UINT count)
 {
     const int frame = m_frame.load();
-    if (!m_motion.load() || m_veh_mesh_frame == frame) return;
+    // afwvehown looks at every Vehicle_ draw of the frame (it keeps the largest: the body, not a door or the wheel).
+    const bool own = m_afw_veh_own.load() && afw_mode() && m_in_vehicle.load();
+    if (!m_motion.load() || (m_veh_mesh_frame == frame && !own)) return;
     ID3D11PixelShader* ps = nullptr;
     ctx->PSGetShader(&ps, nullptr, nullptr);
     if (!ps) return;
@@ -14043,9 +14398,63 @@ void FarCry5Stereo::vehicle_probe(ID3D11DeviceContext* ctx)
                      c.f[0], c.f[4], c.f[8], c.f[1], c.f[5], c.f[9]);
     }
     if (std::sqrt(rel.x * rel.x + rel.y * rel.y) > 0.8f || rel.z > -0.3f || rel.z < -2.2f) return;
-    m_veh_mesh_frame = frame;
-    m_veh_mesh_x     = glm::vec3{ c.f[0], c.f[4], c.f[8] };
-    m_veh_mesh_y     = glm::vec3{ c.f[1], c.f[5], c.f[9] };
+    if (m_veh_mesh_frame != frame) {
+        m_veh_mesh_frame = frame;
+        m_veh_mesh_x     = glm::vec3{ c.f[0], c.f[4], c.f[8] };
+        m_veh_mesh_y     = glm::vec3{ c.f[1], c.f[5], c.f[9] };
+    }
+    if (own) {
+        auto& w = m_veh_world[frame & 3];
+        if (w.frame == frame && count <= w.count) return;
+        // The model's axes without its scale (and its handedness kept).
+        const glm::vec3 x  = glm::normalize(glm::vec3{ c.f[0], c.f[4], c.f[8] });
+        const glm::vec3 y0 = glm::vec3{ c.f[1], c.f[5], c.f[9] };
+        const glm::vec3 y  = glm::normalize(y0 - glm::dot(y0, x) * x);
+        glm::vec3       z  = glm::cross(x, y);
+        if (glm::dot(z, glm::vec3{ c.f[2], c.f[6], c.f[10] }) < 0.0f) z = -z;
+        if (!std::isfinite(x.x + y.x + z.x + x.y + y.y + z.y + x.z + y.z + z.z)) return;
+        w.frame = frame;
+        w.count = count;
+        w.rot   = glm::transpose(glm::mat3{ x, y, z });   // world -> the model's axes
+        w.pos   = glm::vec3{ c.f[3], c.f[7], c.f[11] };
+    }
+}
+
+// afwvehown: this frame's two eye cameras get the car model's transform found during the frame (both AFW paths, before the
+// capture and the rebuild). A model that moved unlike the camera over the frame is another part of the car: left out.
+void FarCry5Stereo::afw_veh_own_stamp(int frame)
+{
+    auto& rec = m_afw_cams[frame & 3];
+    for (auto& c : rec.cam) c.veh_mesh = false;
+    if (!m_afw_veh_own.load() || !m_in_vehicle.load() || rec.frame != frame) return;
+    const auto& w = m_veh_world[frame & 3];
+    if (w.frame != frame) {
+        m_veh_own_miss++;
+        return;
+    }
+    const auto& wp = m_veh_world[(frame - 1) & 3];
+    const auto& rp = m_afw_cams[(frame - 1) & 3];
+    if (wp.frame == frame - 1 && rp.frame == frame - 1 && rp.veh_valid && rec.veh_valid) {
+        const glm::mat3 cm   = glm::transpose(w.rot) * wp.rot;              // the model's turn over the frame (world)
+        const glm::mat3 cc   = glm::transpose(rec.veh_rot) * rp.veh_rot;    // the camera frame's
+        const glm::mat3 d    = cm * glm::transpose(cc);
+        const float     deg  = glm::degrees(std::acos(std::clamp((d[0][0] + d[1][1] + d[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f)));
+        const float     cmo  = 100.0f * glm::length(cm * (rp.veh_pos - wp.pos) + w.pos - rec.veh_pos);   // where the model takes the camera vs where it went
+        if (!std::isfinite(cmo) || deg > 4.0f || cmo > 25.0f) {
+            m_veh_own_reject++;
+            return;
+        }
+        m_veh_own_checked++;
+        m_veh_own_cm += cmo;
+        m_veh_own_max_cm  = std::max(m_veh_own_max_cm, cmo);
+        m_veh_own_max_deg = std::max(m_veh_own_max_deg, deg);
+    }
+    for (auto& c : rec.cam) {
+        c.veh_mesh = true;
+        c.mesh_rot = w.rot;
+        c.mesh_pos = w.pos;
+    }
+    m_veh_own_n++;
 }
 
 // Review P3 (cmd logbuffered): the log file was flushed after every line on the render thread; buffered, it is
@@ -14890,11 +15299,11 @@ void FarCry5Stereo::poll_commands()
         }
         const bool on  = arg == "on" || arg == "1" || arg == "true";
         const float fv = arg.empty() ? 0.0f : std::strtof(arg.c_str(), nullptr);
-        static const std::unordered_set<std::string> kPersistent{ "fastlights", "rumble", "rumblegain", "snapturn", "snapdeg", "turnspeed", "hudmode", "huddist", "hudscale", "hudheight", "dlss", "dlsssharp", "dlsspreset",
+        static const std::unordered_set<std::string> kPersistent{ "fastlights", "rumble", "rumblegain", "shotbuzz", "shotbuzzamp", "shotbuzzms", "snapturn", "snapdeg", "turnspeed", "hudmode", "huddist", "hudscale", "hudheight", "dlss", "dlsssharp", "dlsspreset",
                                                                    "upright", "lensdirt", "skipps", "keeprunning", "mapflat", "grip", "grippitch", "modelyaw", "modelpitch",
                                                                    "aimdot", "aimdotsize", "twohand", "foregrip", "hidetracers", "tracersfromgun", "framedouble", "hands", "reflections", "cinematics", "vehicles", "wheelstick", "hipspread", "norecoil", "nosway", "steadyview", "vehrecenter", "aircraftguard", "headlook", "cinestrict", "menulevel", "weaponsmooth", "fovexact", "fovsize", "dlsscammv", "afw", "aniso", "mipbias", "mipbiasauto",
                                                                    "gputime", "eyeprobeoff", "bbcopyskip", "probeoff", "logbuffered", "savelater", "snapresetfix", "pairjumps", "vehicleperpair", "doublehmd", "exposuregate", "fovmargin", "fovnarrow", "ngxisolate", "dlsstrim", "firegate", "firefast", "firemoving", "hudscreen", "hudsize", "hudfullres", "f11image", "hudpanel", "foreignpass", "hudmask", "firesplit", "firemeasure", "snapsync", "aimlead", "vehstick", "vehfade", "vehentryfollow", "vehcullheads", "airfollow", "airroll", "vehplayerfov", "chutelook", "lakeoverscan", "dlssmvbest", "dlssmvcheck",
-                                                                   "aoexact", "decaleye", "taamv", "taaskip", "fingergrip", "fingerswap", "dlssjitgate", "dlssoffres", "hudmul", "hudmarkers", "hudmarkdist", "hudmarksize", "hudmarksmooth", "nodof", "afwgunown" };
+                                                                   "aoexact", "decaleye", "taamv", "taaskip", "fingergrip", "fingerswap", "dlssjitgate", "dlssoffres", "hudmul", "hudmarkers", "hudmarkdist", "hudmarksize", "hudmarksmooth", "nodof", "afwgunown", "flameworld", "flamehold" };
         if (kPersistent.contains(cmd)) {
             if (!from_settings) persist_changed = true;
             m_persist[cmd] = line;
@@ -14999,9 +15408,12 @@ void FarCry5Stereo::poll_commands()
                 continue;
             }
         }
-        if (cmd == "rumble" || cmd == "rumblegain" || cmd == "rumblelog") {   // controller vibration (rumble_hands); own block (nesting limit)
+        if (cmd == "rumble" || cmd == "rumblegain" || cmd == "rumblelog" || cmd == "shotbuzz" || cmd == "shotbuzzamp" || cmd == "shotbuzzms") {   // controller vibration (rumble_hands, shot_buzz); own block (nesting limit)
             if (cmd == "rumble") m_rumble_mode = arg == "game" ? 0 : arg == "both" ? 2 : 1;
             else if (cmd == "rumblegain") m_rumble_gain = std::clamp(arg.empty() ? 1.0f : fv, 0.0f, 2.0f);
+            else if (cmd == "shotbuzz") m_shot_buzz = on;
+            else if (cmd == "shotbuzzamp") m_shot_buzz_amp = std::clamp(arg.empty() ? 1.0f : fv, 0.1f, 1.0f);
+            else if (cmd == "shotbuzzms") m_shot_buzz_ms = std::clamp(arg.empty() ? 80 : int(fv), 20, 250);
             else m_rumble_log = on;
             spdlog::info("[FC5 cmd] {}", line);
             continue;
@@ -15115,6 +15527,11 @@ void FarCry5Stereo::poll_commands()
             }
         }
         if (cmd == "simprojection") runtimes::OpenXR::s_fc5_sim_projection = on;   // own line (nesting limit): Meta XR Simulator, projection layer kept under the flat screen
+        if (cmd == "flamehold") {   // own block (nesting limit); flamehold S (saved): seconds after firing before they go back on the gun
+            m_flame_hold = std::clamp(fv, 0.0f, 10.0f);
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
         if (cmd == "fovnarrow") {   // own block (nesting limit): each eye's view narrowed at the same pixel count
             m_fov_scale = std::clamp(fv, 0.7f, 1.0f);
             spdlog::info("[FC5 cmd] {}", line);
@@ -15419,7 +15836,7 @@ void FarCry5Stereo::poll_commands()
             else if (cmd == "paircheck") { m_pair_check = on; if (fv > 1.0f) m_pair_every = (int)fv; }
         }
         // AFW gun tests (own block: the research chains are at the compiler's nesting limit).
-        if (cmd == "ctrlsway" || cmd == "afwheldgun" || cmd == "afwfgpush" || cmd == "afwfpeye" || cmd == "afwfpss" || cmd == "afwfptrace" || cmd == "unarmedhand" || cmd == "slinghand" || cmd == "slinghandtilt" || cmd == "gripbyhand" || cmd == "griphand" || cmd == "afwgunmv" || cmd == "afwgunown" || cmd == "afwsteady" || cmd == "afwvehnear" || cmd == "afwdepthlate" || cmd == "afwvehbody" || cmd == "afwvehmv" || cmd == "vehlog" || cmd == "afwstartstereo") {
+        if (cmd == "ctrlsway" || cmd == "afwheldgun" || cmd == "afwfgpush" || cmd == "afwfpeye" || cmd == "afwfpss" || cmd == "afwfptrace" || cmd == "unarmedhand" || cmd == "slinghand" || cmd == "slinghandtilt" || cmd == "gripbyhand" || cmd == "griphand" || cmd == "afwgunmv" || cmd == "afwgunpose" || cmd == "afwgunmvpose" || cmd == "afwgunown" || cmd == "afwsteady" || cmd == "afwroot" || cmd == "afwvehnear" || cmd == "afwdepthlate" || cmd == "afwvehbody" || cmd == "afwvehown" || cmd == "afwvehmv" || cmd == "vehlog" || cmd == "afwstartstereo") {
             if (cmd == "afwfgpush") m_afw_fg_push = on;
             else if (cmd == "afwfpeye") { m_afw_fp_eye = on; m_fp_target_log = 0; }
             else if (cmd == "afwfpss") m_afw_fp_ss = std::clamp((int)fv, 1, 2);
@@ -15436,11 +15853,15 @@ void FarCry5Stereo::poll_commands()
                 m_grip_hand_ref[0] = fv; m_grip_hand_ref[1] = y; m_grip_hand_ref[2] = z;
             }
             else if (cmd == "afwgunmv") m_afw_gun_mv = on;
+            else if (cmd == "afwgunpose") m_afw_gun_pose = on;       // the rebuilt eye's gun colour through the gun's own pose
+            else if (cmd == "afwgunmvpose") m_afw_gun_mv_pose = on;  // test: afwgunmv through the gun's own transforms
             else if (cmd == "afwgunown") fc5::afw::set_gun_own(on);   // the rebuilt eye's gun from its own last image first
             else if (cmd == "afwsteady") m_afw_steady = on;
+            else if (cmd == "afwroot") m_afw_root_every = on;   // the body root (walkbob's height) at every AFW frame
             else if (cmd == "afwdepthlate") m_afw_depth_late = on;
             else if (cmd == "afwvehnear") m_afw_veh_near = arg == "off" ? 0.0f : arg == "on" ? 5.0f : std::clamp(fv, 0.0f, 20.0f);
-            else if (cmd == "afwvehbody") m_afw_veh_body = arg == "off" ? 0.0f : arg == "on" ? 1.5f : std::clamp(fv, 0.0f, 10.0f);
+            else if (cmd == "afwvehbody") m_afw_veh_body = arg == "off" ? 0.0f : arg == "on" ? 3.0f : std::clamp(fv, 0.0f, 10.0f);
+            else if (cmd == "afwvehown") m_afw_veh_own = on;   // the cab carried with the car model's own transform
             else if (cmd == "afwvehmv") m_afw_veh_mv = on;
             else if (cmd == "afwstartstereo") m_afw_start_stereo = on;
             else if (cmd == "vehlog") m_veh_probe_log = std::clamp((int)fv, 0, 200);
@@ -15586,6 +16007,7 @@ void FarCry5Stereo::poll_commands()
                 spdlog::info("[Tracer] diff armed for {} ({} shader object(s))", arg.empty() ? std::string("the streak set") : arg, g_trd_target.size());
             }
             else if (cmd == "worldtracers") m_show_world_tracers = on;
+            else if (cmd == "flameworld") m_flame_world = on;   // flameworld on|off (saved): weapon-pass particles stay in the world
             else if (cmd == "stereorec") m_stereo_rec = std::clamp((int)fv, 0, 5);
             else if (cmd == "stereoskipend") m_stereo_skip_end = on;
             else if (cmd == "execlog") g_exec_log = std::max(1, (int)fv);
@@ -16412,6 +16834,12 @@ void FarCry5Stereo::on_post_present()
                      it != m_weapon_cal.end() ? fmt::format("calibrated: yaw {:+.1f}, pitch {:+.1f} deg", it->second.first, it->second.second) : std::string{ "default calibration" });
     }
     if (m_weapon_sig_frame != 0) m_weapon_sig = m_weapon_sig_frame;
+    // Sight glass (a reticle or a scope's glass) drawn by this frame's weapon: only a gun drawing it magnifies (optic_now).
+    if (m_optic_this_frame && m_weapon_sig_frame != 0) {
+        m_optic_sig   = m_weapon_sig_frame;
+        m_optic_frame = m_frame.load();
+    }
+    m_optic_this_frame = false;
     {
         // unarmedhand: the gloves drawn and no weapon mesh (the weapon id counts every kept weapon-pass draw but the gloves).
         const bool unarmed = m_glove_seen_this_frame && m_weapon_sig_frame == 0;
@@ -16569,6 +16997,11 @@ void FarCry5Stereo::on_post_present()
                          "barrel ray meets the scene at {:.2f} m (shots converge at {:.2f} m); controller at ({:.2f}, {:.2f}, {:.2f}) m from the recentred head; weapon pass rewritten {} times",
                          m_aim_err_deg, m_aim_err_max, m_deg_per_count, glm::degrees(m_body_yaw), m_mo.ctrl_valid ? "tracked" : "missing", fc5::aim::last_hit(), m_mo.converge, m_mo.ctrl_ref.x, m_mo.ctrl_ref.y, m_mo.ctrl_ref.z, m_weapon_rewrites);
             m_aim_err_max = 0.0f;
+            if (m_flame_draws > 0 || m_flame_missed > 0) {
+                spdlog::info("[Flame] flameworld {}: {} weapon-pass particle draws drawn in the world in 5 s, {} left on the gun (no camera copy); muzzle shift ({:.2f}, {:.2f}, {:.2f}) m; on the gun now {:.2f} (flamehold {:.1f} s)",
+                             m_flame_world.load() ? "on" : "off", std::exchange(m_flame_draws, 0), std::exchange(m_flame_missed, 0), m_flame_shift.x, m_flame_shift.y, m_flame_shift.z,
+                             m_flame_attach, m_flame_hold.load());
+            }
         }
         if (m_afw_test.load()) {
             auto& s = fc5::afw::stats();
@@ -16588,10 +17021,23 @@ void FarCry5Stereo::on_post_present()
                 last_skips = m_exposure_skips;
             }
             if (m_afw_fp_eye.load()) {
-                spdlog::info("[AFW] afwfpeye: held-eye weapon passes {} ({} draws; skipped: other target {}, writes elsewhere {}, no camera copy {}, no held camera {}); rebuilds with them {} of {} (fed {}); depth {}x{} at {}x{}; gun vectors re-anchored {} (afwgunmv {})",
+                spdlog::info("[AFW] afwfpeye: held-eye weapon passes {} ({} draws; skipped: other target {}, writes elsewhere {}, no camera copy {}, no held camera {}); rebuilds with them {} of {} (fed {}); depth {}x{} at {}x{}; gun vectors re-anchored {} (afwgunmv {}), {} through the gun's transforms (afwgunmvpose {}); "
+                             "colour from the last image through the gun's pose {}, not ({}) (afwgunpose {}): the gun's move in the game camera's space between an eye's images {:.2f} cm mean, {:.2f} cm / {:.2f} deg max",
                              std::exchange(m_fp_frames, 0), std::exchange(m_fp_draws, 0), std::exchange(m_fp_skip_target, 0), std::exchange(m_fp_skip_uav, 0),
                              std::exchange(m_fp_skip_cb, 0), std::exchange(m_fp_skip_nocam, 0), s.fp_rebuilds, s.rebuilds, std::exchange(m_fp_composed, 0), m_fp_w, m_fp_h, m_fp_tex_ss, m_fp_tex_ss,
-                             std::exchange(m_gun_mv_fixed, 0), m_afw_gun_mv.load() ? "on" : "off");
+                             std::exchange(m_gun_mv_fixed, 0), m_afw_gun_mv.load() ? "on" : "off", std::exchange(m_gun_mv_pose_n, 0), m_afw_gun_mv_pose.load() ? "on" : "off",
+                             m_fp_pose_n, std::exchange(m_fp_pose_miss, 0), m_afw_gun_pose.load() ? "on" : "off", m_fp_pose_n ? m_fp_pose_cm / float(m_fp_pose_n) : 0.0f,
+                             m_fp_pose_max_cm, m_fp_pose_max_deg);
+                m_fp_pose_n = 0;
+                m_fp_pose_cm = m_fp_pose_max_cm = m_fp_pose_max_deg = 0.0f;
+            }
+            if (m_in_vehicle.load() || m_veh_own_n || m_veh_own_miss || m_veh_own_reject) {
+                spdlog::info("[AFW] afwvehown {}: {} frames through the car's model, {} without a model, {} refused (model and camera apart); the camera's spring in the car over a frame "
+                             "{:.1f} cm mean, {:.1f} cm / {:.2f} deg max",
+                             m_afw_veh_own.load() ? "on" : "off", std::exchange(m_veh_own_n, 0), std::exchange(m_veh_own_miss, 0), std::exchange(m_veh_own_reject, 0),
+                             m_veh_own_checked ? m_veh_own_cm / float(m_veh_own_checked) : 0.0f, m_veh_own_max_cm, m_veh_own_max_deg);
+                m_veh_own_checked = 0;
+                m_veh_own_cm = m_veh_own_max_cm = m_veh_own_max_deg = 0.0f;
             }
             s.fp_rebuilds = 0;
             s.captures = s.rebuilds = s.refused = s.depth_missing = 0;
@@ -17572,6 +18018,26 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             }
             hint("x1 = as before. Higher makes the game's light rumbles stronger (the strongest are already at the controller's limit); 0 = no vibration "
                  "from the game (the gesture zones' buzz stays).");
+            bool sb = m_shot_buzz.load();
+            if (ImGui::Checkbox("A firm pulse on every shot", &sb)) {
+                m_shot_buzz = sb;
+                keep("shotbuzz", sb ? "shotbuzz on" : "shotbuzz off");
+            }
+            hint("Each of your shots gives the hands holding the gun the same pulse, on top of the game's rumble (which changes from shot to shot). "
+                 "Off: only the game's rumble. Not with \"The game's own\" above.");
+            if (sb) {
+                float sa = m_shot_buzz_amp.load();
+                if (slider("Shot pulse strength", sa, 0.1f, 1.0f, "%.2f", 0.05f)) {
+                    m_shot_buzz_amp = sa;
+                    keep("shotbuzzamp", fmt::format("shotbuzzamp {:.2f}", sa));
+                }
+                int sm = m_shot_buzz_ms.load();
+                if (slider_int("Shot pulse length", sm, 20, 250, "%d ms", 10)) {
+                    m_shot_buzz_ms = sm;
+                    keep("shotbuzzms", fmt::format("shotbuzzms {}", sm));
+                }
+                hint("1.00 = the controller's strongest. Longer feels heavier; above about 100 ms the pulses of a fast automatic run together.");
+            }
             // The firing limit (fireturnmax: "never hide what you see" and "how far the view may turn to the gun") was removed (Homard 24 Oct):
             // shots always follow the barrel (no limit); firesplit keeps the drawn camera on the head.
         }
@@ -17586,6 +18052,21 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                 keep("tracersfromgun", tr == 2 ? "tracersfromgun on" : "tracersfromgun off");
             }
             hint("The game draws the tracer streaks from your eyes, not from the gun. Hidden: no streaks. Follow the muzzle: the streaks start at the gun barrel.");
+            bool fw = m_flame_world.load();
+            if (ImGui::Checkbox("Flames and smoke stay in the world (flamethrower)", &fw)) m_ui_cmds += fw ? "flameworld on\n" : "flameworld off\n";
+            hint("On (default): the flamethrower's flames and the gun's smoke and sparks leave the barrel and stay where they are in the world, "
+                 "as on a flat screen. Off: they are drawn with the gun, so flames already in the air swing with your hand (before 24 Oct).");
+            if (fw) {
+                float fh = m_flame_hold.load();
+                if (slider("Flames stay in the world for", fh, 0.0f, 5.0f, "%.1f s after firing", 0.1f)) {
+                    m_flame_hold = fh;
+                    keep("flamehold", fmt::format("flamehold {:.1f}", fh));
+                }
+                hint("When not firing, the flames and smoke go with the gun again, so the flamethrower's small pilot flame stays on its nozzle. "
+                     "While firing and for this long after you let go of the trigger they stay in the world (the stream still in the air), then "
+                     "they turn back onto the gun over 0.4 s. Longer if the last flames of a burst start to swing with your hand; shorter if the "
+                     "pilot flame lags the nozzle too long after a burst.");
+            }
             if (fc5::bullet::speed_available()) {
                 float bs = fc5::bullet::speed_scale();
                 if (slider("Bullet speed", bs, 1.0f, 4.0f, "x%.2f", 0.25f)) m_ui_cmds += fmt::format("bulletspeed {:.2f}\n", bs);
@@ -17687,7 +18168,7 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                         {
                             std::lock_guard _{ m_scope_mtx };
                             if (auto it = m_scope_zoom.find(m_weapon_sig.load()); it != m_scope_zoom.end()) k = it->second;
-                            if (auto it = m_scope_cal.find(m_weapon_sig.load()); it != m_scope_cal.end() && it->second.mag > 1.01f) optic = it->second.mag;
+                            if (auto it = m_scope_cal.find(m_weapon_sig.load()); it != m_scope_cal.end() && it->second.mag > 1.01f && optic_now(m_weapon_sig.load())) optic = it->second.mag;
                         }
                         if (optic > 0.0f) {
                             ImGui::SameLine();
@@ -18734,16 +19215,33 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             if (ImGui::Checkbox("AFW: hands and weapon drawn for each eye", &v)) { m_afw_fp_eye = v; m_fp_target_log = 0; }
             v = m_afw_gun_mv.load();
             if (ImGui::Checkbox("AFW: weapon motion for DLSS over both frames", &v)) m_afw_gun_mv = v;
+            v = m_afw_gun_pose.load();
+            if (ImGui::Checkbox("AFW: rebuilt eye's gun coloured through the gun's own pose", &v)) m_afw_gun_pose = v;
+            hint("On (default): the eye rebuilt this frame colours its gun from its own last image at the same spot of the gun, wherever the game moved the gun "
+                 "between the two frames. Off: as before 24 Oct (the spot the gun had in the game camera's view: the scope's turret and rings showed twice while walking). "
+                 "Command afwgunpose on/off.");
+            v = m_afw_gun_mv_pose.load();
+            if (ImGui::Checkbox("AFW: weapon motion for DLSS through the gun's own pose", &v)) { m_afw_gun_mv_pose = v; keep("afwgunmvpose", v ? "afwgunmvpose on" : "afwgunmvpose off"); }
+            hint("On (default since 24 Oct): the weapon's DLSS motion over both frames taken from the gun's own move (exact for the gun and its parts) instead of the game camera's. "
+                 "Command afwgunmvpose on/off.");
             v = fc5::afw::gun_own();
             if (ImGui::Checkbox("AFW: each eye keeps its own shading on the gun (no blinking)", &v)) m_ui_cmds += v ? "afwgunown on\n" : "afwgunown off\n";
             v = m_afw_steady.load();
             if (ImGui::Checkbox("AFW: steady view every frame (no doubled gun while walking)", &v)) m_afw_steady = v;
             hint("On: the hands and weapon are drawn a second time each frame with the other eye's camera, so that eye's gun has its own exact shape, as in Stereo; only its colour is taken from the eye drawn this frame. Off: the gun is moved over from the other eye by its depth (gaps and vibration at the edges). Command afwfpeye on/off; afwfpss 1/2 = edge smoothing off/on.");
+            v = m_afw_root_every.load();
+            if (ImGui::Checkbox("AFW: eye height from the body at every frame (no judder on slopes)", &v)) { m_afw_root_every = v; keep("afwroot", v ? "afwroot on" : "afwroot off"); }
+            hint("On (default since 24 Oct): in AFW the body's position, which sets the eyes' height with No up-and-down bob, is read at every frame. "
+                 "Off: every second frame as in Stereo (going up or down a slope, the view climbed in steps: judder). Command afwroot on/off.");
             float vb = m_afw_veh_body.load();
             if (slider("AFW: vehicle cab carried with the car (m)", vb, 0.0f, 3.0f, vb <= 0.001f ? "off" : "%.1f m", 0.1f)) {
                 m_afw_veh_body = vb;
                 keep("afwvehbody", fmt::format("afwvehbody {:.1f}", vb));
             }
+            v = m_afw_veh_own.load();
+            if (ImGui::Checkbox("AFW: vehicle cab placed with the car's own model", &v)) { m_afw_veh_own = v; keep("afwvehown", v ? "afwvehown on" : "afwvehown off"); }
+            hint("On (default since 24 Oct): the cab in the rebuilt eye is carried with the car model's own position and turn at each image. "
+                 "Off: with the game camera's frame, which springs inside the car at launch and bumps. Command afwvehown on/off.");
             v = m_afw_veh_mv.load();
             if (ImGui::Checkbox("AFW: DLSS moves the vehicle cab with the car", &v)) { m_afw_veh_mv = v; keep("afwvehmv", v ? "afwvehmv on" : "afwvehmv off"); }
             v = m_afw_start_stereo.load();
@@ -20981,7 +21479,7 @@ void WINAPI asm_hk_exec(ID3D11DeviceContext* ctx, ID3D11CommandList* cl, BOOL re
             g_asm_exec_other++;
         }
     }
-    g_asm_exec_hook.call<void>(ctx, cl, restore);
+    call_orig<void>(g_asm_exec_hook, 58, ctx, cl, restore);
 }
 
 // skinposelog (FarCry5SkinPose.cpp): the palette writer's call order.

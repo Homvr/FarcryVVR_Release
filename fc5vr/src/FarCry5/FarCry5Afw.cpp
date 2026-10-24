@@ -714,6 +714,11 @@ float4 psdiff(VSOut i) : SV_Target {
             return;
         }
         // v_t = R_t (V_t^T V_s (R_s^T v + p_s - c_s) + c_t - p_t)
+        if (s.veh_mesh && t.veh_mesh) {   // afwvehown: through the car model's own transform (its origin for c)
+            const glm::mat3 m = glm::transpose(t.mesh_rot) * s.mesh_rot;
+            rows_to(dst, t.rot * m * glm::transpose(s.rot), t.rot * (m * (s.pos - s.mesh_pos) + t.mesh_pos - t.pos));
+            return;
+        }
         const glm::mat3 carry = glm::transpose(t.veh_rot) * s.veh_rot;
         rows_to(dst, t.rot * carry * glm::transpose(s.rot), t.rot * (carry * (s.pos - s.veh_pos) + t.veh_pos - t.pos));
     }

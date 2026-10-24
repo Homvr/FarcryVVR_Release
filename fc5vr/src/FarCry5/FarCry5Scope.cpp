@@ -1283,6 +1283,19 @@ void FarCry5Stereo::scope_frame(int frame, const glm::vec3& eye_cam, const glm::
             cal      = m_scope_default;
             have_cal = true;
         }
+        // A magnifying entry needs sight glass now: a gun whose weapon pass draws no reticle or scope glass (Weapon_Reticle*,
+        // Weapon_ReticleGlow) has iron sights, whatever its entry (Homard 24 Oct: the M60 "without any sights is detected as
+        // having a scope": the weapon id is the largest mesh, shared with a scoped one learned x3.3 on 11 Oct, and iron sights
+        // can zoom past scopelearn's x3.0 too). It counts as a 1x entry meanwhile.
+        if (have_cal && cal.mag > 1.01f && st.sig != 0) {
+            if (!optic_now(st.sig)) {
+                if (m_optic_warned.insert(st.sig).second)
+                    spdlog::info("[Scope] weapon {}: its entry says x{:.1f}, but it draws no sight glass now (iron sights): no scope picture", st.sig, cal.mag);
+                cal.mag = 1.0f;
+            } else {
+                m_optic_warned.erase(st.sig);
+            }
+        }
     }
     // The weapon id (largest mesh of the weapon pass) changes for a moment while a rifle cycles its bolt or aims down
     // sights: the last magnifying entry stays in effect for 1.5 s through a change to an id without one.
@@ -1523,6 +1536,7 @@ void FarCry5Stereo::scope_learn_tick(bool on_foot, bool at_scope, UINT sig, bool
         a.sig     = sig;
         a.probe   = probe;
         a.upgrade = upgrade;
+        a.optic   = optic_now(sig);   // the gun as held before the press (while the game aims down sights its scope view may replace it)
         if (probe) {
             auto& t = m_scope_probed[sig];
             ++t.n;
@@ -1561,8 +1575,12 @@ void FarCry5Stereo::scope_learn_tick(bool on_foot, bool at_scope, UINT sig, bool
     }
     const float zoom = std::tan(glm::radians(a.hip) * 0.5f) / std::tan(glm::radians(a.min) * 0.5f);
     // Aiming down sights with a red dot narrows the camera too (x2.26 on the lodge-night SMG, simulator 2026-10-11; the
-    // scoped rifle x3.9): from x3.0 on it is a magnifying scope.
-    const float mag  = zoom >= 3.0f ? std::round(zoom * 10.0f) / 10.0f : 1.0f;
+    // scoped rifle x3.9): from x3.0 on it is a magnifying scope, if the gun draws sight glass (the M60's iron sights zoom
+    // x3.3, Homard 24 Oct).
+    bool optic = a.optic || optic_now(a.sig);
+    for (int i = 0; i < a.extra_n && !optic; ++i) optic = optic_now(a.extra[i]);
+    if (zoom >= 3.0f && !optic) spdlog::info("[Scope] scopelearn: weapon {}: zooms x{:.2f} but draws no sight glass: iron sights, not a scope", a.sig, zoom);
+    const float mag  = zoom >= 3.0f && optic ? std::round(zoom * 10.0f) / 10.0f : 1.0f;
     if (a.upgrade && mag <= 1.0f) return;   // the 1x entry was right
     ScopeCal    c    = m_scope_default;
     c.mag            = mag;
@@ -1697,6 +1715,7 @@ bool FarCry5Stereo::scope_glow_draw(ID3D11DeviceContext* ctx)
     }
     vs->Release();
     if (!glow) return false;
+    m_optic_this_frame = true;   // sight glass: this weapon may magnify (scope_frame)
     const int fr = m_frame.load();
     if (m_scope_glass.load() && m_scope_st.active && m_scope_st.frame == fr && m_scope_st.mvalid) {
         ID3D11Device* dev = nullptr;

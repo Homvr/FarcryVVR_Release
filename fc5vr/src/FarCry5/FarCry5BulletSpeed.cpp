@@ -263,6 +263,9 @@ namespace fc5::bullet
         std::atomic<bool>                  g_rel_armed{ false };
         std::atomic<int64_t>               g_rel_t{ 0 };   // steady_clock ns of the release
         std::atomic<uint64_t>              g_rel_press_ms{ 0 }, g_rel_weapon{ 0 };
+        // shotbuzz: the callback, the press whose first shot named the player's weapon, that weapon (r14).
+        std::atomic<void (*)()>            g_shot_cb{ nullptr };
+        std::atomic<uint64_t>              g_buzz_press{ 0 }, g_buzz_weapon{ 0 };
 
         bool read_f(const float* p, float& v)
         {
@@ -280,6 +283,12 @@ namespace fc5::bullet
         void speed_probe(safetyhook::Context& c)
         {
             const uint64_t n = ++g_shots;
+            if (auto cb = g_shot_cb.load(); cb && GetTickCount64() - g_player_fire_ms.load() <= 500) {
+                // shotbuzz: the first shot code call of a press is the player's weapon; later calls count only from that weapon.
+                const uint64_t press = g_press_ms.load();
+                if (g_buzz_press.exchange(press) != press) g_buzz_weapon = c.r14;
+                if (c.r14 == g_buzz_weapon.load()) cb();
+            }
             if (g_rel_armed.exchange(false)) {
                 const int64_t ms = (std::chrono::steady_clock::now().time_since_epoch().count() - g_rel_t.load()) / 1000000;
                 if (ms < 1500)
@@ -354,6 +363,7 @@ namespace fc5::bullet
         g_rel_armed    = true;
     }
     bool  speed_available() { return (bool)g_speed_hook; }
+    void  set_player_shot_callback(void (*cb)()) { g_shot_cb = cb; }
 
     void speed_status()
     {

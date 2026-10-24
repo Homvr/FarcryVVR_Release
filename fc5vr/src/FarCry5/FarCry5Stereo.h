@@ -1110,7 +1110,7 @@ private:
     float              m_veh_mesh_off{ 0.0f };
     bool               m_veh_mesh_off_valid{ false };
     std::atomic<bool>  m_veh_driving{ false };
-    void               vehicle_probe(ID3D11DeviceContext* ctx);
+    void               vehicle_probe(ID3D11DeviceContext* ctx, UINT count);
     float              m_veh_heading{ 0.0f }, m_veh_speed{ 0.0f };
     glm::vec3          m_veh_last_pos{ 0.0f };
     bool               m_veh_pos_valid{ false };
@@ -1655,7 +1655,7 @@ private:
     std::atomic<bool>  m_scope_learn{ true };     // cmd scopelearn on|off (saved)
     std::atomic<bool>  m_scope_probe_lt{ false }; // scopelearn's short aim-down-sights press (read by the pad hook)
     std::atomic<float> m_game_hfov{ 0.0f };       // the game camera's horizontal FOV (world view, before the eye rewrite)
-    struct ScopeAds { int state{ 0 }; std::chrono::steady_clock::time_point t0{}, drop{}; float hip{ 0.0f }, min{ 0.0f }; UINT sig{ 0 }; bool probe{ false }, upgrade{ false }; UINT extra[4]{}; int extra_n{ 0 }; } m_scope_ads{};
+    struct ScopeAds { int state{ 0 }; std::chrono::steady_clock::time_point t0{}, drop{}; float hip{ 0.0f }, min{ 0.0f }; UINT sig{ 0 }; bool probe{ false }, upgrade{ false }, optic{ false }; UINT extra[4]{}; int extra_n{ 0 }; } m_scope_ads{};
     ScopeCal           m_scope_sticky{};
     UINT               m_scope_sticky_sig{ 0 };
     std::chrono::steady_clock::time_point m_scope_sticky_at{};
@@ -1790,6 +1790,14 @@ private:
     std::atomic<float> m_zoom_stick_y{ 0.0f }, m_zoom_stick_x{ 0.0f };   // the right stick, from the pad hook
     std::unordered_map<UINT, float> m_scope_zoom{};   // per weapon (under m_scope_mtx)
     bool               m_scope_zoom_latch{ false };   // a step taken: the stick comes back near the centre before the next
+    // Sight glass (a reticle or a scope's glass) drawn in the weapon pass: only a gun drawing it now magnifies (an M60
+    // without sights has the weapon id of a scoped one, whose x3.3 entry it used, Homard 24 Oct). m_optic_this_frame: such
+    // a draw in this frame's weapon pass; m_optic_sig / m_optic_frame: the weapon id and frame it was last seen with.
+    bool               m_optic_this_frame{ false };
+    std::atomic<uint32_t> m_optic_sig{ 0 };
+    std::atomic<int>   m_optic_frame{ -1000 };
+    bool               optic_now(uint32_t sig) const { return sig != 0 && m_optic_sig.load() == sig && m_frame.load() - m_optic_frame.load() <= 30; }
+    std::unordered_set<uint32_t> m_optic_warned{};   // under m_scope_mtx
     float              scope_zoom_tick(UINT sig, float optic, bool active);   // the gun's zoom factor, moved by the stick
     // The scope pass picture fits the lens: drawn at this magnification or lower (wider), or, once the zoom has ramped up,
     // up to 10 % higher (its field has 10 % to spare). Zooming out (scopezoomstick) the picture of a pair or two before is
@@ -2151,7 +2159,15 @@ public:
     // rumble (Homard 24 Oct, tester: "shooting only vibrate left hand"): the game's pad rumble (motors 0-1) as amplitudes for the
     // left and right controllers (amp[0], amp[1]), by hand role. Called from the XInputSetState hook.
     void rumble_hands(float left_motor, float right_motor, float amp[2]);
+    // shotbuzz (Homard 24 Oct 21:25: "make it more intense and consistent when shooting"): each of the player's shots gives the
+    // hands that hold the gun one fixed pulse of their own (game thread, from the shot code; fc5::bullet).
+    void shot_buzz();
 private:
+    std::atomic<bool>    m_shot_buzz{ true };           // cmd shotbuzz on|off (saved): the fixed pulse on every shot (off: only the game's rumble)
+    std::atomic<float>   m_shot_buzz_amp{ 1.0f };       // cmd shotbuzzamp A (saved, 0.1-1): its strength (1 = the controller's strongest)
+    std::atomic<int>     m_shot_buzz_ms{ 80 };          // cmd shotbuzzms N (saved, 20-250): its length
+    std::atomic<int64_t> m_shot_buzz_last{ 0 };         // steady_clock ns of the last pulse (the pellets of one shot give one pulse)
+    std::atomic<int64_t> m_shot_buzz_until{ 0 };        // steady_clock ns: the pulse's end; until then the game's weaker rumble is held back
     std::atomic<int>   m_rumble_mode{ 1 };          // cmd rumble game|gun|both (saved): 0 the pad's left motor on the left controller, its right one on the right (the old way); 1 the weapon hand, plus the other hand while it holds the gun (both hands with no weapon in hand or driving); 2 both hands
     std::atomic<float> m_rumble_gain{ 1.0f };       // cmd rumblegain K (saved, 0-2): strength (0 = no vibration from the game)
     std::atomic<bool>  m_rumble_armed{ false };     // gesture_poll: a weapon in hand (not on the sling), on foot
@@ -2302,7 +2318,26 @@ private:
     // afwgunmv (AFW, default on): the weapon pass's previous camera re-anchored to the game frame the gun's previous world
     // position comes from (DLSS history two frames old, object motion one frame: a doubled gun while walking).
     std::atomic<bool>  m_afw_gun_mv{ true };
+    // afwgunpose (AFW, default on; Homard 24 Oct 14:45: "its the weapon that double in both eye the same way when I move"): the
+    // rebuilt eye's gun takes its colour from its own last image (afwgunown) through the gun's own pose in each of the two
+    // frames (its world transform), not through its place in the game camera's space. The game moves the gun in that space
+    // every frame (walk bob, sprint swing; gunstill holds it still in view), so the colour came from the wrong spot of the gun:
+    // the scope's turret and rings twice, a few pixels apart, in every rebuilt image while walking.
+    std::atomic<bool>  m_afw_gun_pose{ true };
+    // afwgunmvpose (AFW, default on since 24 Oct: Homard, "almost perfect" with it): afwgunmv's previous camera re-anchored
+    // through the gun's own transforms of the two frames (exact for the gun and its parts; the hands follow the gun) instead
+    // of the game camera's axes.
+    std::atomic<bool>  m_afw_gun_mv_pose{ true };
+    struct GunWorld { int frame{ -100 }; glm::mat4 Om{ 1.0f }; };
+    GunWorld           m_gun_world[4]{};   // the gun mesh's world transform by frame (afwgunpose, afwgunmvpose)
+    uint64_t           m_fp_pose_n{ 0 }, m_fp_pose_miss{ 0 }, m_gun_mv_pose_n{ 0 };
+    float              m_fp_pose_cm{ 0.0f }, m_fp_pose_max_cm{ 0.0f }, m_fp_pose_max_deg{ 0.0f };   // the gun's move in the game camera's space between an eye's two images
     std::atomic<bool>  m_afw_steady{ true };
+    // afwroot (default on, 24 Oct; Homard: "a lot of judder with the overall picture especially when going uphill/downhill"):
+    // in AFW the player's body root is taken at every frame (each is its own game update), not every second one as in Stereo.
+    // walkbob sets the eyes' height from the root's: with the root one update stale every other frame, on a slope the eyes
+    // climbed in two-frame steps. viewpivot and the steady view read it too.
+    std::atomic<bool>  m_afw_root_every{ true };
     // afwdepthlate (default on, only in a vehicle): AFW's depth copy retaken at present, after everything of the frame is
     // drawn (the copy at the scene depth's first release may come before the player's vehicle is drawn: the cab then
     // has the road's depth and the rebuilt eye throws it off by a frame of driving). Every 2 s in a vehicle the log
@@ -2319,10 +2354,20 @@ private:
     ID3D11Texture2D*   m_depth_probe_stage[2]{};
     std::chrono::steady_clock::time_point m_depth_probe_t{};
     void afw_vehicle_depth(ID3D11DeviceContext* ctx);
-    // afwvehbody (default 1.5 m; 16 Oct: the cab still doubled with afwvehnear 5 and afwdepthlate): in a vehicle, nearer than this
+    // afwvehbody (default 3 m since 24 Oct, Homard: 3 reduced the cab's doubling a lot, 0 made it worse; was 1.5 m): in a vehicle, nearer than this
     // the AFW rebuild carries both images with the vehicle (its attitude is the body frame, the seat the game camera), not as
     // static world, so the held eye's own cab is used again (with afwvehnear alone what the fresh eye could not see was filled).
-    std::atomic<float> m_afw_veh_body{ 1.5f };
+    std::atomic<float> m_afw_veh_body{ 3.0f };
+    // afwvehown (default on, 24 Oct): the cab nearer than afwvehbody is carried with the vehicle model's own transform at each
+    // image (the largest Vehicle_ draw under the camera, as the gun now uses its own pose), not the frame of the game camera,
+    // which springs inside the car at launch and bumps. A frame whose model and camera disagree by more than 25 cm or 4 deg
+    // over one frame (another part of the car found) keeps the camera's frame.
+    std::atomic<bool>  m_afw_veh_own{ true };
+    struct VehWorld { int frame{ -100 }; UINT count{ 0 }; glm::mat3 rot{ 1.0f }; glm::vec3 pos{ 0.0f }; };
+    VehWorld           m_veh_world[4]{};   // the car model's transform by frame (world -> its axes, its origin)
+    uint64_t           m_veh_own_n{ 0 }, m_veh_own_miss{ 0 }, m_veh_own_reject{ 0 }, m_veh_own_checked{ 0 };
+    float              m_veh_own_cm{ 0.0f }, m_veh_own_max_cm{ 0.0f }, m_veh_own_max_deg{ 0.0f };   // the camera's spring in the car over a frame
+    void               afw_veh_own_stamp(int frame);
     // afwvehmv (default on; 16 Oct, still some doubling with afwvehbody): in AFW and a vehicle, DLSS gets the cab's motion (nearer
     // than afwvehbody) from the vehicle's frame over the eye's two-frame history; the game's vector covers only one frame.
     std::atomic<bool>  m_afw_veh_mv{ true };
@@ -2715,6 +2760,32 @@ private:
         glm::vec3 cur_cam{ 0.0f }, prev_cam{ 0.0f };
     };
     PassHistory        m_hist[2]{};   // 0 world, 1 first-person pass
+    std::unordered_set<ID3D11PixelShader*> m_particle_ps{};   // flameworld: particle shaders (CSceneParticleEmitterRendererParameterProvider)
+    // flameworld (FarCry5Stereo.cpp, flame_upload): weapon-pass particles drawn with the eye's own camera, moved only so the game's
+    // muzzle sits on the drawn one, so flames already emitted stay in the world.
+    std::atomic<bool>  m_flame_world{ true };
+    struct FlameCb
+    {
+        ID3D11Resource*    res{ nullptr };   // the game's weapon camera buffer
+        int                frame{ -100 };
+        std::vector<float> data;             // its contents with the particle camera
+    };
+    static constexpr int kFlameSlots = 8;
+    FlameCb            m_flame_cb[kFlameSlots]{};
+    ID3D11Buffer*      m_flame_standin[kFlameSlots]{};
+    UINT               m_flame_standin_size[kFlameSlots]{};
+    PassHistory        m_flame_hist{};
+    ID3D11Buffer*      m_flame_cb_orig{ nullptr };
+    bool               m_flame_cb_swapped{ false };
+    uint64_t           m_flame_draws{ 0 }, m_flame_missed{ 0 };
+    glm::vec3          m_flame_shift{ 0.0f };
+    std::atomic<float> m_flame_hold{ 1.5f };   // flamehold: seconds after firing before weapon-pass particles go back on the gun
+    std::chrono::steady_clock::time_point m_flame_fire_t{};   // the trigger last seen held
+    float              m_flame_attach{ 1.0f };   // 0 in the world .. 1 on the gun (last upload)
+    void               flame_upload(const float* d, uint32_t size, int frame, const glm::mat3& eye_rot, const glm::vec3& eye_cam, const glm::vec3& cam,
+                                    const glm::mat3& w_full, const glm::vec3& w_off, const glm::mat4& proj);
+    bool               flame_cb_swap(ID3D11DeviceContext* ctx);
+    void               flame_cb_restore(ID3D11DeviceContext* ctx);
     std::atomic<float> m_debug_yaw_amp{ 0.0f };     // flat test: simulated head yaw sweep (degrees)
     std::atomic<int>   m_debug_yaw_period{ 90 };    // frames per sweep
     std::atomic<float> m_debug_sway_pos{ 0.0f };    // test head sideways sway, metres

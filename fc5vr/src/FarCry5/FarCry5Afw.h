@@ -36,6 +36,11 @@ namespace fc5::afw
         bool      veh_valid{ false };
         glm::mat3 veh_rot{ 1.0f };
         glm::vec3 veh_pos{ 0.0f };
+        // afwvehown: the vehicle model's own transform at this image (world -> its axes, its origin), when it was found: the
+        // cab is fixed in the car, while the game camera springs inside it (launch, bumps).
+        bool      veh_mesh{ false };
+        glm::mat3 mesh_rot{ 1.0f };
+        glm::vec3 mesh_pos{ 0.0f };
     };
 
     struct Stats

@@ -1,5 +1,17 @@
 # Changelog
 
+## alpha 0.12 (24 October 2026)
+- **OFXR:** the mod now works with OFXR Bridge running (3D and VR instead of a flat image), confirmed in the headset.
+  It also avoids a stall while loading.
+- **AFW:** the gun no longer doubles up between the eyes when you move, the car interior stays steady while
+  driving, and the view no longer judders going up or down hills.
+- **Scopes:** guns without a scope (such as the M60 with no sights) are no longer treated as scoped.
+- **Vibration:** every shot gives a firm, even pulse in the gun hand. Its strength and length can be set in
+  F11 > Weapon > Feel.
+- **Flamethrower:** flames, muzzle smoke and sparks stay where they were fired instead of swinging with your hand.
+  Fired flames stay in the world for 1.5 s after you let go (F11 > Weapon > Bullet tracers).
+- **Flamethrower pilot flame:** stays on the nozzle when not firing (new, not yet checked in the headset).
+
 ## alpha 0.11 (24 October 2026)
 - **Scopes:** with two hands on the gun, the right stick zooms in steps (x1, x4, x8, x16, x32). Shadows outside the
   scope stay sharp, zooming out no longer turns the scope black, and sniper zoom levels are read correctly.

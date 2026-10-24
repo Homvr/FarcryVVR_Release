@@ -1,4 +1,4 @@
-Far Cry 5 VR - alpha 0.11: known issues
+Far Cry 5 VR - alpha 0.12: known issues
 
 Thanks for testing! Things we already know about (no need to report them, unless they look worse than described):
 
