@@ -1,0 +1,15 @@
+Far Cry 5 VR - alpha 0.11: known issues
+
+Thanks for testing! Things we already know about (no need to report them, unless they look worse than described):
+
+- Only tested on a Quest 3 with Virtual Desktop (VDXR), an RTX 4090 and the Steam copy of the game. Other headsets, runtimes and the Ubisoft Connect or Epic copies should work but are untested.
+- Performance on an RTX 4090: about 50 fps in Stereo, 80+ in AFW. If it is too slow, use AFW (F8) or a lower DLSS mode in the launcher.
+- Cutscenes play in 3D around you. If one feels uncomfortable, F11 > "Cinematics (cutscenes)" can show them on a flat screen instead.
+- Stars can still drift slightly when you turn your head.
+- Water: short black flickers on the water while turning, a pale line along some shores, and far rivers that end in a straight line (that last one is the game's own).
+- Headsets wider than about 116 degrees: objects can pop in at the far edges of the view.
+- AFW is early and experimental, with visible artifacts: Stereo is the recommended mode. Vehicles in AFW can still look a little unsteady on big bumps.
+
+When something looks wrong, please send: what you did, Stereo or AFW, a short video if you can, and the file fc5vr_log.txt from the game's bin folder (right after closing the game).
+
+If the game does not start in VR (it closes, stays black or starts flat): start it with FC5VR_Launcher.exe. When the game closes during the start or crashes, the launcher offers to save FC5VR_report_<date>.zip in the bin folder; send that zip (its "Make a report" button makes one at any time). It holds the mod's log and crash report, your VR runtime's log, your system details and Windows' error events for the game. Nothing is uploaded.

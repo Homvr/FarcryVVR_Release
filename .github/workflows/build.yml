@@ -1,0 +1,85 @@
+# Builds the mod (dxgi.dll) and the launcher on a Windows runner with the NVIDIA DLSS SDK fetched from NVIDIA's own
+# GitHub repository (it is not in this repository: NVIDIA's licence), and packages FC5VR_<release>.zip.
+# Every push to main: the zip as a build artifact. Run by hand with a release name (Actions > Build > Run workflow):
+# also a GitHub pre-release of that name, tagged on the built commit, with the zip and SHA256.txt attached.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      release:
+        description: Release and tag name, e.g. alpha_0_11 (empty = build only)
+        required: false
+        default: ''
+      title:
+        description: Name shown in the README and the release, e.g. alpha 0.11
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  # The DLSS runtime shipped with the mod (nvngx_dlss.dll: the release's own, 310.9.1) and the SDK the mod compiles
+  # against (the 3.7 API: nvsdk_ngx.h and nvsdk_ngx_helpers.h as on the builder's PC).
+  DLSS_RUNTIME_TAG: v310.9.1
+  DLSS_SDK_TAG: v3.7.10
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: DLSS SDK
+        shell: pwsh
+        run: |
+          $sdk = "$env:RUNNER_TEMP\dlss-sdk"
+          git clone -q --depth 1 --branch $env:DLSS_SDK_TAG https://github.com/NVIDIA/DLSS $sdk
+          if ($env:DLSS_RUNTIME_TAG -eq $env:DLSS_SDK_TAG) { $rt = $sdk } else {
+            $rt = "$env:RUNNER_TEMP\dlss-runtime"
+            git clone -q --depth 1 --branch $env:DLSS_RUNTIME_TAG https://github.com/NVIDIA/DLSS $rt
+          }
+          New-Item -ItemType Directory -Force deps\ngx\lib\Windows_x86_64 | Out-Null
+          Copy-Item "$sdk\include" deps\ngx\include -Recurse -Force
+          # nvsdk_ngx_d.lib: the x64 one built with the current MSVC (not the vs2010-vs2013 builds).
+          $lib = Get-ChildItem "$sdk\lib\Windows_x86_64" -Recurse -Filter nvsdk_ngx_d.lib | Where-Object { $_.DirectoryName -notmatch 'vs20\d\d' } | Select-Object -First 1
+          if (-not $lib) { throw 'nvsdk_ngx_d.lib not found in the DLSS SDK' }
+          Copy-Item $lib.FullName deps\ngx\lib\Windows_x86_64\
+          Copy-Item "$rt\lib\Windows_x86_64\rel\nvngx_dlss.dll" deps\ngx\
+          Get-ChildItem deps\ngx -Recurse -File | ForEach-Object { '{0,10}  {1}' -f $_.Length, $_.FullName }
+
+      - name: Build
+        shell: cmd
+        env:
+          FC5VR_ONLINE_DEPS: '1'
+        run: call build.bat
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $rel = if ('${{ inputs.release }}') { '${{ inputs.release }}' } else { "build_$($env:GITHUB_SHA.Substring(0, 7))" }
+          .\release\package.ps1 -Release $rel -Title '${{ inputs.title }}' -Commit $env:GITHUB_SHA.Substring(0, 7)
+          "REL=$rel" >> $env:GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FC5VR_${{ env.REL }}
+          path: |
+            out/*.zip
+            out/SHA256.txt
+            fc5vr/build/build-release-msvc/dxgi.pdb
+
+      - name: Release
+        if: ${{ inputs.release != '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $notes = "release\RELEASE_NOTES_${{ inputs.release }}.md"
+          if (-not (Test-Path $notes)) { $notes = 'CHANGELOG.md' }
+          $title = if ('${{ inputs.title }}') { 'Far Cry 5 VR ${{ inputs.title }}' } else { '${{ inputs.release }}' }
+          gh release create '${{ inputs.release }}' "out\FC5VR_${{ inputs.release }}.zip" out\SHA256.txt --target $env:GITHUB_SHA --title $title --notes-file $notes --prerelease
