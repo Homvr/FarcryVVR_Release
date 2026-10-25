@@ -1198,7 +1198,7 @@ namespace fc5::skelhand
     }
     // The object that flew furthest from the hand; its launch: the first sample moving over 3 m/s, then p(t) = p0 + v0 t + a t^2 / 2
     // fitted (least squares, per axis) over the next 0.5 s.
-    ThrowFit throw_fit()
+    ThrowFit throw_fit(const glm::vec3& head_dir)
     {
         ThrowFit r;
         std::lock_guard _{ g_tp_mtx };
@@ -1216,6 +1216,11 @@ namespace fc5::skelhand
             }
             cands.push_back({ furthest, vmax, &v, e });
             if (v.size() < 6 || vmax > 100.0f) continue;   // a teleport (a pooled object put elsewhere), not a throw
+            // Not the thrown object (Homard's headset, 24 Oct: two fits flew 146-175 deg from where he looked): it must start within
+            // 1 m of the throwing hand and fly within 60 deg (sideways) of the head's direction.
+            if (glm::length(v.front().p - g_tp_hand) > 1.0f) { r.rejected++; continue; }
+            const glm::vec2 hh{ head_dir.x, head_dir.y }, mv{ v.back().p.x - v.front().p.x, v.back().p.y - v.front().p.y };
+            if (glm::length(hh) > 1e-3f && glm::length(mv) > 1.0f && glm::dot(glm::normalize(hh), glm::normalize(mv)) < 0.5f) { r.rejected++; continue; }
             if (furthest > bd) { bd = furthest; best = &v; }
         }
         std::sort(cands.begin(), cands.end(), [](const Cand& a, const Cand& b) { return a.dist > b.dist; });
@@ -1234,9 +1239,16 @@ namespace fc5::skelhand
         size_t i0 = 0;
         for (size_t i = 1; i < v.size(); ++i)
             if (glm::length(v[i].p - g_tp_hand) > 1.0f) { i0 = i - 1; break; }
+        // Over the next 0.5 s; 1 s when that holds fewer than 5 samples (the simulator at ~35 fps wrote a flying knife 3-4 times in 0.5 s).
         double S[5]{}, Bx[3][3]{};
-        int    n = 0;
-        for (size_t i = i0; i < v.size() && v[i].t - v[i0].t <= 0.5f; ++i, ++n) {
+        int    n   = 0;
+        float  win = 0.5f;
+        {
+            int k = 0;
+            for (size_t i = i0; i < v.size() && v[i].t - v[i0].t <= 0.5f; ++i) ++k;
+            if (k < 5) win = 1.0f;
+        }
+        for (size_t i = i0; i < v.size() && v[i].t - v[i0].t <= win; ++i, ++n) {
             const double tt = v[i].t - v[i0].t, pw[3]{ 1.0, tt, tt * tt };
             for (int k = 0; k < 5; ++k) S[k] += std::pow(tt, k);
             for (int ax = 0; ax < 3; ++ax) for (int k = 0; k < 3; ++k) Bx[ax][k] += v[i].p[ax] * pw[k];

@@ -1344,6 +1344,15 @@ void VR::on_config_load(const utility::Config& cfg, bool set_defaults) {
     if (m_motion_controls_inactivity_timer->value() <= 10.0f) {
         m_motion_controls_inactivity_timer->value() = 30.0f;
     }
+
+    // Far Cry 5: Stereo pairs both eyes on one pose sample only with Async AER off (the odd frame keeps the even frame's
+    // sample, FarCry5Stereo::store_xr_views). On, the left eye was sent at the right eye's present with the right eye's newer
+    // pose: the headset moved it by a frame of head motion every pair, a tremor in the left eye only (players, 25 Oct; the
+    // framework default is on and the release ships no vr_config.txt). AFW turns async on by itself (m_fc5_afw_active).
+    if (m_use_async_aer->value()) {
+        spdlog::warn("[VR] VR_AsyncAER was on in vr_config.txt: turned off (Stereo needs both eyes on one pose sample; AFW is unaffected)");
+        m_use_async_aer->value() = false;
+    }
 }
 
 void VR::on_config_save(utility::Config& cfg) {

@@ -205,6 +205,10 @@ struct FarCry5Stereo::GunStillState
     bool          first_have{ false };
     float         first_obj[12]{}, prev_obj[12]{};
     uint64_t      first_current{ 0 }, first_stale{ 0 }, first_other{ 0 };
+
+    // meleestill (FarCry5Melee.cpp): a melee weapon's game hand in the weapon's own axes (smoothed), per weapon.
+    struct MeleeHand { glm::vec3 h{ 0.0f }; bool ok{ false }, said{ false }; };
+    std::unordered_map<uint32_t, MeleeHand> melee{};
 };
 
 void FarCry5Stereo::gun_still_first_draw()
@@ -641,8 +645,47 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
         }
     }
 
+    // meleestill (FarCry5Melee.cpp, Homard 25 Oct 10:22: "better align melee weapon with controller and also desactivate any game
+    // animation of the weapon and hands when swinging melee weapon"): a melee weapon is never learned (the game holds it 55-60 cm
+    // below the camera, out of the learning's reach), so the game's idle, run and swing animations all showed. Its held pose is
+    // made instead: the weapon turned so its length (the model's +Y, the barrel's axis on guns) points along meleepitch / meleeyaw /
+    // meleeroll from the aim's axis, about the game's hand on it, which stays at its grip point; held at all times but a throw.
+    bool melee_hold = false;
+    if (m_mel_still.load() && melee_weapon(sig) && !m_mo.slung) {
+        auto&     mh = s.melee[sig];
+        glm::vec3 c{ 0.0f };
+        bool      c_ok = false;
+        {
+            std::lock_guard _{ m_weapon_cal_mtx };
+            if (auto it = m_grip_hand.find(sig); it != m_grip_hand.end() && it->second.ok) { c = it->second.c; c_ok = true; }
+        }
+        const bool hand_now = m_frame.load() - m_wpn_hand_frame <= 3;
+        if (!c_ok && hand_now) { c = m_wpn_hand_cam; c_ok = true; }
+        // The game's hand on it (else its grip point, where the game holds that hand on average) in the weapon's axes.
+        if (new_update && (hand_now || c_ok)) {
+            const glm::vec3 h = glm::vec3{ glm::inverse(Q) * glm::vec4{ hand_now ? m_wpn_hand_cam : c, 1.0f } };
+            if (glm::length(h) < 0.6f) {
+                mh.h  = mh.ok ? glm::mix(mh.h, h, 0.05f) : h;
+                mh.ok = true;
+            }
+        }
+        if (mh.ok && c_ok) {
+            const glm::quat R = melee_hold_rot();
+            ref.pose          = Pose{ R, c - R * mh.h };
+            ref.ok            = true;
+            melee_hold        = true;
+            if (!mh.said) {
+                mh.said             = true;
+                const glm::vec3 len = glm::mat3_cast(qp.r) * glm::vec3{ 0.0f, 1.0f, 0.0f };
+                spdlog::info("[Melee] meleestill: weapon {} held as a melee weapon (the game held its length toward ({:.2f}, {:.2f}, {:.2f}) in the camera's axes, its hand at "
+                             "({:.2f}, {:.2f}, {:.2f}) in the weapon's; now meleepitch {:.0f}, meleeyaw {:.0f}, meleeroll {:.0f})",
+                             sig, len.x, len.y, len.z, mh.h.x, mh.h.y, mh.h.z, m_mel_pitch.load(), m_mel_yaw.load(), m_mel_roll.load());
+            }
+        }
+    }
     // Held unless a reload or a throw is under way, the pose is unknown, or the gun is far from it (another mesh).
-    const bool hold = m_gun_still.load() && ref.ok && !s.reload && !throwing && glm::length(qp.t - ref.pose.t) < 0.6f;
+    const bool hold = melee_hold ? !throwing
+                                 : m_gun_still.load() && ref.ok && !s.reload && !throwing && glm::length(qp.t - ref.pose.t) < 0.6f;
     s.alpha         = std::clamp(s.alpha + (hold ? 1.0f : -1.0f) * da / std::max(0.02f, m_gst_ease.load()), 0.0f, 1.0f);
     const int  prev_applied = s.applied_frame;
     const bool prev_full    = s.applied_full;

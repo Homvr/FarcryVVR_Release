@@ -22,6 +22,7 @@
 #include "FarCry5Aim.h"
 #include "FarCry5Afw.h"
 
+#include <glm/gtc/matrix_access.hpp>
 #include <glm/gtc/quaternion.hpp>
 #include <spdlog/spdlog.h>
 
@@ -262,6 +263,7 @@ void FarCry5Stereo::draw_fc2vr_menu(const std::function<void(const char*, std::s
         hint("Test of the detection only: a fast swing of your weapon hand (over meleespeed, 2.5 m/s) with something within reach in front is written "
              "to the log ([Melee]). The game's melee is not pressed yet.");
     }
+    draw_melee_menu(keep, hint);   // meleehit (FarCry5Melee.cpp)
     {
         bool v = m_skin_pose.load();
         if (ImGui::Checkbox("Gun and hands moved in their own draws##skinpose", &v)) {
@@ -291,13 +293,50 @@ void FarCry5Stereo::draw_fc2vr_menu(const std::function<void(const char*, std::s
 }
 
 // throwarc: the predicted throw drawn into this eye's image (as the aim dot: small discs written with ClearView at projected points).
+// The launch of the throwable in hand: measured (its own, else the last measured throw's), else throwarcspeed / throwarcup.
+FarCry5Stereo::ArcFit FarCry5Stereo::throw_fit_now(bool& measured) const
+{
+    measured = false;
+    if (fc5::gesture::throw_is_rock()) {   // the game's rock (582 indices): its own measure, else 26 m/s, 3 deg (headset 24 Oct)
+        if (auto it = m_arc_fit.find(582u); it != m_arc_fit.end()) { measured = true; return it->second; }
+        return ArcFit{ 26.0f, 3.0f, 9.81f };
+    }
+    if (auto it = m_arc_fit.find(m_arc_sig.load()); it != m_arc_fit.end()) { measured = true; return it->second; }
+    if (auto it = m_arc_fit.find(m_arc_rel_sig); it != m_arc_fit.end()) { measured = true; return it->second; }
+    // throwv2 before any measure: the knife's 36-40 m/s with no lift and the rock's 26 m/s, 3 deg (simulator 24-25 Oct) -> 25 m/s, 0 deg.
+    if (fc5::gesture::throw_v2()) return ArcFit{ 25.0f, 0.0f, 9.81f };
+    return ArcFit{ m_arc_speed.load(), m_arc_up.load(), 9.81f };
+}
+
 void FarCry5Stereo::draw_throw_arc(ID3D11DeviceContext* ctx, ID3D11Texture2D* bb)
 {
-    if (!m_throw_arc.load() || !m_motion.load() || !m_mo.valid || m_menu_screen_on || m_player_views_this_frame == 0 || m_hist[0].cur_frame != m_frame.load()) return;
-    const bool held = fc5::gesture::throw_phase() == fc5::gesture::ThrowPhase::Held || m_rb_down.load();
-    const glm::vec3 o  = m_mo.other_valid ? m_mo.other_pos_world : m_mo.aim_origin;
-    glm::vec3       hf = glm::normalize(m_mo.head_world);
-    if (m_arc_was_held && !held) throw_arc_release(o, hf);   // let go: the thrown object's launch measured
+    // throwv2: its own trajectory (both grips held), along where the left controller points, from the holding hand; measured at the throw.
+    const bool v2 = fc5::gesture::throw_v2();
+    if ((!m_throw_arc.load() && !v2) || !m_motion.load() || !m_mo.valid || m_menu_screen_on || m_player_views_this_frame == 0 || m_hist[0].cur_frame != m_frame.load()) return;
+    const auto ph   = fc5::gesture::throw_phase();
+    const bool held = v2 ? fc5::gesture::throw_arc_shown() : ph == fc5::gesture::ThrowPhase::Held || m_rb_down.load();
+    glm::vec3  o    = m_mo.other_valid ? m_mo.other_pos_world : m_mo.aim_origin;
+    if (v2) {
+        glm::mat3 r{ 1.0f };
+        throwable_hold_pose(o, r);
+    }
+    glm::vec3 hf = glm::normalize(m_mo.head_world);
+    if (v2) {
+        // The game's throw goes once RB is let go (Throw): measured from then, against the game camera's direction (the lift it adds).
+        const bool gone = ph == fc5::gesture::ThrowPhase::Throw || ph == fc5::gesture::ThrowPhase::Follow;
+        // Against the trajectory's own launch direction (kept from while it showed): the fit's "above" and "to its left" are then the throw's miss.
+        if (gone && !m_arc_v2_gone) {
+            bool meas         = false;
+            m_arc_rel_up_used = throw_fit_now(meas).up;   // the lift the camera was lowered by: the measured miss is added to it
+            throw_arc_release(o, m_arc_v2_dir_ok ? m_arc_v2_dir : glm::normalize(-glm::vec3{ glm::row(glm::mat4{ m_mo.game_rot }, 2) }));
+            m_arc_rel_v2 = m_arc_v2_dir_ok;
+        }
+        if (ph == fc5::gesture::ThrowPhase::Idle) m_arc_v2_dir_ok = false;
+        m_arc_v2_gone = gone;
+    } else if (m_arc_was_held && !held) {
+        throw_arc_release(o, hf);   // let go: the thrown object's launch measured
+        m_arc_rel_v2 = false;
+    }
     m_arc_was_held = held;
     if (!held) {
         m_arc_drawn = false;
@@ -329,12 +368,16 @@ void FarCry5Stereo::draw_throw_arc(ID3D11DeviceContext* ctx, ID3D11Texture2D* bb
     if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1))) || !ctx1) return;
     // From the left hand (the throwable's), where the head looks, raised by throwarcup; a throwable thrown before: its measured launch
     // (speed, angle above the head's direction, gravity).
-    ArcFit fit{ m_arc_speed.load(), m_arc_up.load(), 9.81f };
     // (the held throwable's id is not steady while it is drawn: the last measured throw stands in for one not measured yet)
-    bool measured = false;
-    if (auto it = m_arc_fit.find(m_arc_sig.load()); it != m_arc_fit.end()) { fit = it->second; measured = true; }
-    else if (auto it2 = m_arc_fit.find(m_arc_rel_sig); it2 != m_arc_fit.end()) { fit = it2->second; measured = true; }
-    const float     yaw = std::atan2(-hf.x, hf.y), pit = std::asin(std::clamp(hf.z, -1.0f, 1.0f)) + glm::radians(fit.up);
+    bool         measured = false;
+    const ArcFit fit      = throw_fit_now(measured);
+    // throwv2: launched along the left controller (the throw turns the game camera to it minus the lift, throw_dir_world).
+    if (v2 && m_mo.other_valid) {
+        hf               = glm::normalize(-m_mo.other_rot_world[2]);
+        m_arc_v2_dir     = hf;
+        m_arc_v2_dir_ok  = true;
+    }
+    const float     yaw = std::atan2(-hf.x, hf.y), pit = std::asin(std::clamp(hf.z, -1.0f, 1.0f)) + (v2 ? 0.0f : glm::radians(fit.up));
     const glm::vec3 v  = glm::vec3{ -std::sin(yaw) * std::cos(pit), std::cos(yaw) * std::cos(pit), std::sin(pit) } * fit.speed;
     D3D11_TEXTURE2D_DESC d{};
     bb->GetDesc(&d);
@@ -380,6 +423,10 @@ void FarCry5Stereo::draw_throw_arc(ID3D11DeviceContext* ctx, ID3D11Texture2D* bb
 // reach (the barrel ray's scene hit under 1.2 m) is logged, at most every 0.6 s.
 void FarCry5Stereo::melee_frame()
 {
+    melee_hit_frame();   // meleehit (FarCry5Melee.cpp)
+    // One eye's presents only: from one eye's present to the other's the hand moved 4-8 cm with the controller still (7-16 m/s,
+    // simulator 25 Oct), so the speeds of 24 Oct's swings were partly that.
+    if (m_frame.load() & 1) return;
     if (!m_melee_swing.load() || !m_motion.load() || !m_mo.valid || !m_mo.ctrl_valid || m_menu_screen_on) {
         m_melee_have = false;
         return;
@@ -394,7 +441,12 @@ void FarCry5Stereo::melee_frame()
             m_melee_peak  = std::max(m_melee_peak, m_melee_v);
             // The hand's motion: the direction marched each frame from the hand (0.8 m, aim channel 1) while it moves over 1 m/s.
             if (v > 1.0f) m_melee_dir = glm::normalize(glm::mix(m_melee_dir, glm::normalize(rel - m_melee_rel), 0.6f));
-            m_melee_dir_ok = m_melee_v > 1.0f || m_melee_pending;
+            // Where the swing started (the hand before it went over 1 m/s), so a fast swing that is already at the wall when it is seen
+            // is still caught (Homard's headset, 24 Oct: the 12 swings of 7.9-15.7 m/s all "nothing within 0.8 m").
+            const bool moving = m_melee_v > 1.0f || m_melee_pending;
+            if (moving && !m_melee_dir_ok) m_melee_rel0 = m_melee_rel;
+            m_melee_dir_ok = moving;
+            m_melee_travel = m_melee_dir_ok ? glm::length(rel - m_melee_rel0) : 0.0f;
             if (m_melee_v > m_melee_speed.load() && now - m_melee_last > std::chrono::milliseconds(600)) {
                 // A swing: judged once the marches dispatched along it from now on have answered (2 results, or 0.2 s): a result read
                 // at once came from the frames before, along the previous motion (simulator 24 Oct: swings up "hit" the ground).
@@ -409,14 +461,18 @@ void FarCry5Stereo::melee_frame()
             const float mhit = fc5::aim::hit_since_mark(1, n);   // the nearest scene within 0.8 m of the hand along its swing
             if (m_melee_pending && (n >= 2 || now - m_melee_pending_t > std::chrono::milliseconds(200))) {
                 m_melee_pending  = false;
-                const float hit  = m_melee_pending_barrel;
-                const bool  reach = mhit > 0.0f && mhit <= 0.8f;
+                // The ray from the swing's start reaches 0.8 m past the hand's travel; the gun itself within 0.4 m of the scene counts too.
+                const float hit   = std::max(m_melee_pending_barrel, fc5::aim::last_hit());
+                const float reach_m = 0.8f + m_melee_travel;
+                const bool  by_ray  = mhit > 0.0f && mhit <= reach_m;
+                const bool  by_gun  = hit > 0.0f && hit <= 0.4f;
+                const bool  reach   = by_ray || by_gun;
                 m_melee_swings++;
                 if (reach) m_melee_hits++;
-                spdlog::info("[Melee] swing {:.1f} m/s (threshold {:.1f}) toward ({:.2f}, {:.2f}, {:.2f}); along the swing ({} marches): {}; the barrel ray: {}: {} ({} of {} swings would have)",
-                             m_melee_pending_v, m_melee_speed.load(), m_melee_dir.x, m_melee_dir.y, m_melee_dir.z, n,
-                             reach ? fmt::format("the scene {:.2f} m from the hand", mhit) : std::string{ "nothing within 0.8 m" },
-                             hit > 0.0f ? fmt::format("the scene {:.1f} m ahead", hit) : std::string{ "nothing ahead" },
+                spdlog::info("[Melee] swing {:.1f} m/s (threshold {:.1f}) toward ({:.2f}, {:.2f}, {:.2f}), the hand {:.2f} m from where it started; along the swing from there ({} marches): {}; the barrel ray: {}: {} ({} of {} swings would have)",
+                             m_melee_pending_v, m_melee_speed.load(), m_melee_dir.x, m_melee_dir.y, m_melee_dir.z, m_melee_travel, n,
+                             by_ray ? fmt::format("the scene {:.2f} m from the start (reach {:.2f})", mhit, reach_m) : fmt::format("nothing within {:.2f} m", reach_m),
+                             hit > 0.0f ? fmt::format("the scene {:.2f} m ahead{}", hit, by_gun ? " (the gun at it)" : "") : std::string{ "nothing ahead" },
                              reach ? "would press melee (log only)" : "no melee", m_melee_hits, m_melee_swings);
             }
         }
@@ -442,18 +498,20 @@ void FarCry5Stereo::throw_arc_result()
 {
     if (!m_arc_wait || std::chrono::steady_clock::now() - m_arc_rel_t < std::chrono::milliseconds(2600)) return;
     m_arc_wait  = false;
-    const auto r = fc5::skelhand::throw_fit();
+    const auto r = fc5::skelhand::throw_fit(m_arc_rel_head);
     if (!r.ok) {
-        spdlog::info("[ThrowArc] measured throw: no object flew from the hand ({} entities followed, the furthest steady one moved {:.1f} m){}", r.tracked, r.dist, r.path);
+        spdlog::info("[ThrowArc] measured throw: no object flew from the hand ({} entities followed, {} not starting at the hand or flying off the look, the furthest kept one moved {:.1f} m){}", r.tracked, r.rejected, r.dist, r.path);
         return;
     }
     const float sp    = glm::length(r.v0);
     const float elev  = glm::degrees(std::asin(std::clamp(r.v0.z / std::max(sp, 1e-3f), -1.0f, 1.0f)));
     const glm::vec2 hh{ m_arc_rel_head.x, m_arc_rel_head.y }, vh{ r.v0.x, r.v0.y };
     const float side = (glm::length(hh) > 1e-3f && glm::length(vh) > 1e-3f) ? glm::degrees(std::atan2(hh.x * vh.y - hh.y * vh.x, glm::dot(hh, vh))) : 0.0f;
-    const bool  sane = sp > 3.0f && sp < 80.0f && r.g > 2.0f && r.g < 30.0f;
+    // The last good value per throwable stays unless this one is sane and within 60 deg (sideways) of the look.
+    const bool  sane = sp > 3.0f && sp < 80.0f && r.g > 2.0f && r.g < 30.0f && std::abs(side) <= 60.0f;
     spdlog::info("[ThrowArc] measured throw (throwable {}): launch {:.3f} s after the release, {:.1f} m/s, {:.1f} deg above level ({:.1f} above the head's direction, {:.1f} deg to its left), "
                  "gravity {:.2f} m/s2, flew {:.1f} m; {} samples fitted, {} entities followed{}; path from the hand:{}",
                  m_arc_rel_sig, r.t_launch, sp, elev, elev - m_arc_rel_pitch, side, r.g, r.dist, r.samples, r.tracked, sane ? "" : " (not taken: out of range)", r.path);
-    if (sane && m_arc_rel_sig) m_arc_fit[m_arc_rel_sig] = ArcFit{ sp, elev - m_arc_rel_pitch, r.g };
+    // throwv2: measured against the trajectory, so the lift is the one used plus the miss.
+    if (sane && m_arc_rel_sig) m_arc_fit[m_arc_rel_sig] = ArcFit{ sp, (m_arc_rel_v2 ? m_arc_rel_up_used : 0.0f) + elev - m_arc_rel_pitch, r.g };
 }

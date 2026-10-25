@@ -115,7 +115,8 @@ void FarCry5Stereo::empty_hands_frame()
     bool        sprint = false;
     float       since_moving = 1e6f;
     const float speed        = gun_still_speed(sprint, since_moving);
-    const bool  throwing     = m_rb_down.load() || fc5::gesture::throw_phase() != fc5::gesture::ThrowPhase::Idle;
+    // throwv2 (Homard 24 Oct: "remove all animation that might interfere with the throwing"): the hands stay on their controllers through a throw.
+    const bool  throwing     = !fc5::gesture::throw_v2() && (m_rb_down.load() || fc5::gesture::throw_phase() != fc5::gesture::ThrowPhase::Idle);
     if (throwing) e.last_throw = now;
     const float since_x     = std::chrono::duration<float>(now - clock::time_point{ clock::duration{ m_pad_x_press.load() } }).count();
     const float since_throw = e.last_throw == clock::time_point{} ? 1e6f : std::chrono::duration<float>(now - e.last_throw).count();

@@ -1249,13 +1249,22 @@ public:
     // drawn again on the chest between throws (throwchest).
     struct ThrowableState;
     ThrowableState*      m_th{ nullptr };
-    void                 throwable_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base);   // a non-glove weapon-pass draw
+    void                 throwable_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool record_only = false);   // a non-glove weapon-pass draw (record_only: an arm draw, hidden)
     void                 throwable_chest(ID3D11DeviceContext* ctx);   // at the gloves draw, before it
     void                 throwable_pouch(ID3D11DeviceContext* ctx);   // the pouch marking the grab spot, with the gloves' material
     void                 throwable_restore(ID3D11DeviceContext* ctx);
     bool                 throwable_command(const std::string& cmd, const std::string& arg, float fv, std::istream& rest, bool& persist);
     void                 throwable_note_support(const glm::mat4& A, const glm::vec3& F);   // the gloves draw's left-hand move
     bool                 m_th_cb_swapped{ false };    // a throwable draw's object constants swapped (restored with the hands')
+    // throwv2 (FarCry5Gesture): the other controller's pointing direction in the recentred reference (motion update -> gesture_poll),
+    // whether a throwable's model is recorded (its peek), the recorded copy drawn in the holding hand.
+    std::atomic<float>   m_other_fwd_ref[3]{ 0.0f, 0.0f, -1.0f };
+    std::atomic<bool>    m_throw_split{ true };   // throwsplit on|off (saved): see the aim loop
+    bool                 throwable_recorded() const;
+    void                 draw_throw_v2_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint,
+                                            const std::function<void(const char*)>& section);
+    void                 throwable_hold_pose(glm::vec3& pos, glm::mat3& rot) const;
+    void                 throw_all_probe(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, UINT inst);   // throwallprobe (test)   // the holding hand's controller (world); left unchanged for the left hand
     bool                 m_hand_bones_swapped{ false };
     std::atomic<int> m_plane_scan{ 0 };
     std::atomic<bool>  m_aim_once{ true };
@@ -2338,6 +2347,9 @@ private:
     // walkbob sets the eyes' height from the root's: with the root one update stale every other frame, on a slope the eyes
     // climbed in two-frame steps. viewpivot and the steady view read it too.
     std::atomic<bool>  m_afw_root_every{ true };
+    // afwfoot, afwrail (default on since 25 Oct, Homard: "great work on AFW, add it as a default setting in debug AFW"; F11 Debug >
+    // AFW): from the BioShock VR mod's rebuild, see FarCry5Afw.h.
+    std::atomic<bool>  m_afw_foot{ true }, m_afw_rail{ true };
     // afwdepthlate (default on, only in a vehicle): AFW's depth copy retaken at present, after everything of the frame is
     // drawn (the copy at the scene depth's first release may come before the player's vehicle is drawn: the cab then
     // has the road's depth and the rebuilt eye throws it off by a frame of driving). Every 2 s in a vehicle the log
@@ -2640,6 +2652,12 @@ private:
     // throwarc's measured throws (24 Oct night): the thrown object's launch read from the game's entity transforms after each release.
     struct ArcFit { float speed{ 0.0f }, up{ 0.0f }, g{ 9.81f }; };
     std::map<UINT, ArcFit> m_arc_fit;             // per throwable (its held mesh's index count)
+    ArcFit             throw_fit_now(bool& measured) const;   // the held throwable's launch (measured, or throwarcspeed / throwarcup)
+    bool               m_arc_v2_gone{ false };        // throwv2: the game's throw under way (measured once from its start)
+    glm::vec3          m_arc_v2_dir{ 0.0f };          // throwv2: the trajectory's launch direction while it showed (world)
+    bool               m_arc_v2_dir_ok{ false };
+    bool               m_arc_rel_v2{ false };         // the measured release was a throwv2 throw (against its trajectory)
+    float              m_arc_rel_up_used{ 0.0f };     // the lift its camera was lowered by
     std::atomic<bool>  m_arc_snap{ false };        // throwarcsnap (test)
     std::atomic<UINT>  m_arc_sig{ 0 };              // the throwable held now (throwable_draw)
     bool               m_arc_was_held{ false }, m_arc_wait{ false };
@@ -2660,10 +2678,69 @@ private:
     uint64_t           m_melee_swings{ 0 };
     glm::vec3          m_melee_dir{ 0.0f, 1.0f, 0.0f };   // the hand's motion (world axes, relative to the game camera)
     bool               m_melee_dir_ok{ false };            // moving fast enough to march along it (the hand-motion ray, aim channel 1)
+    glm::vec3          m_melee_rel0{ 0.0f };               // the hand (from the game camera, world axes) where the swing started
+    float              m_melee_travel{ 0.0f };             // how far the hand has gone since
     uint64_t           m_melee_hits{ 0 };
     bool               m_melee_pending{ false };           // a swing waiting for the marches along it
     float              m_melee_pending_v{ 0.0f }, m_melee_pending_barrel{ -1.0f };
     std::chrono::steady_clock::time_point m_melee_pending_t{};
+    // meleehit (FarCry5Melee.cpp, Homard 24 Oct 21:59 "progress on colision-based melee"): the weapon (or the bare hand) swung into a
+    // character's body (its draws' root, a standing capsule) faster than meleespeed is a hit: logged (1), or the game's melee pressed
+    // with its aim turned onto the point hit (2) and a pulse on the hand.
+    struct MeleeBody { glm::vec3 rel{ 0.0f }; bool test{ false }; };   // a body's root (feet), from that frame's game camera, world axes
+    std::atomic<int>   m_mel_mode{ 0 };            // meleehit 0|1|2 (off, log, hit; saved)
+    std::atomic<float> m_mel_reach{ 0.55f };       // meleereach m: the weapon's length ahead of the hand (bare hand 0.12)
+    std::atomic<float> m_mel_radius{ 0.30f };      // meleeradius m: the body capsule's radius
+    std::atomic<int>   m_mel_button{ 0 };          // meleebutton r3|rt|both|auto (0, 1, 2, 3; saved, default r3 since release 0.12.1): auto = rt with a melee weapon, else r3
+    std::atomic<bool>  m_mel_held_melee{ false };  // the weapon in hand is a melee weapon (melee_hit_frame; meleebutton auto)
+    std::atomic<int>   m_mel_press_ms{ 120 };      // meleepressms: how long the button is held
+    std::atomic<int>   m_mel_wait_ms{ 120 };       // meleewait: the longest wait for the game's aim before the press
+    std::atomic<float> m_mel_gate{ 15.0f };        // meleegate deg: the aim this close to the point hit presses at once
+    std::atomic<int>   m_mel_cool_ms{ 650 };       // meleecool: the shortest time between two hits
+    std::atomic<float> m_mel_buzz_amp{ 1.0f };     // meleebuzz 0-1: the hit's pulse on the hand (0 = none)
+    std::atomic<bool>  m_mel_aim_on{ true };       // meleeaim on|off: the game's aim turned onto the point hit for the press
+    std::atomic<float> m_mel_slew{ 60.0f };        // meleeslew deg: the aim's largest step per send while turning onto it (firesplitslew 12 otherwise)
+    // meleestill (Homard 25 Oct 10:22): a melee weapon held at a made pose, its length along the aim's axis turned by meleepitch /
+    // meleeyaw / meleeroll (deg), the game's animations of it (and the hands with it) taken out (FarCry5GunStill.cpp).
+    std::atomic<bool>  m_mel_still{ false };       // meleestill on|off (saved; off by default since release 0.12.1)
+    std::atomic<float> m_mel_pitch{ 40.0f }, m_mel_yaw{ 0.0f }, m_mel_roll{ 0.0f };
+    std::atomic<float> m_mel_blade{ 0.70f };       // meleeblade m: a melee weapon's length ahead of the hand (meleehit)
+    std::atomic<float> m_mel_auto_m{ 0.62f };      // meleeauto m: a weapon whose game hand sits farther than this from the camera is a melee weapon
+    std::set<uint32_t> m_mel_force_on, m_mel_force_off;   // meleeweapons +sig -sig (saved): set by hand, under m_mel_mtx
+    bool               melee_weapon(uint32_t sig);
+    glm::quat          melee_hold_rot() const;      // the made pose's turn (weapon axes -> game camera axes)
+    std::atomic<int>   m_mel_log{ 0 };             // meleelog N (test): N seconds of bodies seen, one line a second
+    std::mutex         m_mel_mtx;
+    std::vector<MeleeBody> m_mel_cur, m_mel_bodies; // the frame being drawn, the last whole frame
+    int                m_mel_cur_frame{ -100 }, m_mel_bodies_frame{ -100 };
+    glm::vec3          m_mel_test_rel{ 0.0f };     // meleetest x y z [s] (test): a body standing there (from the game camera, world axes)
+    std::chrono::steady_clock::time_point m_mel_test_until{};
+    // The weapon segment (hand side, tip, from the game camera) at the last present of each eye: the speed is measured between presents
+    // of the same eye (from one eye's present to the other's the hand jumped 4-8 cm with the controller still: 7-16 m/s, simulator 25 Oct).
+    bool               m_mel_have[2]{};
+    glm::vec3          m_mel_p0[2]{}, m_mel_p1[2]{};
+    std::chrono::steady_clock::time_point m_mel_t[2]{};
+    float              m_mel_v_hand{ 0.0f }, m_mel_v_tip{ 0.0f };   // meleelog
+    std::chrono::steady_clock::time_point m_mel_last_hit{}, m_mel_log_t{};
+    float              m_mel_v{ 0.0f };
+    std::vector<int>   m_mel_inside;               // per body: touching last present (a hit is entering one)
+    int                m_mel_state{ 0 };           // 0 idle, 1 aiming, 2 pressed
+    std::chrono::steady_clock::time_point m_mel_state_t{};
+    glm::vec3          m_mel_target{ 0.0f };       // the point hit, world
+    bool               m_mel_aimed{ false };       // the game's aim is on it (motion_post_present)
+    float              m_mel_aim_err{ -1.0f };     // the game's aim from it, deg (motion_post_present, while aiming)
+    std::atomic<int64_t> m_mel_press_until{ 0 };   // steady_clock ticks: the button held until then (read by the pad)
+    std::atomic<float> m_mel_buzz{ 0.0f };         // a pulse waiting for the pad (amplitude)
+    uint64_t           m_mel_hits{ 0 }, m_mel_presses{ 0 }, m_mel_swings{ 0 };
+    bool               melee_command(const std::string& cmd, const std::string& arg, std::istream& rest, bool& persist);
+    void               melee_note_character(const glm::vec3& origin);   // a skinned character draw (world_character_draw)
+    void               melee_hit_frame();                               // once per present (melee_frame)
+    bool               melee_aim(glm::vec3& want) const;                // the game's aim for the press (motion_post_present)
+    void               draw_melee_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);
+public:
+    void               melee_pad(WORD& buttons, BYTE& rt, float& buzz) ;   // the pad (VR::on_xinput_get_state): the press and the pulse
+    bool               melee_wants_characters() const { return m_mel_mode.load() > 0; }
+private:
     void               melee_frame();    void               draw_fc2vr_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint,
                                        const std::function<void(const char*)>& section);    void               view_log_line(int frame, const glm::mat3& eye_rot, const glm::vec3& eye_cam, const glm::vec3& cam, const glm::vec3& base_cam);
     void               draw_pivot_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);

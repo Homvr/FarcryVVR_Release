@@ -719,7 +719,7 @@ private:
 
     const ModKey::Ptr m_recenter_view_key{ ModKey::create(generate_name("RecenterViewKey")) };
     const ModToggle::Ptr m_decoupled_pitch{ ModToggle::create(generate_name("DecoupledPitch"), false) };
-    const ModToggle::Ptr m_use_async_aer{ ModToggle::create(generate_name("AsyncAER"), true) };
+    const ModToggle::Ptr m_use_async_aer{ ModToggle::create(generate_name("AsyncAER"), false) };
     const ModToggle::Ptr m_use_custom_view_distance{ ModToggle::create(generate_name("UseCustomViewDistance"), false) };
     const ModToggle::Ptr m_hmd_oriented_audio{ ModToggle::create(generate_name("HMDOrientedAudio"), true) };
     const ModSlider::Ptr m_view_distance{ ModSlider::create(generate_name("CustomViewDistance"), 10.0f, 3000.0f, 500.0f) };

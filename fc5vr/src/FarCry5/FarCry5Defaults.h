@@ -4,6 +4,7 @@
 // release pre_alpha_0_1 (Homard 20 Oct: "make all my current settings the default"). Replayed at start before
 // fc5vr_settings.txt, which overrides them line by line; written as fc5vr_settings.txt when there is none, so a fresh
 // file is exactly this text. tools\release\fc5_package.ps1 checks the shipped file against it.
+// Release 0.12.1 (Homard 25 Oct 12:40: "make sure that experimental melee and throwable are off by default"): throwable off.
 namespace fc5 {
 inline constexpr const char* kReleaseSettings = R"FC5VR(
 # Far Cry 5 VR settings: the same commands as fc5vr_cmd.txt, replayed at start (edited by the mod).
@@ -127,7 +128,7 @@ steadyexact on
 steadyview off
 taamv on
 taaskip on
-throwable on
+throwable off
 tracersfromgun on
 upright on
 vehfade off

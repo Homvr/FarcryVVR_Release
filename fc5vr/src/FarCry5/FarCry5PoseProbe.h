@@ -51,6 +51,6 @@ namespace fc5::skelhand
     // throwarc's probe: from a throw's release (the throwing hand's world position), every entity the writer (+0x6a10660) sets near the
     // hand is followed for 2.5 s; throw_fit then gives the launch of the one that flew furthest (velocity at launch, gravity).
     void        throw_probe_arm(const glm::vec3& hand);
-    struct ThrowFit { bool ok{ false }; glm::vec3 p0{ 0.0f }, v0{ 0.0f }; float g{ 0.0f }, t_launch{ 0.0f }, dist{ 0.0f }; int samples{ 0 }, tracked{ 0 }; std::string path; };
-    ThrowFit    throw_fit();
+    struct ThrowFit { bool ok{ false }; glm::vec3 p0{ 0.0f }, v0{ 0.0f }; float g{ 0.0f }, t_launch{ 0.0f }, dist{ 0.0f }; int samples{ 0 }, tracked{ 0 }, rejected{ 0 }; std::string path; };
+    ThrowFit    throw_fit(const glm::vec3& head_dir);   // head_dir: the head's direction at the release (world)
 }

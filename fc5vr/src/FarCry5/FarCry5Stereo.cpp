@@ -3299,7 +3299,13 @@ void FarCry5Stereo::note_compute_shader(ID3D11ComputeShader* cs, const void* cod
         }
         // Research (file probes\csdump.on present at start): the disassembly of the passes that rebuild positions with
         // LinearDepthReconstructionVector (no slot for the eye's off-centre part), to see how they use it.
-        if (out.find("LinearDepthReconstructionVector") != std::string::npos && std::filesystem::exists("D:/SteamLibrary/steamapps/common/FarCry5/VRMod_dev/probes/csdump.on")) {
+        // Checked once, without throwing: on a player's PC D: can be an empty card reader or disc drive, and the throwing
+        // exists() then aborted the game at its first such shader ("exists: The device is not ready", report 25 Oct 01:49).
+        static const bool csdump = [] {
+            std::error_code ec;
+            return std::filesystem::exists("D:/SteamLibrary/steamapps/common/FarCry5/VRMod_dev/probes/csdump.on", ec);
+        }();
+        if (csdump && out.find("LinearDepthReconstructionVector") != std::string::npos) {
             using DisFn = HRESULT(WINAPI*)(const void*, SIZE_T, UINT, const char*, ID3DBlob**);
             static auto dis = reinterpret_cast<DisFn>(GetProcAddress(LoadLibraryA("d3dcompiler_47.dll"), "D3DDisassemble"));
             ID3DBlob*   txt = nullptr;
@@ -6329,7 +6335,8 @@ void FarCry5Stereo::note_object_constants(ID3D11Resource* res, const float* data
 bool FarCry5Stereo::world_character_draw(ID3D11DeviceContext* ctx, UINT count, UINT instances)
 {
     const bool census = m_body_census_frame == m_frame.load();
-    if (!census && !(m_hide_body.load() && m_motion.load())) {
+    const bool melee  = m_mel_mode.load() > 0 && m_motion.load();   // meleehit: the characters' roots (FarCry5Melee.cpp)
+    if (!census && !melee && !(m_hide_body.load() && m_motion.load())) {
         return false;
     }
     ID3D11PixelShader* ps = nullptr;
@@ -6380,6 +6387,7 @@ bool FarCry5Stereo::world_character_draw(ID3D11DeviceContext* ctx, UINT count, U
         return false;
     }
     for (auto* b : cbs) if (b) b->Release();
+    if (melee && has1) melee_note_character(glm::vec3{ c1.f[3], c1.f[7], c1.f[11] });
     if (!(m_hide_body.load() && m_motion.load()) || !has1) {
         return false;
     }
@@ -7955,6 +7963,9 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
                 return true;
             }
         }
+        // throwable: the game draws its throwables other than the knife with the arms' material (simulator 25 Oct, Homard's save: a weapon-pass
+        // draw of 2334 indices, pixel shader #D31033ED, from RB's 13th frame), so an arm draw is looked at too (recorded only: it stays hidden).
+        if (arm && count > 0 && m_motion.load()) throwable_draw(ctx, count, start, base, true);
         if (arm) return true;
         if (glove) m_glove_seen_this_frame = true;   // unarmedhand
         if (glove && m_motion.load()) throwable_chest(ctx);   // throwable: the recorded throwable drawn on the chest first
@@ -8155,6 +8166,7 @@ void WINAPI FarCry5Stereo::hk_draw_indexed(ID3D11DeviceContext* ctx, UINT count,
     FC5_TRACE("hk_draw_indexed");
     static auto& self = Get();
     if (foreign_thread()) { call_orig<void>(self->m_draw_idx_hook, 12, ctx, count, start, base); return; }
+    self->throw_all_probe(ctx, count, start, base, 1);   // throwallprobe (test)
     if (self->m_cd_state.load() == 2) self->cd_draw();
     MenuViewportRestore restore_vp{ ctx };
     restore_vp.on = self->menu_fill_viewport(ctx, count, restore_vp.vp, restore_vp.scissor, restore_vp.scissors);
@@ -8463,6 +8475,7 @@ void WINAPI FarCry5Stereo::hk_draw_indexed_instanced(ID3D11DeviceContext* ctx, U
     FC5_TRACE("hk_draw_indexed_instanced");
     static auto& self = Get();
     if (foreign_thread()) { call_orig<void>(self->m_draw_idx_i_hook, 20, ctx, count, inst, start, base, start_inst); return; }
+    self->throw_all_probe(ctx, count, start, base, inst);   // throwallprobe (test)
     if (self->m_cd_state.load() == 2) self->cd_draw();
     MenuViewportRestore restore_vp{ ctx };
     restore_vp.on = self->menu_fill_viewport(ctx, count, restore_vp.vp, restore_vp.scissor, restore_vp.scissors);
@@ -9278,6 +9291,7 @@ void FarCry5Stereo::afw_present(ID3D11DeviceContext* ctx)
     }
     const int frame = m_frame.load();
     afw_veh_own_stamp(frame);   // afwvehown
+    fc5::afw::set_experiments((m_afw_foot.load() ? 1 : 0) | (m_afw_rail.load() ? 2 : 0));   // afwfoot, afwrail
     const auto& rec = m_afw_cams[frame & 3];
     if (rec.frame != frame || !rec.cam[frame & 1].valid) {
         afw_record(frame, frame & 1, 3, -1, -1, 0.0f, rec.frame != frame ? "no camera record for this frame" : "camera not valid");
@@ -9744,12 +9758,13 @@ void FarCry5Stereo::on_present()
                 fc5::aim::march(g_framework->get_d3d11_hook()->get_device(), ctx, clean ? m_aim_depth : m_scene_snapshot, ray);
                 if (m_melee_swing.load() && m_melee_dir_ok) {
                     // meleeswing: from the weapon hand along its swing, 5-80 cm; depths no farther than the hand (+12 cm) are the gun and hands.
+                    // From where the swing started, over 0.8 m past the hand's travel; depths no farther than the hand now (+12 cm) skipped.
                     fc5::aim::Ray mr = ray;
-                    mr.origin_rel    = m_mo.ctrl_pos_world - m_hist[0].cur_cam;
+                    mr.origin_rel    = m_world_cam_pos + m_melee_rel0 - m_hist[0].cur_cam;
                     mr.dir           = m_melee_dir;
                     mr.start         = 0.05f;
-                    mr.stop          = 0.8f;
-                    mr.near_skip     = glm::length(mr.origin_rel) + 0.12f;
+                    mr.stop          = 0.8f + m_melee_travel;
+                    mr.near_skip     = std::max(glm::length(mr.origin_rel), glm::length(m_mo.ctrl_pos_world - m_hist[0].cur_cam)) + 0.12f;
                     fc5::aim::march(g_framework->get_d3d11_hook()->get_device(), ctx, clean ? m_aim_depth : m_scene_snapshot, mr, 1);
                 }
                 fc5::gputime::end(ctx, fc5::gputime::kAim);
@@ -12848,6 +12863,7 @@ bool FarCry5Stereo::update_motion(int frame, const glm::mat3& game_rot, const gl
         m_other_have     = have_other;
         m_other_pos_ref  = other;
         m_other_rot_ref  = other_rot;
+        for (int i = 0; i < 3; ++i) m_other_fwd_ref[i] = -other_rot[2][i];   // throwv2 (gesture_poll): where it points
         const glm::vec3 span = other - glm::vec3{ k[3] };
         if (m_two_hand.load() && have_other && glm::length(span) > 0.08f) {
             const glm::vec3 fwd   = glm::normalize(span);
@@ -13263,6 +13279,9 @@ void FarCry5Stereo::motion_post_present(float dt)
     // direction (where the game throws from) instead of the head or the barrel; the trigger does not fire meanwhile.
     glm::vec3       throw_want{ 0.0f };
     const bool      throwing = throw_dir_world(throw_want);
+    // meleehit (FarCry5Melee.cpp): from a hit until its press is over, the game camera turned onto the point hit (as a throw).
+    glm::vec3       melee_want{ 0.0f };
+    const bool      meleeing = !throwing && melee_aim(melee_want);
     const bool      trigger = !throwing && (m_trigger.load() || m_dbg_trigger.load());
     // fireready (Homard 20 Oct 12:11: "the gun still jump around and the first bullets are bad ... make the background
     // animation in always 'ready to fire' mode"): on foot with the weapon in hand, the game's aim stays on the barrel (firesplit
@@ -13299,7 +13318,11 @@ void FarCry5Stereo::motion_post_present(float dt)
         m_split_meas_seq   = m_mo.ev_seq;
     }
     bool            split   = false;
-    if (can_split && !throwing && (aim_barrel || m_split_on)) {
+    // throwsplit (throwv2, test): the game's aim goes to the throw's direction as it goes to the barrel when firing, the drawn and culled
+    // camera kept on the head by Extended View (the camera turned 30-45 deg off the head for up to 0.7 s to throw, simulator 25 Oct).
+    // Not for a rock: with the split on, the game's rock throw (D-pad down) never left (simulator 25 Oct, three tries; off: thrown).
+    const bool      throw_split = throwing && m_throw_split.load() && fc5::gesture::throw_v2() && !fc5::gesture::throw_is_rock();
+    if (can_split && (!throwing || throw_split) && (aim_barrel || m_split_on || throw_split || meleeing)) {
         // The game keeps the Extended View offset it applied (yaw +0x6C, pitch +0x70, see head look below): its aim
         // is the uploaded camera minus that, and the aim is what the mouse steers here.
         const bool measure = m_fire_measure.load() && m_ev_cam_lag.load() > 0;
@@ -13340,11 +13363,11 @@ void FarCry5Stereo::motion_post_present(float dt)
         }
     }
     // firefast: the swing onto the barrel at a trigger press goes in one send (the measured aim counts every send on its way,
-    // so a gain of 1 does not overshoot); once the shot is out the loop goes back to aimgain.
-    const bool fast_swing = m_fire_fast.load() && split && trigger && !m_fire_open && m_fire_measure.load() && m_ev_cam_lag.load() > 0;
+    // so a gain of 1 does not overshoot); once the shot is out the loop goes back to aimgain. meleehit: the turn onto the point hit too.
+    const bool fast_swing = m_fire_fast.load() && split && (trigger || meleeing) && !m_fire_open && m_fire_measure.load() && m_ev_cam_lag.load() > 0;
     // The game culls (decides what to draw) with its own camera; while firing its aim goes all the way to the barrel (the
     // fireturnmax limit, 180 = none by default, was removed 24 Oct). With firesplit the drawn camera stays on the head.
-    glm::vec3 want = throwing ? throw_want : aim_barrel ? m_mo.aim_world : m_mo.head_world;
+    glm::vec3 want = throwing ? throw_want : meleeing ? melee_want : aim_barrel ? m_mo.aim_world : m_mo.head_world;
     if (const float back = m_aim_back_limit.load(); split && aim_barrel && !throwing && back > 0.0f) {
         // aimbacklimit (Homard 22 Oct: "culling when holding the weapon 180 degrees ... or block extreme angles"): the game's aim goes at
         // most this far round from where the head looks, and keeps the side it is on until the barrel is 30 deg past straight back.
@@ -13404,6 +13427,8 @@ void FarCry5Stereo::motion_post_present(float dt)
     const float e_pit = pit_d - pit_c;
     // throwable: the game throws once its camera is on the throw's direction (throwgate deg; see FarCry5Gesture).
     m_throw_aimed = throwing && glm::degrees(std::sqrt(e_yaw * e_yaw + e_pit * e_pit)) < fc5::gesture::throw_gate_deg();
+    m_mel_aim_err = meleeing ? glm::degrees(std::sqrt(e_yaw * e_yaw + e_pit * e_pit)) : -1.0f;
+    m_mel_aimed   = meleeing && m_mel_aim_err < m_mel_gate.load();
 
     if (split) {
         // Extended View turns the camera from the aim onto the head (offset / the game's weight), once per stereo pair.
@@ -13414,7 +13439,7 @@ void FarCry5Stereo::motion_post_present(float dt)
             // Against the aim this frame's mouse send will give (the game applies the send and the offset in the same
             // update): computed from the aim before the send, the camera trailed the aim's swing by one frame and
             // culled what the head saw for that frame (headset 2026-10-11: "the culling kind of flash at times").
-            const float     step = glm::radians(std::clamp(m_split_slew_deg.load(), 1.0f, 90.0f));
+            const float     step = glm::radians(std::clamp(meleeing ? std::max(m_split_slew_deg.load(), m_mel_slew.load()) : m_split_slew_deg.load(), 1.0f, 90.0f));
             const float     g    = fast_swing ? 1.0f : m_aim_gain.load();
             const float     ay   = yaw_c + std::clamp(e_yaw * g, -step, step);
             const float     ap   = pit_c + std::clamp(e_pit * g, -step, step);
@@ -13684,7 +13709,7 @@ void FarCry5Stereo::motion_post_present(float dt)
     dy     = std::clamp(dy, -600, 600);
     if (split) {
         // firesplit: the aim swings at most firesplitslew degrees per send (the Extended View offset is set for that step).
-        const int mx = std::max(1, int(std::clamp(m_split_slew_deg.load(), 1.0f, 90.0f) / std::max(1e-4f, m_deg_per_count)));
+        const int mx = std::max(1, int(std::clamp(meleeing ? std::max(m_split_slew_deg.load(), m_mel_slew.load()) : m_split_slew_deg.load(), 1.0f, 90.0f) / std::max(1e-4f, m_deg_per_count)));
         dx = std::clamp(dx, -mx, mx);
         dy = std::clamp(dy, -mx, mx);
     }
@@ -13972,7 +13997,25 @@ fc5::gesture::Output FarCry5Stereo::gesture_poll(bool weapon_grip, bool other_gr
     m_finger_grip_in[m_left_handed.load() ? 1 : 0] = in.hand[fc5::gesture::kWeaponHand].grip;
     m_finger_grip_in[m_left_handed.load() ? 0 : 1] = in.hand[fc5::gesture::kOtherHand].grip;
     in.throw_aimed                          = m_throw_aimed.load();
-    auto valid = [](const glm::mat4& m) { return std::isfinite(m[3][0]) && (m[0][0] != 0.0f || m[1][1] != 0.0f || m[2][2] != 0.0f); };
+    in.wheel                                = m_wheel_open.load();
+    in.recorded                             = throwable_recorded();
+    {
+        bool  sprint = false;
+        float since  = 1e6f;
+        const float speed = gun_still_speed(sprint, since);
+        in.moving = sprint || speed >= 0.4f || since < 1.0f;
+    }
+    {
+        // throwv2: where the other controller points (the motion update's, grip pitch included), back from the recentred reference to
+        // tracking space.
+        std::lock_guard _{ m_ref_mtx };
+        const glm::vec3 f{ m_other_fwd_ref[0].load(), m_other_fwd_ref[1].load(), m_other_fwd_ref[2].load() };
+        if (m_have_ref && m_other_have && glm::length(f) > 0.5f) {
+            in.other_fwd    = glm::normalize(glm::mat3{ glm::inverse(m_ref_inv) } * f);
+            in.other_fwd_ok = true;
+        }
+    }
+    auto valid =[](const glm::mat4& m) { return std::isfinite(m[3][0]) && (m[0][0] != 0.0f || m[1][1] != 0.0f || m[2][2] != 0.0f); };
     if (vr->is_hmd_active()) {
         const glm::mat4 head = vr->get_transform(0);
         if (valid(head)) {
@@ -14093,6 +14136,14 @@ bool FarCry5Stereo::throw_dir_world(glm::vec3& dir)
     d = glm::transpose(m_mo.body_rot) * d;
     if (glm::length(d) < 1e-4f) return false;
     dir = glm::normalize(d);
+    if (fc5::gesture::throw_launch_aimed()) {
+        // throwv2 along the trajectory: d is the launch's direction; the game launches its throwables a lift above its camera's
+        // direction (measured per throwable, throwarc), so the camera goes that much lower.
+        bool         measured = false;
+        const ArcFit fit      = throw_fit_now(measured);
+        const float  y = std::atan2(-dir.x, dir.y), p = std::clamp(std::asin(std::clamp(dir.z, -1.0f, 1.0f)) - glm::radians(fit.up), -1.45f, 1.45f);
+        dir = glm::vec3{ -std::sin(y) * std::cos(p), std::cos(y) * std::cos(p), std::sin(p) };
+    }
     return true;
 }
 
@@ -15397,7 +15448,7 @@ void FarCry5Stereo::poll_commands()
         {
             // Body gestures (FarCry5Gesture.cpp): "<gesture> on|off", "<gesture>size m"; tests gesturegrip, gestureshoulder.
             bool keep_it = false;
-            if (throwable_command(cmd, arg, fv, ls, keep_it) || fc5::gesture::command(cmd, arg, fv, ls, keep_it) || gun_still_command(cmd, arg, fv, ls, keep_it) ||
+            if (melee_command(cmd, arg, ls, keep_it) || throwable_command(cmd, arg, fv, ls, keep_it) || fc5::gesture::command(cmd, arg, fv, ls, keep_it) || gun_still_command(cmd, arg, fv, ls, keep_it) ||
                 walk_command(cmd, arg, keep_it) || pivot_command(cmd, arg, keep_it) || skin_pose_command(cmd, arg, keep_it) || skel_hand_command(cmd, arg, keep_it) || bob_command(cmd, arg, keep_it) ||
                 vehtrans_command(cmd, arg, keep_it) || vehcomfort_command(cmd, arg, keep_it)) {
                 if (keep_it) {
@@ -15836,7 +15887,7 @@ void FarCry5Stereo::poll_commands()
             else if (cmd == "paircheck") { m_pair_check = on; if (fv > 1.0f) m_pair_every = (int)fv; }
         }
         // AFW gun tests (own block: the research chains are at the compiler's nesting limit).
-        if (cmd == "ctrlsway" || cmd == "afwheldgun" || cmd == "afwfgpush" || cmd == "afwfpeye" || cmd == "afwfpss" || cmd == "afwfptrace" || cmd == "unarmedhand" || cmd == "slinghand" || cmd == "slinghandtilt" || cmd == "gripbyhand" || cmd == "griphand" || cmd == "afwgunmv" || cmd == "afwgunpose" || cmd == "afwgunmvpose" || cmd == "afwgunown" || cmd == "afwsteady" || cmd == "afwroot" || cmd == "afwvehnear" || cmd == "afwdepthlate" || cmd == "afwvehbody" || cmd == "afwvehown" || cmd == "afwvehmv" || cmd == "vehlog" || cmd == "afwstartstereo") {
+        if (cmd == "ctrlsway" || cmd == "afwheldgun" || cmd == "afwfgpush" || cmd == "afwfpeye" || cmd == "afwfpss" || cmd == "afwfptrace" || cmd == "unarmedhand" || cmd == "slinghand" || cmd == "slinghandtilt" || cmd == "gripbyhand" || cmd == "griphand" || cmd == "afwgunmv" || cmd == "afwgunpose" || cmd == "afwgunmvpose" || cmd == "afwgunown" || cmd == "afwsteady" || cmd == "afwroot" || cmd == "afwfoot" || cmd == "afwrail" || cmd == "afwvehnear" || cmd == "afwdepthlate" || cmd == "afwvehbody" || cmd == "afwvehown" || cmd == "afwvehmv" || cmd == "vehlog" || cmd == "afwstartstereo") {
             if (cmd == "afwfgpush") m_afw_fg_push = on;
             else if (cmd == "afwfpeye") { m_afw_fp_eye = on; m_fp_target_log = 0; }
             else if (cmd == "afwfpss") m_afw_fp_ss = std::clamp((int)fv, 1, 2);
@@ -15858,6 +15909,8 @@ void FarCry5Stereo::poll_commands()
             else if (cmd == "afwgunown") fc5::afw::set_gun_own(on);   // the rebuilt eye's gun from its own last image first
             else if (cmd == "afwsteady") m_afw_steady = on;
             else if (cmd == "afwroot") m_afw_root_every = on;   // the body root (walkbob's height) at every AFW frame
+            else if (cmd == "afwfoot") m_afw_foot = on;         // a refined point off its depth footprint is refused
+            else if (cmd == "afwrail") m_afw_rail = on;         // thin near things retried from the texel beside the seed
             else if (cmd == "afwdepthlate") m_afw_depth_late = on;
             else if (cmd == "afwvehnear") m_afw_veh_near = arg == "off" ? 0.0f : arg == "on" ? 5.0f : std::clamp(fv, 0.0f, 20.0f);
             else if (cmd == "afwvehbody") m_afw_veh_body = arg == "off" ? 0.0f : arg == "on" ? 3.0f : std::clamp(fv, 0.0f, 10.0f);
@@ -18499,6 +18552,7 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
         // Experiments (Homard 2026-10-14): off by default or unfinished. Every switch keeps its command and saved setting.
         ImGui::TextDisabled("Off by default or unfinished. Turn on one at a time and compare.");
         draw_fc2vr_menu(keep, hint, section);   // Research for alternatives (test): skelhand, skinpose, bulletaim (FarCry5Fc2Vr.cpp)
+        draw_throw_v2_menu(keep, hint, section);   // Throwables (test): throwv2 (FarCry5Throwable.cpp)
         auto rtoggle = [&](const char* label, bool cur, const char* key, auto&& set, const char* help) {
             bool b = cur;
             if (ImGui::Checkbox(label, &b)) {
@@ -19233,6 +19287,17 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             if (ImGui::Checkbox("AFW: eye height from the body at every frame (no judder on slopes)", &v)) { m_afw_root_every = v; keep("afwroot", v ? "afwroot on" : "afwroot off"); }
             hint("On (default since 24 Oct): in AFW the body's position, which sets the eyes' height with No up-and-down bob, is read at every frame. "
                  "Off: every second frame as in Stereo (going up or down a slope, the view climbed in steps: judder). Command afwroot on/off.");
+            // From the BioShock VR mod's AFW rebuild (24 Oct; on by default and moved here from Experimental, Homard 25 Oct).
+            v = m_afw_foot.load();
+            if (ImGui::Checkbox("AFW: refuse a rebuilt point on the wrong side of an edge", &v)) { m_afw_foot = v; keep("afwfoot", v ? "afwfoot on" : "afwfoot off"); }
+            hint("On (default since 25 Oct): each rebuilt pixel is found by stepping through the source image's depth; if the step it still needs would "
+                 "cross a depth break, that pixel is refused there (the next source or the fill takes it): edges of the gun, pillars and wires stay "
+                 "one pixel thin instead of doubling. Command afwfoot on/off.");
+            v = m_afw_rail.load();
+            if (ImGui::Checkbox("AFW: thin near things retried from the pixel beside them", &v)) { m_afw_rail = v; keep("afwrail", v ? "afwrail on" : "afwrail off"); }
+            hint("On (default since 25 Oct): where a nearer surface sits right beside the rebuild's starting point (a wire, a fence rail, a car's "
+                 "pillar or mirror arm, the gun's sight), the rebuild also tries from there, so thin things the coarse grid missed are kept. "
+                 "Command afwrail on/off.");
             float vb = m_afw_veh_body.load();
             if (slider("AFW: vehicle cab carried with the car (m)", vb, 0.0f, 3.0f, vb <= 0.001f ? "off" : "%.1f m", 0.1f)) {
                 m_afw_veh_body = vb;

@@ -474,4 +474,10 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
             pXinputGamepad->sThumbRY = (int16_t)std::clamp(FarCry5Stereo::Get()->stick_y() * 32767.0f, -32767.0f, 32767.0f);
         }
     }
+    // meleehit (FarCry5Melee.cpp): a hit presses the game's melee (after the fire gate, which would hold RT back) and pulses the weapon hand.
+    {
+        float melee_buzz = 0.0f;
+        FarCry5Stereo::Get()->melee_pad(pXinputGamepad->wButtons, pXinputGamepad->bRightTrigger, melee_buzz);
+        if (melee_buzz > 0.0f) trigger_haptic_vibration(0.0f, 0.06f, 1.0f, melee_buzz, lh ? left_joystick : right_joystick);
+    }
 }

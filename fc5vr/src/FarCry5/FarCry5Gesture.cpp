@@ -55,8 +55,9 @@ namespace
         { "throwable", "Throwable on the left chest: take it with the left grip, let go while swinging to throw",
           "The selected grenade (or other throwable) sits on the left of your chest. Put your left hand there and hold the grip: it is in your hand. "
           "Swing and let go of the grip: the game throws it the way your hand was moving (let go without a swing: where you look). "
-          "That grip press is not the left grip's usual modifier or two-handed hold.",
-          Kind::Hold, kOtherHand, Anchor::Chest, 0, 0, 0.22f, true, false },
+          "That grip press is not the left grip's usual modifier or two-handed hold. Off (default, experimental): nothing on the chest; throw with the "
+          "game's own button (left grip + right B).",
+          Kind::Hold, kOtherHand, Anchor::Chest, 0, 0, 0.22f, false, false },   // off by default (release 0.12.1, Homard 25 Oct 12:40)
     };
     constexpr int kCount = int(sizeof(kDefs) / sizeof(kDefs[0]));
     constexpr int kSling = 1;
@@ -134,6 +135,34 @@ namespace
     int                g_tt_step = 0;   // 0 off, 1 grab, 2 swing, 3 released
     clock::time_point  g_tt_t0{};
     glm::vec3          g_tt_p0{ 0.0f }, g_tt_vw{ 0.0f };
+
+    // throwv2 (see the header): the hold, the trajectory, RB held for the wind-up, the peek.
+    std::atomic<bool>  g_v2{ false }, g_v2_right{ false }, g_v2_rb_arm{ true }, g_preaim{ true }, g_rock{ false };   // throwrock off by default: a throwable the game draws only when thrown looks like "none left" to the peek
+    std::atomic<bool>  g_rock_now{ false };   // this throwable is a rock (throwrock)
+    std::atomic<bool>  g_v2_held{ false }, g_v2_arc{ false }, g_v2_rb{ false }, g_th_launch{ false };
+    bool               g_v2_armed = false, g_v2_was_armed = false;
+    // Simulator 25 Oct: with RB held the game shows "Cancel attack (X)"; X, LB and Y each kept the knife (no object flew), A, B, the sticks did not.
+    std::atomic<bool>  g_peek_on{ true }, g_peek_again{ false }, g_peek_seen{ false }, g_peeking{ false };
+    std::atomic<int>   g_peek_cancel{ 0x4000 }, g_peek_cancel_ms{ 150 };
+    std::atomic<bool>  g_t2_req{ false };   // throwtest2 hold_ms arm_ms (test)
+    std::atomic<int>   g_t2_hold{ 800 }, g_t2_arm{ 1500 };
+    bool               g_t2_on = false;
+    clock::time_point  g_t2_t0{};
+    glm::vec3          g_t2_p0{ 0.0f };
+    int                g_peek_step = 0;   // 0 off, 1 RB held until seen, 2 cancel tapped (RB held), 3 RB let go
+    clock::time_point  g_peek_t{}, g_allowed_since{}, g_peek_quiet{};
+    bool               g_allowed_was = false, g_wheel_was = false, g_peek_failed = false;
+    int                g_peek_fails = 0;
+    bool               g_peek_twice = false;   // the peek saw nothing: X with RB twice before RB goes
+
+    // The hand a gesture's zone answers to: the throwable's is the weapon hand with throwv2hand right (the zone stays on the left chest).
+    Hand def_hand(int i) { return (i == kThrow && g_v2.load() && g_v2_right.load()) ? kWeaponHand : kDefs[i].hand; }
+
+    // throwv2zone (saved, default 0.12 m): the throwable's zone with throwv2, smaller than throwablesize's 0.22 (headset 25 Oct 11:15, the
+    // right hand: presses meant for the sling 0.30 m off its centre went to the throwable 0.18-0.21 m off, then thrown; the throwable's own
+    // grabs were 0.02-0.04 m off).
+    std::atomic<float> g_v2_zone{ 0.12f };
+    float zone_radius(int i) { return (i == kThrow && g_v2.load()) ? std::min(g_state[i].radius.load(), g_v2_zone.load()) : g_state[i].radius.load(); }
 
     // Haptic pulses: a light tick when a free hand enters a zone, a firmer one when a gesture fires.
     constexpr float kEnterAmp = 0.25f, kEnterSec = 0.03f, kFireAmp = 0.6f, kFireSec = 0.08f;
@@ -316,6 +345,27 @@ Output update(const Input& in_game)
         h.grip         = ts < te;
         if (ts >= te) g_tt_step = 0;
     }
+    if (in.head_ok && g_t2_req.exchange(false)) {
+        g_t2_on = true;
+        g_t2_t0 = now;
+        g_t2_p0 = glm::vec3{ throw_pose(in.head, in.mirror)[3] };
+        spdlog::info("[Throw] test v2: taken at the chest, held {} ms, then both grips for {} ms, then the right grip let go", g_t2_hold.load(), g_t2_arm.load());
+    }
+    if (g_t2_on) {
+        // throwtest2 (throwv2): the holding hand taken to the chest and its grip pressed; after hold ms the other grip too (the trajectory);
+        // after arm ms more the weapon hand's grip let go (the throw), 300 ms later everything let go.
+        const int   hh = def_hand(kThrow);
+        const float t  = std::chrono::duration<float>(now - g_t2_t0).count() * 1000.0f;
+        const float a = float(g_t2_hold.load()), b = a + float(g_t2_arm.load());
+        auto&       h  = in.hand[hh];
+        if (t < 120.0f) {
+            h.tracked = true;
+            h.pos     = g_t2_p0;
+        }
+        h.grip = (hh == kOtherHand) ? t < b + 300.0f : t < b;
+        in.hand[1 - hh].grip = (hh == kOtherHand) ? (t >= a && t < b) : (t >= a && t < b + 300.0f);
+        if (t >= b + 400.0f) g_t2_on = false;
+    }
     if (in.head_ok) follow_body(in.head);
     for (int h = 0; h < 2; ++h) {
         g_hand_pt_ok[h] = in.hand[h].tracked;
@@ -332,7 +382,7 @@ Output update(const Input& in_game)
     for (int i = 0; i < kCount; ++i) {
         const Def&  d  = kDefs[i];
         State&      s  = g_state[i];
-        const auto& hs = in.hand[d.hand];
+        const auto& hs = in.hand[def_hand(i)];
         dist[i]        = (in.head_ok && hs.tracked) ? glm::length(hs.pos - anchor_pos(d.anchor, in)) : -1.0f;
         s.dist         = dist[i];
         if (!hs.grip) s.owned = false;
@@ -340,8 +390,8 @@ Output update(const Input& in_game)
         // Zone entry: a light tick on that controller when the hand comes in with its grip free (a hand already
         // holding something passes through quietly). Leaving needs 15 % more distance, so the edge does not chatter.
         const bool was_in = s.inside;
-        s.inside          = active[i] && dist[i] < s.radius.load() * (was_in ? 1.15f : 1.0f);
-        if (s.inside && !was_in && !hs.grip && g_zone_buzz.load()) buzz(out, d.hand, kEnterAmp, kEnterSec);
+        s.inside          = active[i] && dist[i] < zone_radius(i) * (was_in ? 1.15f : 1.0f);
+        if (s.inside && !was_in && !hs.grip && g_zone_buzz.load()) buzz(out, def_hand(i), kEnterAmp, kEnterSec);
         s.shown_avail  = active[i];
         s.shown_inside = s.inside;
     }
@@ -351,8 +401,8 @@ Output update(const Input& in_game)
         int   best = -1;
         float best_k = 1.0f;
         for (int i = 0; i < kCount; ++i) {
-            if (kDefs[i].hand != h || dist[i] < 0.0f) continue;
-            const float r = g_state[i].radius.load();
+            if (def_hand(i) != h || dist[i] < 0.0f) continue;
+            const float r = zone_radius(i);
             if (!active[i]) {
                 if (dist[i] < r) spdlog::info("[Gesture] {}: grip pressed in the zone ({:.2f} m) but {}", kDefs[i].name, dist[i], g_state[i].on.load() ? "not available now" : "switched off");
                 continue;
@@ -375,13 +425,13 @@ Output update(const Input& in_game)
             s.tap_until = now + std::chrono::milliseconds(d.tap_ms);
             spdlog::info("[Gesture] {}: grip pressed {:.2f} m from the zone centre (zone {:.2f} m): pad buttons 0x{:04x} tapped", d.name, dist[best], s.radius.load(), d.buttons);
         } else {
-            spdlog::info("[Gesture] {}: grip pressed {:.2f} m from the zone centre (zone {:.2f} m): held until the grip is released", d.name, dist[best], s.radius.load());
+            spdlog::info("[Gesture] {}: grip pressed {:.2f} m from the zone centre (zone {:.2f} m): held until the grip is released", d.name, dist[best], zone_radius(best));
         }
     }
     for (int i = 0; i < kCount; ++i) {
         const Def& d = kDefs[i];
         State&     s = g_state[i];
-        if (s.owned && d.kind == Kind::Tap) out.grip_taken[d.hand] = true;
+        if (s.owned && d.kind == Kind::Tap) out.grip_taken[def_hand(i)] = true;
         if (now < s.tap_until) out.buttons |= d.buttons;
         s.shown_held = s.owned;
     }
@@ -397,11 +447,176 @@ Output update(const Input& in_game)
     // Throwable: held while its grip press lasts; let go with a swing, the game camera is turned to the swing's direction
     // (Stereo's aim loop, throw_aim()) and the game's throw button (pad RB) goes once it is there (or after throwwait).
     const auto& td = kDefs[kThrow];
-    const auto& th = in.hand[td.hand];
+    const auto& th = in.hand[def_hand(kThrow)];
     if (th.tracked) hist_add(now, th.pos);
-    const bool hold_rb = g_th_hold.load();
+    bool       hold_rb = g_th_hold.load();
     ThrowPhase ph      = ThrowPhase(g_th_phase.load());
-    if (g_state[kThrow].owned) {
+    const bool v2      = g_v2.load();
+    if (!v2) {
+        g_v2_held = g_v2_arc = g_v2_rb = false;
+        g_v2_armed = false;
+        g_th_launch = false;
+    }
+    if (v2) {
+        // throwv2: the press in the zone only puts the throwable in the hand (no RB). Both grips held: the trajectory, along the other
+        // controller; RB held from then (throwv2rb arm). The weapon hand's grip let go while armed (or, with throwv2hand right, at all)
+        // throws; with throwv2hand left the left grip let go before that puts it back.
+        const int  hh    = def_hand(kThrow);
+        const bool left  = hh == kOtherHand;
+        const bool wgrip = in.hand[kWeaponHand].grip, ogrip = in.hand[kOtherHand].grip;
+        // Taken at the press only (a left grip still held after the throw takes nothing more).
+        static bool owned_was = false;
+        const bool  took      = g_state[kThrow].owned && !owned_was;
+        owned_was             = g_state[kThrow].owned;
+        if (took && !g_v2_held.load() && ph == ThrowPhase::Idle && g_peek_step == 0) {
+            // throwrock (Homard: "make the rock being selected"): the game drew no throwable at the last peek (none selected, none left):
+            // this one is a rock (the game's own rock throw, D-pad down; endless).
+            g_rock_now = g_rock.load() && g_peek_failed;
+            if (g_rock_now) spdlog::info("[Throw] v2: no throwable to draw at the last peek: a rock (D-pad down) this time");
+            g_v2_held  = true;
+            g_v2_armed = g_v2_was_armed = false;
+            g_v2_rb    = false;
+            set_phase(ThrowPhase::Held, now);
+            ph = ThrowPhase::Held;
+            spdlog::info("[Throw] v2: taken in the {} hand (no RB: no raise animation)", left ? "left" : "right");
+        }
+        bool release = false, cancel = false;
+        if (g_v2_held.load()) {
+            out.grip_taken[kWeaponHand] = out.grip_taken[kOtherHand] = true;   // both grips belong to the throw meanwhile
+            const bool armed = wgrip && ogrip;
+            if (armed != g_v2_armed && g_th_log.load()) spdlog::info("[Throw] v2: {}", armed ? "both grips held: trajectory shown" : "trajectory hidden");
+            if (left) {
+                if (g_v2_was_armed && !wgrip) release = true;   // the right grip let go after both were held (the left one may be let go by then)
+                else if (!ogrip && !g_v2_was_armed) cancel = true;   // the left grip let go first: back on the chest
+            } else if (!wgrip) {
+                // The right grip let go: thrown only if the trajectory was shown (both grips) since the grab; else back on the chest (headset
+                // 25 Oct: a grab by mistake let go threw it where the head looked).
+                if (g_v2_was_armed) release = true;
+                else cancel = true;
+            }
+            g_v2_armed = armed;
+            if (armed) g_v2_was_armed = true;
+            // once RB is held it stays until the throw (letting it go throws). The rock (throwrock): D-pad down, tapped at the throw.
+            if (armed && g_v2_rb_arm.load() && !g_rock_now) g_v2_rb = true;
+            if (!in.allowed) cancel = !g_v2_rb.load(), release = g_v2_rb.load();
+        }
+        g_v2_arc = g_v2_held.load() && g_v2_armed && in.other_fwd_ok;
+        // throwpreaim: while the trajectory shows, the game's aim already follows it, so letting go throws at once.
+        if (g_v2_arc.load() && g_preaim.load()) {
+            std::lock_guard _{ g_th_mtx };
+            g_th_dir    = in.other_fwd;
+            g_th_launch = true;
+        }
+        if (cancel) {
+            spdlog::info("[Throw] v2: let go before the throw: back on the chest");
+            g_v2_held = false;
+            set_phase(ThrowPhase::Idle, now);
+            ph = ThrowPhase::Idle;
+        } else if (release) {
+            // Along the trajectory when it was shown (the other controller's aim); else the swing's direction, or the head's.
+            float           peak = 0.0f;
+            int             used = 0;
+            const glm::vec3 v    = release_velocity(now, peak, used);
+            const float     sp   = glm::length(v);
+            glm::vec3       dir{ 0.0f, 0.0f, -1.0f };
+            const bool      along = in.other_fwd_ok && (left || g_v2_was_armed);
+            if (along) dir = in.other_fwd;
+            else if (sp >= g_th_min.load()) dir = v / sp;
+            else if (in.head_ok) dir = -glm::normalize(glm::vec3{ in.head[2] });
+            {
+                std::lock_guard _{ g_th_mtx };
+                g_th_dir   = dir;
+                g_th_speed = sp;
+            }
+            g_th_launch = along;
+            const glm::vec3 dh = glm::transpose(glm::mat3{ in.head }) * dir;
+            spdlog::info("[Throw] v2: thrown {} (head frame right {:+.2f} up {:+.2f} back {:+.2f}, {:.0f} deg up), RB {}", along ? "along the trajectory" : sp >= g_th_min.load() ? "the swing's way" : "where the head looks",
+                         dh.x, dh.y, dh.z, glm::degrees(std::asin(std::clamp(dir.y, -1.0f, 1.0f))), g_v2_rb.load() ? "held since the trajectory showed" : "tapped");
+            g_v2_held  = false;
+            g_v2_armed = false;
+            g_v2_arc   = false;
+            set_phase(ThrowPhase::Aim, now);
+            ph = ThrowPhase::Aim;
+        }
+        hold_rb = g_v2_rb.load();
+        if (ph == ThrowPhase::Idle) g_v2_rb = false;
+
+        // throwpeek: RB held a moment with nothing recorded (or after the weapon wheel closed) so the game draws the selected throwable
+        // and the render side records it; the cancel buttons are tapped while RB is still held, then RB is let go.
+        // Standing still only (headset 25 Oct: peeks while walking forward saw nothing in time, RB was let go without the cancel, and the
+        // game threw a knife each time).
+        const bool calm = in.allowed && !in.wheel && !in.moving;
+        if (calm && !g_allowed_was) g_allowed_since = now;
+        g_allowed_was = calm;
+        // The peek's own LB opens and closes the wheel: not a new selection (the peek ran again and again in the simulator).
+        if (g_wheel_was && !in.wheel && g_peek_step == 0 && now > g_peek_quiet) g_peek_again = true, g_peek_failed = false, g_peek_fails = 0;
+        g_wheel_was = in.wheel;
+        const int cancel_btn = g_peek_cancel.load();
+        if (g_peek_step == 0 && g_peek_on.load() && cancel_btn != 0 && ph == ThrowPhase::Idle && calm && !wgrip && !ogrip &&
+            now - g_allowed_since > std::chrono::seconds(2) && now > g_peek_quiet && ((!in.recorded && !g_peek_failed) || g_peek_again.load())) {
+            g_peek_again = false;
+            g_peek_seen  = false;
+            g_peek_step  = 1;
+            g_peek_t     = now;
+            spdlog::info("[Throw] peek: RB held so the game draws the selected throwable ({})", in.recorded ? "the weapon wheel closed" : "nothing recorded yet");
+        }
+        else if (g_peek_step == 0 && g_peek_on.load() && ((!in.recorded && !g_peek_failed) || g_peek_again.load())) {
+            static clock::time_point said{};
+            if (now - said > std::chrono::seconds(3)) {
+                said = now;
+                spdlog::info("[Throw] peek waits: phase {}, on foot {}, wheel {}, grips {}/{}, {:.1f} s calm, cancel 0x{:04x}", int(ph), in.allowed, in.wheel, wgrip, ogrip,
+                             calm ? std::chrono::duration<float>(now - g_allowed_since).count() : 0.0f, cancel_btn);
+            }
+        }
+        if (g_peek_step > 0) {
+            const auto ps = now - g_peek_t;
+            if (g_peek_step == 1) {
+                out.buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+                // Headset 25 Oct: other throwables than the knife (0.34 s) took longer than 0.7 s; at 12:35 a peek saw nothing in 1.3 s and the knife
+                // was thrown anyway: waited up to 2.5 s now, and a peek that saw nothing is cancelled twice.
+                if (g_peek_seen.load() || ps > std::chrono::milliseconds(2500)) {
+                    // Simulator 25 Oct: RB pressed while the game puts the weapon back after a throw draws nothing either: one more try
+                    // 2.5 s later before calling it "none" (the rock then).
+                    if (g_peek_seen.load()) {
+                        g_peek_fails  = 0;
+                        g_peek_failed = false;
+                    } else if (++g_peek_fails < 2 && g_rock.load()) {   // tried again only for throwrock (each peek is a risk)
+                        g_peek_again = true;
+                        spdlog::info("[Throw] peek: the game drew no throwable in 1.3 s: trying again");
+                    } else {
+                        g_peek_failed = true;
+                        spdlog::info("[Throw] peek: the game drew no throwable in 1.3 s twice (none selected or none left): no new peek until the weapon wheel closes");
+                    }
+                    if (!g_peek_seen.load()) g_peek_failed = true;
+                    g_peek_twice = !g_peek_seen.load();
+                    g_peek_step  = 2;   // always cancelled (X) before RB goes: a throwable drawn late would otherwise be thrown
+                    g_peek_t    = now;
+                }
+            } else if (g_peek_step == 2) {
+                out.buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER | uint16_t(cancel_btn);
+                if (ps > std::chrono::milliseconds(g_peek_cancel_ms.load()) && g_peek_twice) {
+                    g_peek_twice = false;
+                    g_peek_step  = 4;   // RB alone a moment, then X with RB once more
+                    g_peek_t     = now;
+                } else if (ps > std::chrono::milliseconds(g_peek_cancel_ms.load())) {
+                    g_peek_step = 3;
+                    g_peek_t    = now;
+                    spdlog::info("[Throw] peek: cancel 0x{:04x} tapped with RB held; RB let go", cancel_btn);
+                }
+            } else if (g_peek_step == 4) {
+                out.buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+                if (ps > std::chrono::milliseconds(120)) {
+                    g_peek_step = 2;
+                    g_peek_t    = now;
+                }
+            } else if (ps > std::chrono::milliseconds(800)) {
+                g_peek_step  = 0;
+                g_peek_quiet = now + std::chrono::milliseconds(g_peek_fails > 0 ? 2500 : 1500);
+            }
+            out.no_fire = true;
+        }
+        g_peeking = g_peek_step == 1 || g_peek_step == 2 || g_peek_step == 4;
+    } else if (g_state[kThrow].owned) {
         out.grip_taken[td.hand] = true;
         if (ph != ThrowPhase::Held) {
             set_phase(ThrowPhase::Held, now);
@@ -444,29 +659,38 @@ Output update(const Input& in_game)
         }
     }
     const auto since = now - g_th_since;   // in the phase entered (this poll's release starts Aim at 0)
+    const bool rock    = v2 && g_rock_now;
+    const uint16_t tap_btn = rock ? XINPUT_GAMEPAD_DPAD_DOWN : XINPUT_GAMEPAD_RIGHT_SHOULDER;
     switch (ph) {
     case ThrowPhase::Held:
         if (hold_rb) out.buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
         break;
     case ThrowPhase::Aim:
         if (hold_rb) out.buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
-        if (in.throw_aimed || since > std::chrono::milliseconds(g_th_wait.load())) {
+        if (in.throw_aimed || since > std::chrono::milliseconds(v2 ? std::max(g_th_wait.load(), 700) : g_th_wait.load())) {   // throwv2: the trajectory can be far off the look
             if (g_th_log.load()) spdlog::info("[Throw] RB {} after {} ms: {}", hold_rb ? "released" : "tapped", std::chrono::duration_cast<std::chrono::milliseconds>(since).count(),
                                               in.throw_aimed ? "the camera is on the throw's direction" : "the camera did not get there in time (throwwait)");
             set_phase(ThrowPhase::Throw, now);
-            if (!hold_rb) out.buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+            if (!hold_rb) out.buttons |= tap_btn;
         }
         break;
     case ThrowPhase::Throw:
-        if (!hold_rb && since < std::chrono::milliseconds(g_th_tap.load())) out.buttons |= XINPUT_GAMEPAD_RIGHT_SHOULDER;
+        // A rock's D-pad down kept short: held ~350 ms (a stalled frame in the simulator) the game threw no rock; 120 ms did.
+        if (!hold_rb && since < std::chrono::milliseconds(rock ? std::min(g_th_tap.load(), 100) : g_th_tap.load())) out.buttons |= tap_btn;
         else set_phase(ThrowPhase::Follow, now);
         break;
     case ThrowPhase::Follow:
-        if (since > std::chrono::milliseconds(g_th_keep.load())) set_phase(ThrowPhase::Idle, now);
+        if (since > std::chrono::milliseconds(rock ? std::max(g_th_keep.load(), 1000) : g_th_keep.load())) {   // a rock leaves ~0.63 s after its button
+            set_phase(ThrowPhase::Idle, now);
+            if (v2 && g_rock.load()) {   // only for throwrock: is there another one (else the next is a rock)
+                g_peek_again = true;
+                g_peek_quiet = now + std::chrono::milliseconds(2500);   // RB pressed right after a throw draws nothing (simulator 25 Oct: 1.5 s was short)
+            }
+        }
         break;
     default: break;
     }
-    out.no_fire = ThrowPhase(g_th_phase.load()) != ThrowPhase::Idle;
+    out.no_fire = out.no_fire || ThrowPhase(g_th_phase.load()) != ThrowPhase::Idle;
     if (now < g_padtap_until) out.buttons |= uint16_t(g_padtap_buttons.load());   // padtap (test)
     return out;
 }
@@ -508,6 +732,24 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
     if (cmd == "throwtap") { g_th_tap = std::clamp(int(fv), 20, 1000); persist = true; return true; }
     if (cmd == "throwhold") { g_th_hold = on; persist = true; return true; }
     if (cmd == "throwlog") { g_th_log = on; return true; }
+    if (cmd == "throwv2") { g_v2 = on; persist = true; spdlog::info("[Throw] throwv2 {}", on ? "on" : "off"); return true; }
+    if (cmd == "throwv2hand") { g_v2_right = arg == "right"; persist = true; return true; }
+    if (cmd == "throwv2rb") { g_v2_rb_arm = arg != "tap"; persist = true; return true; }
+    if (cmd == "throwpeek") { g_peek_on = on; persist = true; return true; }
+    if (cmd == "throwpreaim") { g_preaim = on; persist = true; return true; }
+    if (cmd == "throwv2zone") { g_v2_zone = std::clamp(fv, 0.05f, 0.5f); persist = true; return true; }
+    if (cmd == "throwrock") { g_rock = on; persist = true; return true; }
+    if (cmd == "throwpeekcancel") { g_peek_cancel = int(std::strtol(arg.c_str(), nullptr, 16)); persist = true; return true; }
+    if (cmd == "throwpeekms") { g_peek_cancel_ms = std::clamp(int(fv), 20, 1000); persist = true; return true; }
+    if (cmd == "throwpeeknow") { g_peek_again = true; return true; }
+    if (cmd == "throwtest2") {
+        int arm = 1500;
+        rest >> arm;
+        g_t2_hold = std::clamp(arg.empty() ? 800 : int(fv), 0, 20000);
+        g_t2_arm  = std::clamp(arm, 50, 20000);
+        g_t2_req  = true;
+        return true;
+    }
     if (cmd == "padtap") {
         int ms = 120;
         rest >> ms;
@@ -547,7 +789,7 @@ bool command(const std::string& cmd, const std::string& arg, float fv, std::istr
 }
 
 bool test_grip() { return g_test_grip.load(); }
-bool test_input() { return g_test_grip.load() || g_tt_req.load() || g_tt_step > 0 || clock::now() < g_padtap_until; }
+bool test_input() { return g_test_grip.load() || g_tt_req.load() || g_tt_step > 0 || g_t2_req.load() || g_t2_on || clock::now() < g_padtap_until; }
 bool zone_buzz() { return g_zone_buzz.load(); }
 void set_zone_buzz(bool on) { g_zone_buzz = on; }
 bool zone_show() { return g_zone_show.load(); }
@@ -565,8 +807,8 @@ int zone_views(const glm::mat4& head, bool mirror, ZoneView* out, int max)
         const State& s = g_state[i];
         ZoneView&    z = out[n++];
         z.centre       = anchor_pos(kDefs[i].anchor, in);
-        z.radius       = s.radius.load();
-        z.hand         = kDefs[i].hand;
+        z.radius       = zone_radius(i);
+        z.hand         = def_hand(i);
         z.on           = s.on.load();
         z.available    = s.shown_avail.load();
         z.inside       = s.shown_inside.load();
@@ -640,12 +882,28 @@ float      throw_gate_deg() { return g_th_gate.load(); }
 bool throw_aim(glm::vec3& dir, float& speed)
 {
     const auto p = ThrowPhase(g_th_phase.load());
-    if (p != ThrowPhase::Aim && p != ThrowPhase::Throw && p != ThrowPhase::Follow) return false;
+    const bool pre = p == ThrowPhase::Held && g_v2.load() && g_v2_arc.load() && g_preaim.load();
+    if (p != ThrowPhase::Aim && p != ThrowPhase::Throw && p != ThrowPhase::Follow && !pre) return false;
     std::lock_guard _{ g_th_mtx };
     dir   = g_th_dir;
     speed = g_th_speed;
     return true;
 }
+
+bool throw_v2() { return g_v2.load(); }
+bool throw_v2_right() { return g_v2_right.load(); }
+bool throw_v2_rb_arm() { return g_v2_rb_arm.load(); }
+bool throw_peek_on() { return g_peek_on.load(); }
+int  throw_hold_hand() { return def_hand(kThrow); }
+bool throw_arc_shown() { return g_v2.load() && g_v2_arc.load(); }
+bool throw_launch_aimed() { return g_v2.load() && g_th_launch.load() && throw_phase() != ThrowPhase::Idle; }
+bool throw_preaim() { return g_preaim.load(); }
+bool throw_rock() { return g_rock.load(); }
+bool throw_is_rock() { return g_v2.load() && g_rock_now && throw_phase() != ThrowPhase::Idle; }
+bool throw_rb_held() { return g_v2.load() && g_v2_rb.load(); }
+bool throw_peeking() { return g_peeking.load(); }
+void throw_peek_seen() { g_peek_seen = true; }
+void throw_peek_again() { g_peek_again = true; }
 
 void get_throw_place(float pos[3]) { for (int i = 0; i < 3; ++i) pos[i] = g_th_pos[i].load(); }
 

@@ -38,7 +38,7 @@ namespace
 {
     using Key = std::tuple<void*, UINT, UINT, INT>;   // index buffer, start, count, base
 
-    constexpr int kSrv = 16, kSmp = 16, kPsCb = 8, kVb = 4, kMaxRec = 4;
+    constexpr int kSrv = 16, kSmp = 16, kPsCb = 8, kVb = 4, kMaxRec = 6;   // a throwable of up to 6 parts (headset 25 Oct: 4)
 
     // One recorded draw of the throwable.
     struct Rec
@@ -69,6 +69,7 @@ namespace
         UINT                      mask{ 0xffffffff };
         glm::mat3                 rq{ 1.0f };          // the object's axes in the game camera's (q) axes, as held
         glm::vec3                 tq{ 0.0f };          // its origin there
+        glm::vec3                 Fq{ 0.0f };          // the game's left hand there when it was recorded (throwv2: the copy in the hand)
 
         void release()
         {
@@ -107,20 +108,35 @@ struct FarCry5Stereo::ThrowableState
     std::atomic<bool>  hand{ true };    // throwhand: the held throwable follows the left controller
     std::atomic<bool>  chest{ true };   // throwchest: the recorded throwable drawn on the chest between throws
     std::atomic<float> rot[3]{ 0.0f, 90.0f, 0.0f };   // throwrot: its turn on the chest (yaw, pitch, roll, deg)
+    std::atomic<float> hand_rot[3]{ 0.0f, 90.0f, 0.0f };   // throwhandrot: the copy's turn in the hand (throwv2), controller axes (90 deg: the knife along the controller, not hanging down)
+    std::atomic<float> hand_off[3]{ 0.0f, 0.0f, 0.0f };   // throwhandpos: its origin from the controller (m, controller axes)
     std::atomic<int>   log{ 2 };        // throwdrawlog N: the next N throwable draws logged
+    std::chrono::steady_clock::time_point probe_until{};   // throwprobe S (test)
+    std::set<Key>                         probe_seen;
+    std::chrono::steady_clock::time_point ap_until{};   // throwallprobe S (test)
+    int                                   ap_frame{ -1 }, ap_rb_frames{ 0 };
+    std::set<std::tuple<UINT, UINT, INT>> ap_base, ap_seen;
 
     // Weapon-pass draws by frame: the last idle frame's set is "the gun"; while a throw is under way anything else is
     // the throwable.
     int           set_frame{ -1 };
-    std::set<Key> cur, idle;
+    // By shape (count, start, base), not by index buffer: a weapon put back after a throw comes with new buffers (simulator 25 Oct: the gun's
+    // parts looked new and spoiled the frames where the thrown throwable showed).
+    using Shape = std::tuple<UINT, UINT, INT>;
+    std::set<Shape> cur, idle;
     bool          idle_phase{ true };
 
     glm::vec3 F{ 0.0f };   // the game's left hand (gloves' left-hand bones' centre), q axes (last gloves draw)
     int       F_frame{ -100 };
 
     std::vector<Rec> recs;
+    std::vector<Rec> pend;              // this frame's recording, committed at the next frame unless it was a junk frame
+    int              pend_frame{ -1 };
+    bool             pend_peek{ false };
     int              rec_frame{ -1 };
+    int              junk_frame{ -1 };   // a frame with a big new mesh (the gun coming back): nothing recorded or moved in it
     bool             grab_recorded{ false };
+    std::atomic<bool> any{ false };   // recs not empty (read by the pad thread: throwable_recorded)
     uint64_t         moved{ 0 }, chest_draws{ 0 };
 
     ID3D11Buffer* standin[2]{};      // object transform (b1) and previous (b3) for the held throwable
@@ -149,28 +165,67 @@ void FarCry5Stereo::throwable_note_support(const glm::mat4&, const glm::vec3& F)
     m_th->F_frame = m_frame.load();
 }
 
-void FarCry5Stereo::throwable_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base)
+void FarCry5Stereo::throwable_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool record_only)
 {
     if (!m_th) m_th = new ThrowableState{};
     auto&      t     = *m_th;
     const int  frame = m_frame.load();
     const auto phase = fc5::gesture::throw_phase();
-    const bool held  = phase != fc5::gesture::ThrowPhase::Idle;   // also while the game's throw animation lets it go (Follow)
     const bool rb    = m_rb_down.load();   // any throw (left grip + B too) shows the game's throwable: recorded for the chest
+    // Also while the game's throw animation lets it go (Follow). throwv2: in the hand before RB the game draws no throwable (the mod's
+    // copy is drawn instead: throwable_hand), so only RB or the throw's own phases count.
+    const bool held  = fc5::gesture::throw_v2() ? (rb || phase == fc5::gesture::ThrowPhase::Throw || phase == fc5::gesture::ThrowPhase::Follow)
+                                                : phase != fc5::gesture::ThrowPhase::Idle;
+    const bool peek  = fc5::gesture::throw_peeking();
     if (frame != t.set_frame) {
         if (t.idle_phase) t.idle = std::move(t.cur);
         t.cur.clear();
         t.set_frame  = frame;
         t.idle_phase = phase == fc5::gesture::ThrowPhase::Idle && !rb;
         if (t.idle_phase) t.grab_recorded = false;
+        // The last frame's recording, kept only if no big new mesh came in that frame (the gun coming back after a throw: headset 25 Oct,
+        // a multi-part throwable recorded and thrown away again every frame while the gun came back): the chest keeps the last good one.
+        if (!t.pend.empty()) {
+            if (t.pend_frame != t.junk_frame) {
+                for (auto& r : t.recs) r.release();
+                t.recs          = std::move(t.pend);
+                t.any           = true;
+                t.grab_recorded = true;
+                std::string parts;
+                for (const auto& r : t.recs) parts += fmt::format(" {}", r.count);
+                spdlog::info("[Throwable] recorded for the chest: {} draws (indices:{}), {:.2f} m from the game camera{}", t.recs.size(), parts, glm::length(t.recs.front().tq),
+                             t.pend_peek ? " (peek)" : "");
+                if (t.pend_peek) fc5::gesture::throw_peek_seen();
+            } else {
+                for (auto& r : t.pend) r.release();
+                spdlog::info("[Throwable] a recording dropped: a big new mesh came in the same frame (the gun coming back)");
+            }
+            t.pend.clear();
+        }
     }
     ID3D11Buffer* ib = nullptr;
     DXGI_FORMAT   fmt{};
     UINT          ib_off = 0;
     ctx->IAGetIndexBuffer(&ib, &fmt, &ib_off);
     const Key key{ ib, start, count, base };
-    t.cur.insert(key);
-    if (!(held || rb) || t.idle.empty() || t.idle.contains(key) || !fc5::gesture::throw_on()) {
+    const ThrowableState::Shape shape{ count, start, base };
+    t.cur.insert(shape);
+    // throwprobe S (test): for S seconds every weapon-pass draw that the last idle frame did not have is logged once, whatever
+    // the pad does (which draws a rock throw, a D-pad throw or a cancelled throw makes).
+    if (std::chrono::steady_clock::now() < t.probe_until && !t.idle.empty() && !t.idle.contains(shape) && t.probe_seen.insert(key).second)
+        spdlog::info("[ThrowProbe] frame {}: new weapon-pass draw {} indices from {} base {} (index buffer {}), RB {}, phase {}", frame, count, start, base, (void*)ib, rb, int(phase));
+    if (!(held || rb) || t.idle.empty() || t.idle.contains(shape) || !fc5::gesture::throw_on()) {
+        if (ib) ib->Release();
+        return;
+    }
+    // A big new mesh is not a throwable (simulator 25 Oct: with none left, RB brought back the gun's parts, 11040 and 16110 indices, which
+    // were recorded and drawn in the hand): that frame records nothing (knife 2502, rock 582).
+    if (count > 8000) {
+        t.junk_frame = frame;
+        if (ib) ib->Release();
+        return;
+    }
+    if (t.junk_frame == frame) {
         if (ib) ib->Release();
         return;
     }
@@ -197,16 +252,17 @@ void FarCry5Stereo::throwable_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
         spdlog::info("[Throwable] the game's throwable drawn: {} indices from {} (index buffer {}), object at ({:.2f}, {:.2f}, {:.2f}){}", count, start, (void*)ib, obj[3], obj[7], obj[11],
                      have ? "" : ", no rigid transform at b1: left as drawn");
     }
-    // Record it for the chest, once per grab (the draws of the first frame it shows).
-    if (fresh && (!t.grab_recorded || t.rec_frame == frame)) {
-        if (!t.grab_recorded) {
-            for (auto& r : t.recs) r.release();
-            t.recs.clear();
-            t.grab_recorded = true;
-            t.rec_frame     = frame;
+    // Record it for the chest, once per press (the draws of the first frame it shows, committed at the next frame if that frame was
+    // clean). Simulator 25 Oct, Homard's save: his other throwable is not drawn at all while RB is held, only in the throw itself (Throw,
+    // Follow; in the headset its first frame there had 3 parts), so those count too; a frame where the gun comes back is not clean.
+    const bool rec_ok = held;
+    if (fresh && rec_ok && !t.grab_recorded && (t.pend.empty() || t.pend_frame == frame)) {
+        if (t.pend.empty()) {
+            t.pend_frame = frame;
+            t.pend_peek  = peek;
         }
-        const bool dup = std::any_of(t.recs.begin(), t.recs.end(), [&](const Rec& r) { return r.key == key; });
-        if ((int)t.recs.size() < kMaxRec && !dup) {
+        const bool dup = std::any_of(t.pend.begin(), t.pend.end(), [&](const Rec& r) { return r.key == key; });
+        if ((int)t.pend.size() < kMaxRec && !dup) {
             Rec r{};
             r.key   = key;
             r.count = count;
@@ -252,25 +308,35 @@ void FarCry5Stereo::throwable_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
             const glm::mat4 O = from_rows(obj);
             r.rq              = hm.rot * glm::mat3{ O };
             r.tq              = hm.rot * (glm::vec3{ O[3] } - hm.cam);
-            t.recs.push_back(r);
-            spdlog::info("[Throwable] recorded for the chest: {} indices from {}, {} vertex buffers, {} textures, object {:.2f} m from the game camera", count, start,
-                         std::count_if(std::begin(r.vb), std::end(r.vb), [](auto* p) { return p != nullptr; }),
-                         std::count_if(std::begin(r.srv), std::end(r.srv), [](auto* p) { return p != nullptr; }), glm::length(r.tq));
+            r.Fq              = t.F;
+            t.pend.push_back(r);
         }
     }
     // In the hand: the move that puts the game's left hand on the left controller (as the gloves get it, FarCry5Stereo
     // weapon_draw_impl), from this frame's placement and the last gloves draw's hand centre.
-    if (held && fresh && t.hand.load() && frame - t.F_frame <= 2) {
+    const bool hide = peek || fc5::gesture::throw_v2();
+    if (!record_only && held && have && (hide || (fresh && t.hand.load() && frame - t.F_frame <= 2))) {
+        // throwv2 with throwv2hand right: the right hand (its own controller, also with the weapon on the sling).
+        glm::vec3 hp = m_mo.other_pos_world;
+        glm::mat3 hr = m_mo.other_rot_world;
+        throwable_hold_pose(hp, hr);
         const glm::mat3 rT = glm::transpose(hm.rot);
         const glm::mat3 WT = glm::transpose(hm.w_rot);
-        const glm::mat3 LR = m_mo.other_rot_world * hm.corr;
+        const glm::mat3 LR = hr * hm.corr;
         const glm::mat3 G  = rT * WT * LR * hm.rot;
-        const glm::vec3 c  = hm.cam + rT * (hm.grip + WT * (m_mo.other_pos_world - hm.w_pos)) - rT * WT * LR * t.F;
+        const glm::vec3 c  = hm.cam + rT * (hm.grip + WT * (hp - hm.w_pos)) - rT * WT * LR * t.F;
         glm::mat4       A{ G };
         A[3] = glm::vec4{ c - G * hm.cam, 1.0f };
         float o1[32], o3[32];
         std::memcpy(o1, obj, sizeof(o1));
         to_rows(A * from_rows(obj), o1);
+        if (peek || fc5::gesture::throw_v2()) {
+            // throwpeek: the game's throwable is only looked at (recorded), not shown: collapsed to a point in front of the camera. throwv2: the
+            // mod's copy is in the hand instead (the game's raise and throw animation do not move it).
+            glm::mat4 Z{ 0.0f };
+            Z[3] = glm::vec4{ hm.cam, 1.0f };
+            to_rows(Z, o1);
+        }
         std::memcpy(o3, o1, sizeof(o3));   // no motion of its own (as the moved gloves: DLSS takes it with the view)
         ID3D11Device* dev = nullptr;
         ctx->GetDevice(&dev);
@@ -318,7 +384,11 @@ void FarCry5Stereo::throwable_chest(ID3D11DeviceContext* ctx)
     if (!m_th) m_th = new ThrowableState{};
     auto& t = *m_th;
     throwable_pouch(ctx);
-    if (t.recs.empty() || !t.chest.load() || !fc5::gesture::throw_on() || fc5::gesture::throw_phase() != fc5::gesture::ThrowPhase::Idle) return;
+    // throwv2: in the hand before RB (the game draws nothing there then), the recorded copy goes to the holding hand instead.
+    const auto ph      = fc5::gesture::throw_phase();
+    // (The game's own throwable is hidden throughout with throwv2: throwable_draw.) Until RB is let go at the throw (Held, Aim).
+    const bool in_hand = fc5::gesture::throw_v2() && (ph == fc5::gesture::ThrowPhase::Held || ph == fc5::gesture::ThrowPhase::Aim);
+    if (t.recs.empty() || !fc5::gesture::throw_on() || (!in_hand && (!t.chest.load() || ph != fc5::gesture::ThrowPhase::Idle))) return;
     const auto& hm = m_hand_map;
     if (!m_mo.valid || !m_mo.chest_valid || m_frame.load() - hm.frame > 1 || in_vehicle() || flat_screen_on() || m_cine_on) return;
     ID3D11Device* dev = nullptr;
@@ -385,14 +455,23 @@ void FarCry5Stereo::throwable_chest(ID3D11DeviceContext* ctx)
     const glm::vec3 F0 = t.recs.front().tq;
     const glm::mat3 R0 = orthonormal(t.recs.front().rq);
     int             k  = 0;
+    // In the hand (throwv2): the same move onto the holding controller, turned by throwhandrot (its axes: x right, y up, -z where it
+    // points). (The game's own move from its left hand put the copy ~0.5 m off in the simulator: its hand point was not of that frame.)
+    glm::vec3 hp = m_mo.other_pos_world;
+    glm::mat3 hr = m_mo.other_rot_world;
+    throwable_hold_pose(hp, hr);
+    const glm::mat3 Rh = hr * glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.hand_rot[0].load()), glm::vec3{ 0, 1, 0 }) *
+                                         glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.hand_rot[1].load()), glm::vec3{ 1, 0, 0 }) *
+                                         glm::rotate(glm::mat4{ 1.0f }, glm::radians(t.hand_rot[2].load()), glm::vec3{ 0, 0, -1 }) };
+    const glm::vec3 place = in_hand ? hp + hr * glm::vec3{ t.hand_off[0].load(), t.hand_off[1].load(), t.hand_off[2].load() } : chest_at;
     for (auto& r : t.recs) {
         if (!t.chest_cb[k]) break;
         // q -> world now (this frame's game camera), then the move that puts q point F0 with axes R0 at the chest with Rc.
         glm::mat4 Oq{ glm::mat3{ rT * r.rq } };
         Oq[3]              = glm::vec4{ hm.cam + rT * r.tq, 1.0f };
-        const glm::mat3 LR = Rc * glm::transpose(R0);
+        const glm::mat3 LR = (in_hand ? Rh : Rc) * glm::transpose(R0);
         const glm::mat3 G  = rT * WT * LR * hm.rot;
-        const glm::vec3 c  = hm.cam + rT * (hm.grip + WT * (chest_at - hm.w_pos)) - rT * WT * LR * F0;
+        const glm::vec3 c  = hm.cam + rT * (hm.grip + WT * (place - hm.w_pos)) - rT * WT * LR * F0;
         glm::mat4       A{ G };
         A[3] = glm::vec4{ c - G * hm.cam, 1.0f };
         float o[32];
@@ -651,6 +730,106 @@ void FarCry5Stereo::throwable_pouch(ID3D11DeviceContext* ctx)
         spdlog::info("[Throwable] pouch drawn at ({:.2f}, {:.2f}, {:.2f}) world", m_mo.chest_pos_world.x, m_mo.chest_pos_world.y, m_mo.chest_pos_world.z);
 }
 
+// F11 Experimental > Throwables (test): throwv2 and its choices (each through its command, so it is saved).
+void FarCry5Stereo::draw_throw_v2_menu(const std::function<void(const char*, std::string)>&, const std::function<void(const char*)>& hint,
+                                       const std::function<void(const char*)>& section)
+{
+    section("Throwables (test)");
+    bool v = fc5::gesture::throw_v2();
+    if (ImGui::Checkbox("Throwables: take, aim with the trajectory, throw by letting go of the right grip##throwv2", &v)) m_ui_cmds += v ? "throwv2 on\n" : "throwv2 off\n";
+    hint("Taking the throwable at the left chest only puts it in your hand (the game's raise animation does not play). Hold both grips: a "
+         "dotted trajectory shows where it will go, following where your left controller points. Let go of the right grip: it is thrown along "
+         "the trajectory. Letting go of the left grip first puts it back on the chest. Off: the swing-to-throw gesture as before.");
+    if (!v) return;
+    int hand = fc5::gesture::throw_v2_right() ? 1 : 0;
+    ImGui::TextUnformatted("Hand that takes it");
+    bool ch = ImGui::RadioButton("Left##throwv2hand", &hand, 0);
+    ImGui::SameLine();
+    ch |= ImGui::RadioButton("Right##throwv2hand", &hand, 1);
+    if (ch) m_ui_cmds += hand ? "throwv2hand right\n" : "throwv2hand left\n";
+    hint("Left (default): the left hand holds it and aims; the right grip shows the trajectory and letting it go throws. Right: the right hand "
+         "takes it from the left chest; hold the left grip too (the trajectory) and let go of the right grip to throw; let go without the "
+         "trajectory and it goes back on the chest. The zone is smaller with this switch (throwv2zone, 12 cm).");
+    bool arm = fc5::gesture::throw_v2_rb_arm();
+    if (ImGui::Checkbox("Wind up while the trajectory shows##throwv2rb", &arm)) m_ui_cmds += arm ? "throwv2rb arm\n" : "throwv2rb tap\n";
+    hint("On (default): the game's throw button is held from the moment the trajectory shows, so the throw leaves sooner when you let go. Off: "
+         "it is only pressed when you let go (the game's whole throw plays then).");
+    bool pa = fc5::gesture::throw_preaim();
+    if (ImGui::Checkbox("Aim while the trajectory shows##throwpreaim", &pa)) m_ui_cmds += pa ? "throwpreaim on\n" : "throwpreaim off\n";
+    hint("On (default): while the trajectory shows, the game already aims along it, so letting go throws at once. Off: the game turns to it "
+         "after you let go (up to 0.7 s later).");
+    bool ts = m_throw_split.load();
+    if (ImGui::Checkbox("Keep the view's culling on the head while aiming a throw##throwsplit", &ts)) m_ui_cmds += ts ? "throwsplit on\n" : "throwsplit off\n";
+    hint("On (default): the game's aim turns to the trajectory the way it turns to the barrel when you fire, and the picture the game draws stays "
+         "where you look (nothing vanishes at the edges). Off: the game's whole camera turns to the throw.");
+    bool rk = fc5::gesture::throw_rock();
+    if (ImGui::Checkbox("A rock when there is no throwable##throwrock", &rk)) m_ui_cmds += rk ? "throwrock on\n" : "throwrock off\n";
+    hint("Off by default: some throwables are only drawn once thrown, so they look like none left. On: when the game has no throwable to show "
+         "(none selected or none left), the chest gesture throws a rock (the game's own "
+         "rock throw, endless) and the chest shows the rock once one has been thrown.");
+    bool pk = fc5::gesture::throw_peek_on();
+    if (ImGui::Checkbox("Show the selected throwable on the chest from the start##throwpeek", &pk)) m_ui_cmds += pk ? "throwpeek on\n" : "throwpeek off\n";
+    hint("The mod can only show a throwable it has seen the game draw. On: when nothing is known yet and after the weapon wheel closes, the throw "
+         "button is pressed for a moment and the throw cancelled, so the chest shows the selected throwable (a short hide of the gun).");
+}
+
+// throwallprobe S (test): which draw, in any pass, shows the selected throwable while RB is held. For S seconds every indexed draw's
+// shape is kept while RB is up (the baseline); while RB is held (from its 6th frame) each shape not in the baseline is logged once with
+// its pass (the weapon camera or not), target size and pixel shader. (Only the knife is drawn in the weapon pass, simulator 25 Oct.)
+void FarCry5Stereo::throw_all_probe(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, UINT inst)
+{
+    if (!m_th || std::chrono::steady_clock::now() >= m_th->ap_until) return;
+    auto&     t     = *m_th;
+    const int frame = m_frame.load();
+    const bool rb   = m_rb_down.load();
+    if (frame != t.ap_frame) {
+        t.ap_frame     = frame;
+        t.ap_rb_frames = rb ? t.ap_rb_frames + 1 : 0;
+    }
+    const ThrowableState::Shape s{ count, start, base };
+    if (!rb) {
+        t.ap_base.insert(s);
+        return;
+    }
+    if (t.ap_rb_frames < 6 || t.ap_base.contains(s) || !t.ap_seen.insert(s).second || t.ap_seen.size() > 60) return;
+    ID3D11PixelShader* ps = nullptr;
+    ctx->PSGetShader(&ps, nullptr, nullptr);
+    std::string name;
+    {
+        std::lock_guard _{ m_ps_mtx };
+        if (auto it = m_ps_names.find(ps); it != m_ps_names.end()) name = it->second.substr(0, 120);
+    }
+    if (ps) ps->Release();
+    ID3D11RenderTargetView* rtv = nullptr;
+    ctx->OMGetRenderTargets(1, &rtv, nullptr);
+    UINT w = 0, h = 0;
+    if (rtv) {
+        ID3D11Resource* r = nullptr;
+        rtv->GetResource(&r);
+        if (ID3D11Texture2D* tex = nullptr; r && SUCCEEDED(r->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&tex))) && tex) {
+            D3D11_TEXTURE2D_DESC d{};
+            tex->GetDesc(&d);
+            w = d.Width;
+            h = d.Height;
+            tex->Release();
+        }
+        if (r) r->Release();
+        rtv->Release();
+    }
+    const bool wpn = m_vs_cb0 && is_weapon_cb(m_vs_cb0);
+    spdlog::info("[ThrowAll] frame {} (RB frame {}): new draw {} indices from {} base {} x{} | weapon pass {} | target {}x{} | ps {} {}", frame, t.ap_rb_frames, count, start, base, inst, wpn,
+                 w, h, (void*)ps, name);
+}
+
+bool FarCry5Stereo::throwable_recorded() const { return m_th && m_th->any.load(); }
+
+void FarCry5Stereo::throwable_hold_pose(glm::vec3& pos, glm::mat3& rot) const
+{
+    if (!fc5::gesture::throw_v2() || fc5::gesture::throw_hold_hand() != fc5::gesture::kWeaponHand) return;
+    pos = m_mo.slung ? m_mo.hand_pos_world : m_mo.ctrl_pos_world;
+    rot = m_mo.slung ? m_mo.hand_rot_world : m_mo.ctrl_rot_world;
+}
+
 bool FarCry5Stereo::throwable_command(const std::string& cmd, const std::string& arg, float fv, std::istream& rest, bool& persist)
 {
     if (!m_th) m_th = new ThrowableState{};
@@ -660,6 +839,31 @@ bool FarCry5Stereo::throwable_command(const std::string& cmd, const std::string&
     if (cmd == "throwpouch") { m_th->pouch = on; persist = true; return true; }
     if (cmd == "throwpouchup") { m_th->pouch_up = std::clamp(fv, -0.3f, 0.3f); persist = true; return true; }
     if (cmd == "throwdrawlog") { m_th->log = arg.empty() ? 4 : (int)fv; return true; }
+    if (cmd == "throwallprobe") {
+        m_th->ap_base.clear();
+        m_th->ap_seen.clear();
+        m_th->ap_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(int(std::clamp(arg.empty() ? 8.0f : fv, 0.0f, 60.0f) * 1000.0f));
+        spdlog::info("[ThrowAll] every pass's new draws while RB is held logged for {:.1f} s", arg.empty() ? 8.0f : fv);
+        return true;
+    }
+    if (cmd == "throwprobe") {
+        m_th->probe_seen.clear();
+        m_th->probe_until = std::chrono::steady_clock::now() + std::chrono::milliseconds(int(std::clamp(arg.empty() ? 5.0f : fv, 0.0f, 60.0f) * 1000.0f));
+        spdlog::info("[ThrowProbe] new weapon-pass draws logged for {:.1f} s", arg.empty() ? 5.0f : fv);
+        return true;
+    }
+    if (cmd == "throwsplit") { m_throw_split = on; persist = true; return true; }
+    if (cmd == "throwhandrot" || cmd == "throwhandpos") {
+        float b = 0.0f, c = 0.0f;
+        rest >> b >> c;
+        auto& v = cmd == "throwhandrot" ? m_th->hand_rot : m_th->hand_off;
+        const float lim = cmd == "throwhandrot" ? 180.0f : 0.3f;
+        v[0] = std::clamp(fv, -lim, lim);
+        v[1] = std::clamp(b, -lim, lim);
+        v[2] = std::clamp(c, -lim, lim);
+        persist = true;
+        return true;
+    }
     if (cmd == "throwrot") {
         float p = m_th->rot[1].load(), r = m_th->rot[2].load();
         rest >> p >> r;

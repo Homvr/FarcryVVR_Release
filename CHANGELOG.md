@@ -1,5 +1,12 @@
 # Changelog
 
+## alpha 0.12.1 (25 October 2026): hotfix
+- **Stereo:** no more left-eye tremor for players whose VR Framework setting had VR_AsyncAER on (it is now always
+  off).
+- **AFW:** two image rebuild fixes for cleaner edges in AFW are now on by default.
+- **Crash fix:** the game no longer crashes when the PC has an empty D: drive (a card reader or a disc drive with
+  nothing in it).
+
 ## alpha 0.12 (24 October 2026)
 - **OFXR:** the mod now works with OFXR Bridge running (3D and VR instead of a flat image), confirmed in the headset.
   It also avoids a stall while loading.

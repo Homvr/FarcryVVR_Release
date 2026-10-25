@@ -49,7 +49,8 @@ cbuffer P : register(b0) {
     float4 prm;                  // target w, h, consistency tolerance (target texels), foreground limit (m)
     float4 prm2;                 // debug tint, stale tolerance (relative), near-miss (texels), foreground by stencil (1) / by depth limit (0)
     float4 prm4;                 // one grid step in uv: fresh x, y, held x, y
-    float4 prm5;                 // afwvehnear: in a vehicle, nearer than this (m) only the fresh image (0 = off); y afwvehbody (m)
+    float4 prm5;                 // afwvehnear: in a vehicle, nearer than this (m) only the fresh image (0 = off); y afwvehbody (m);
+                                 // z experiments (bits): 1 afwfoot, 2 afwrail
     float4 fB0, fB1, fB2, fBo;   // afwvehbody: fresh view -> target view for points fixed in the vehicle (its raw frame)
     float4 hB0, hB1, hB2, hBo;   // held, same
 };
@@ -101,16 +102,34 @@ float3 mapH(float2 s, float zr) {
     float3 v = viewDir(s, tanH) * abs(zr);
     return toT(isFg(zr) ? mr(hG0, hG1, hG2, v) + hGo.xyz : isBody(zr) ? mr(hB0, hB1, hB2, v) + hBo.xyz : mr(hW0, hW1, hW2, v) + hWo.xyz);
 }
+// Experiments from the BioShock VR mod's rebuild (24 Oct, F11 Experimental > AFW), prm5.z bits.
+bool xFoot() { return fmod(prm5.z, 2.0) >= 1.0; }
+bool xRail() { return fmod(floor(prm5.z * 0.5), 2.0) >= 1.0; }
+// afwfoot: a refined point must still lie on the surface its last correction reaches: if the step it still needs crosses a
+// depth break, it is the wrong side of an edge (a one-texel rail widened into two, an edge pixel from behind the gun).
+bool offFoot(float z0, float z1) { return abs(z1 - z0) > min(z0, z1) * 0.04 + 0.02; }
 float2 refineF(float2 t, float2 s, out float zt, out float err) {
     float3 m;
     [unroll] for (int i = 0; i < 3; ++i) { m = mapF(s, zFr(s)); s = saturate(s + (t - ndcUV(m.xy))); }
-    m = mapF(s, zFr(s)); zt = m.z; err = m.z > 0 ? length((ndcUV(m.xy) - t) * prm.xy) : 1e9; return s;
+    m = mapF(s, zFr(s)); zt = m.z; err = m.z > 0 ? length((ndcUV(m.xy) - t) * prm.xy) : 1e9;
+    if (xFoot() && err < 1e8 && offFoot(zF(s), zF(saturate(s + (t - ndcUV(m.xy)))))) err = 1e9;
+    return s;
 }
 float2 refineH(float2 t, float2 s, out float zt, out float err) {
     float3 m;
     [unroll] for (int i = 0; i < 3; ++i) { m = mapH(s, zHr(s)); s = saturate(s + (t - ndcUV(m.xy))); }
-    m = mapH(s, zHr(s)); zt = m.z; err = m.z > 0 ? length((ndcUV(m.xy) - t) * prm.xy) : 1e9; return s;
+    m = mapH(s, zHr(s)); zt = m.z; err = m.z > 0 ? length((ndcUV(m.xy) - t) * prm.xy) : 1e9;
+    if (xFoot() && err < 1e8 && offFoot(zH(s), zH(saturate(s + (t - ndcUV(m.xy)))))) err = 1e9;
+    return s;
 }
+// afwrail: the nearest of the four depth texels right beside a seed (not a grid step away): a thin near thing (a wire, a
+// fence rail, a car's pillar or mirror arm, the gun's sight) that falls between grid vertices is retried from there.
+float2 near1F(float2 s) { float2 sz; freshDepth.GetDimensions(sz.x, sz.y); float2 o = 1.0 / sz; float2 b = s; float bz = zF(s);
+    float2 c[4] = { s + float2(o.x, 0), s - float2(o.x, 0), s + float2(0, o.y), s - float2(0, o.y) };
+    [unroll] for (int k = 0; k < 4; ++k) { float z = zF(saturate(c[k])); if (z < bz) { bz = z; b = saturate(c[k]); } } return b; }
+float2 near1H(float2 s) { float2 sz; heldDepth.GetDimensions(sz.x, sz.y); float2 o = 1.0 / sz; float2 b = s; float bz = zH(s);
+    float2 c[4] = { s + float2(o.x, 0), s - float2(o.x, 0), s + float2(0, o.y), s - float2(0, o.y) };
+    [unroll] for (int k = 0; k < 4; ++k) { float z = zH(saturate(c[k])); if (z < bz) { bz = z; b = saturate(c[k]); } } return b; }
 float2 nearF(float2 s) { float2 b = s; float bz = zF(s); float2 o = prm4.xy;
     float2 c[4] = { s + float2(o.x, 0), s - float2(o.x, 0), s + float2(0, o.y), s - float2(0, o.y) };
     [unroll] for (int k = 0; k < 4; ++k) { float z = zF(c[k]); if (z < bz) { bz = z; b = c[k]; } } return b; }
@@ -156,12 +175,18 @@ float4 ladder(float2 t, bool worldOnly) {
     float2 sF = refineF(t, kF.a > 0 ? kF.xy : t, tF, eF);
     if (kF.a > 0) { float zs = seedZ(kF); zs = zs / max(1.0 - zs, 1e-5);
         if (kF.a < 0.75 || tF > zs * 1.05 + 0.01) { float ta, ea; float2 sa = refineF(t, nearF(kF.xy), ta, ea);
-            if (ea < tol && (!(eF < tol) || ta < tF)) { sF = sa; tF = ta; eF = ea; } } }
+            if (ea < tol && (!(eF < tol) || ta < tF)) { sF = sa; tF = ta; eF = ea; } }
+        if (xRail()) { float2 n1 = near1F(kF.xy);
+            if (zF(n1) < zF(kF.xy) * 0.96 - 0.02) { float ta, ea; float2 sa = refineF(t, n1, ta, ea);
+                if (ea < tol && (!(eF < tol) || ta < tF)) { sF = sa; tF = ta; eF = ea; } } } }
     float4 kH = seedH.SampleLevel(pointSamp, t, 0);
     float2 sH = refineH(t, kH.a > 0 ? kH.xy : t, tH, eH);
     if (kH.a > 0) { float zs = seedZ(kH); zs = zs / max(1.0 - zs, 1e-5);
         if (kH.a < 0.75 || tH > zs * 1.05 + 0.01) { float ta, ea; float2 sa = refineH(t, nearH(kH.xy), ta, ea);
-            if (ea < tol && (!(eH < tol) || ta < tH)) { sH = sa; tH = ta; eH = ea; } } }
+            if (ea < tol && (!(eH < tol) || ta < tH)) { sH = sa; tH = ta; eH = ea; } }
+        if (xRail()) { float2 n1 = near1H(kH.xy);
+            if (zH(n1) < zH(kH.xy) * 0.96 - 0.02) { float ta, ea; float2 sa = refineH(t, n1, ta, ea);
+                if (ea < tol && (!(eH < tol) || ta < tH)) { sH = sa; tH = ta; eH = ea; } } } }
     bool okF = eF < tol, okH = eH < tol;
     bool bF = isFg(zFr(sF)), bH = isFg(zHr(sH));
     // 1. The player's weapon and hands now, from the fresh eye.
@@ -463,6 +488,7 @@ float4 psdiff(VSOut i) : SV_Target {
     std::atomic<bool>             g_held_gun{ false };   // afwheldgun (research): the old way, the held eye's own gun allowed in the fallback
     std::atomic<float>            g_veh_near{ 0.0f };    // afwvehnear: in a vehicle, nearer than this (m) only the fresh image
     std::atomic<float>            g_veh_body{ 0.0f };    // afwvehbody: in a vehicle, nearer than this (m) carried with the vehicle
+    std::atomic<int>              g_experiments{ 0 };    // afwfoot (1), afwrail (2): F11 Experimental > AFW
     ID3D11ShaderResourceView*     g_stencil_srv{ nullptr };
     ID3D11Texture2D*              g_stencil_srv_of{ nullptr };
     std::atomic<int>              g_dump{ 0 };
@@ -1019,7 +1045,7 @@ ID3D11Texture2D* rebuild(ID3D11DeviceContext* ctx, int held, const Camera& targe
     set4(p.prm, { float(w), float(h), 1.5f * depth_texel, g_fg_limit.load() });
     set4(p.prm2, { g_tint.load() ? 1.0f : 0.0f, 0.015f, 6.0f, (H.stencil && F.stencil) ? (g_held_gun.load() ? 2.0f : 1.0f) : 0.0f });
     set4(p.prm4, { float(kGridStep) / dw, float(kGridStep) / dh, float(kGridStep) / dw, float(kGridStep) / dh });
-    set4(p.prm5, { g_veh_near.load(), g_veh_body.load(), 0.0f, 0.0f });
+    set4(p.prm5, { g_veh_near.load(), g_veh_body.load(), float(g_experiments.load() & 3), 0.0f });
 
     StateScope scope{ ctx };
     bind_common(ctx);
@@ -1118,6 +1144,7 @@ void             set_held_gun(bool on) { g_held_gun = on; }
 void             set_fp_input(const FpInput& in) { g_fp = in; }
 void             set_vehicle_near(float metres) { g_veh_near = metres; }
 void             set_vehicle_body(float metres) { g_veh_body = metres; }
+void             set_experiments(int bits) { g_experiments = bits; }
 void             set_enabled(bool on) { g_enabled = on; }
 bool             enabled() { return g_enabled.load(); }
 Stats&           stats() { return g_stats; }
