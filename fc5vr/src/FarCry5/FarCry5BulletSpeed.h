@@ -35,16 +35,10 @@ namespace fc5::bullet
 
     // FC2 VR item 2 (23 Oct): the weapon's fire function (FC_m64+0x1e37110) right after its protected call [vtbl+0x278] fills the shot's
     // origin [rbp-0x58] and direction [rbp-0x68] (hook at +0x1e375fa, bytes checked); the projectile spawn and the shot event read them.
-    //  shotprobe N: the next N calls logged ([ShotProbe]); bulletaim 0|1|2: 1 = a player shot's direction written as the barrel ray (the game's origin),
-    //  2 = also from the drawn muzzle (not at a wall); with either, no aim swing or trigger gate while firing (Stereo.cpp's aim loop asks
-    //  aim_mode()); bulletorigin head|muzzle (test: the muzzle origin with mode 1 too).
+    //  shotprobe N: the next N calls logged ([ShotProbe]). bulletaim / bulletorigin (shots rewritten along the barrel) were removed with
+    //  F11 Experimental > Research for alternatives (Homard 30 Oct).
     bool install_shot_hook(uint8_t* fc_m64_base);
     void shot_probe(int n);
-    void set_aim_mode(int mode);
-    int  aim_mode();       // the setting (0-2)
-    bool shot_hook_ok();   // the hook is in (bulletaim acts only then)
-    void set_origin_muzzle(bool on);
-    bool origin_muzzle();
     // Each present: the game camera (position, forward) and the barrel (direction, drawn muzzle), world space, z up.
     void set_view(const float cam[3], const float fwd[3], const float aim[3], const float muzzle[3], bool aim_valid, bool muzzle_at_wall);
 }

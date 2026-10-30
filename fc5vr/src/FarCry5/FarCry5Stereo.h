@@ -3,6 +3,7 @@
 #include <Mod.hpp>
 #include "FarCry5Afw.h"
 #include "FarCry5Gesture.h"
+#include "FarCry5LocalLights.h"
 #include <d3d11.h>
 #include <glm/glm.hpp>
 #include <glm/gtc/quaternion.hpp>
@@ -488,6 +489,31 @@ private:
     std::atomic<int>   m_empty_palm_log{ 0 };
     std::atomic<int>   m_empty_learn{ 0 };                           // emptyhandlearn: draws still to average
     bool               empty_hands_aligning() const;                 // this frame: the empty palms turned to the grip pose
+    // shoulderdraw on|off (FarCry5WeaponSwitch.cpp; default off, saved; F11 Experimental > Weapon switch (test); Homard 26 Oct: "the
+    // weapon should appear in the hand as if grabbed from the shoulder"): a weapon-switch gesture (fc5::gesture::weapon_switch_count())
+    // opens a switch window. Phase 1, from the grip until the game draws the new weapon with a known held pose (gunstill): the
+    // weapon pass is hidden but the gloves, and the right glove is an empty hand on its controller (emptyhandstill's bones). Phase 2,
+    // shoulderdrawms (saved, default 1500) from then: gunstill holds the new weapon at once and fully (no 0.6 m limit, no reload),
+    // so the game's draw animation does not show. shoulderdrawwait ms (saved, default 1500; the first switch from the sling took 1.08 s in the simulator): with no new weapon id by then the game
+    // did not switch and the old weapon shows again. shoulderdrawtest: the window opened and pad Y tapped, as the gesture does; shoulderdrawsnap a b: eye pictures a ms after the grip and b ms after the new weapon shows. With the switch off the window still opens, watched and logged only (for comparing).
+    // weapon_switch_hiding(): phase 1 now (the holster thread draws its recorded copies then); weapon_switch_target(): the new
+    // weapon's id once phase 2 began (0 before); weapon_switch_holds(sig): phase 2 holds that weapon now.
+    std::atomic<bool>  m_sh_draw{ false };
+    // shoulderinstant on|off (saved, default on, with shoulderdraw; Homard 27 Oct: "a bit too slow ... make it instant"): in phase 1 the
+    // recorded copy (FarCry5Holster.cpp) of the weapon the switch is guessed to bring is drawn in the hand from the grip (weapon_switch_guess).
+    std::atomic<bool>  m_sh_instant{ true };
+    uint32_t           weapon_switch_guess() const;
+    bool               weapon_switch_needs_pose(uint32_t sig) const;   // phase 1 brought this weapon and its held pose is not known: gunstill takes it at the end of the draw
+    std::atomic<int>   m_sh_draw_ms{ 1500 }, m_sh_draw_wait{ 1500 };
+    struct WeaponSwitchState;
+    WeaponSwitchState* m_wsw{ nullptr };
+    void               weapon_switch_frame(uint32_t frame_sig);   // once per frame, after m_unarmed is set and before empty_hands_frame
+    bool               weapon_switch_hiding() const;
+    uint32_t           weapon_switch_target() const;
+    bool               weapon_switch_holds(uint32_t sig) const;
+    void               weapon_switch_note_hidden();                // weapon_draw_impl: one weapon-pass draw hidden in phase 1
+    bool               weapon_switch_command(const std::string& cmd, const std::string& arg, float fv, std::istream& rest, bool& persist);
+    void               draw_weapon_switch_menu(const std::function<void(const char*)>& hint, const std::function<void(const char*)>& section);
     // offhandstill on|off|always (FarCry5EmptyHands.cpp; default on, saved; Homard 23 Oct 22:17: "the left hand moves when sprinting
     // while holding the weapon with right hand"): with a weapon in the weapon hand and the other hand free (no two-handed hold),
     // the free glove is put on its controller with the game's turn of it, and the game swings that arm while moving (its sprint
@@ -621,6 +647,9 @@ private:
     std::atomic<bool>                         m_eye_impostors{ true };
     uint64_t                                  m_impostor_fixes{ 0 };
     bool fix_impostors(float* d);
+    // lampeye (FarCry5LocalLights): the lamp data slots of each compute shader (LightsLightingData, ShadowData; 255 none).
+    std::unordered_map<ID3D11ComputeShader*, std::pair<UINT, UINT>> m_lamp_cs{};
+    fc5::locallights::Saved lamp_swap(ID3D11DeviceContext* ctx);
     // Far tree line (global impostors, VS #0BC76EBF): its cards turn about U = (c8.z, c9.z, c10.z) of GlobalImpostors_BillboardMatrix,
     // (0,1,0) = screen up. Per draw, a stand-in block with U = the eye's roll-free up in view space (cmd impostorup).
     // Default on (Homard 2026-10-13: tilting far trees solved). The 2026-10-12 GPU timeouts came from fogprev, not this.
@@ -654,6 +683,25 @@ private:
     bool                                      m_cur_ps_skip{ false };
     std::atomic<int>                          m_map_seen_frame{ -1000 };
     std::atomic<bool>                         m_map_flat{ true };
+    // mapsticky (update_menu_screen): the map kept flat until it is closed, also while its shaders are not drawn.
+    std::atomic<bool>                         m_map_sticky{ true };
+    std::atomic<bool>                         m_map_close_press{ false };   // B, Back or Start sent to the game (note_map_close)
+    int                                       m_map_close_frame{ -1000 };   // the frame of the last such press
+    int                                       m_map_held_weapon{ 0 };       // frames in a row with the first-person pass, map held
+    bool                                      m_map_held{ false };          // the map kept flat without its shaders now
+    // binoczoom (update_binoculars): the eyes magnified while the game's binoculars narrow its camera.
+    std::atomic<bool>                         m_binoc_zoom{ true };
+    std::atomic<bool>                         m_binoc_press{ false };      // D-pad up sent to the game (note_binoc_press)
+    std::atomic<float>                        m_binoc_mag{ 1.0f };         // the eyes' magnification now (eye_rel)
+    bool                                      m_binoc_armed{ false };      // a D-pad up press on foot: the binoculars may be up
+    float                                     m_binoc_base_tan{ 0.0f };    // the game camera's tan(hfov / 2) before the press
+    float                                     m_binoc_peak{ 1.0f };        // the largest magnification since the press
+    std::chrono::steady_clock::time_point     m_binoc_armed_at{};
+    void update_binoculars(float tan_half);
+public:
+    void note_map_close(bool down) { static bool was = false; if (down && !was) m_map_close_press = true; was = down; }
+    void note_binoc_press(bool down) { static bool was = false; if (down && !was) m_binoc_press = true; was = down; }
+private:
     std::atomic<int>                          m_ps_census_frame{ -1 };
     std::atomic<int>                          m_ps_census_end{ -1 };
     std::unordered_map<ID3D11PixelShader*, int> m_ps_census_pass{};   // 1 weapon pass, 2 world, 4 other
@@ -842,6 +890,16 @@ private:
     int                m_cine_cam_frame{ -10 };
     std::atomic<bool>  m_cine_pair{ true };       // cmd cinepair: 3D cutscene camera moved once per stereo pair (off = per eye frame)
     std::atomic<bool>  m_cine_follow{ true };     // cmd cinefollow: 3D cutscenes look where the scene camera looks (heading and pitch, no roll)
+    // cinesteer (default on, saved; Homard 29 Oct: "the headset orientation follows the camera a bit like with planes"): 3D cutscenes keep
+    // the level frame at the smoothed position and only steer its heading: onto the scene camera's at once on a cut, eased toward it once
+    // it is cinesteerstart deg away (about 95% in cinesteertime s, at most 90 deg/s), held again within 3 deg. Over cinefollow while on.
+    std::atomic<bool>  m_cine_steer{ true };
+    std::atomic<float> m_cine_steer_start{ 30.0f };   // cmd cinesteerstart (deg, 10-90)
+    std::atomic<float> m_cine_steer_time{ 1.0f };     // cmd cinesteertime (s, 0.3-3)
+    bool               m_cine_steering{ false };
+    float              m_cine_steer_from{ 0.0f }, m_cine_prev_game_yaw{ 0.0f };
+    int                m_cine_steer_logs{ 0 };
+    std::chrono::steady_clock::time_point m_cine_steer_t{}, m_cine_steer_t0{};
     std::atomic<bool>  m_postfx_vr{ true };       // cmd vrpost: the game's vignette and film grain off in the headset picture
     uint64_t           m_postfx_seen{ 0 }, m_postfx_changed{ 0 };
     std::unordered_map<ID3D11PixelShader*, int> m_postfx_shaders{};   // the post pass's shaders -> their PostFx cbuffer slot (under m_ps_mtx)
@@ -906,10 +964,11 @@ private:
     std::atomic<bool>  m_fire_split{ true };      // cmd firesplit: firing on foot aims the game at the barrel, Extended View keeps the culled camera on the head
     std::atomic<bool>  m_fire_ready{ true };      // cmd fireready (Homard 20 Oct): with firesplit, the weapon in hand on foot, the game's aim stays on the barrel (ready to fire)
     std::atomic<bool>  m_snap_ready{ true };      // cmd snapready (Homard 21 Oct): snapsync with the weapon in hand (fireready keeps firesplit on)
+    std::atomic<bool>  m_snap_stick{ true };      // cmd snapstick (Homard 28 Oct): snapsync with the stick aim picked by hand too (the mouse still heard)
     std::atomic<float> m_split_ev_max{ 330.0f };  // cmd splitevmax (Homard 22 Oct): the firing offset limit, handed deg (the game applies x0.75: 330 = 247 deg; room past 180 so it rarely flips sides)
     bool               m_fire_ready_was = false;
     std::atomic<bool>  m_main_strict{ true };     // cmd mainstrict: the main view size only from views with the player camera's kind of projection
-    std::string        m_ui_cmds;                 // commands queued by the F11 Tests tab's switch buttons (run by poll_commands)
+    std::string        m_ui_cmds;                 // commands queued by F11 buttons (run by poll_commands)
     bool               m_split_on = false;        // firesplit offset in use (trigger held, or the aim not yet back on the head)
     std::atomic<float> m_split_slew_deg{ 12.0f };  // cmd firesplitslew: largest aim swing per send while firesplit is on (deg)
     std::atomic<int>   m_split_log_every{ 150 };  // cmd firesplitlog N: a fire split log line every N offset updates
@@ -965,7 +1024,6 @@ private:
     void record_send(int dx, int dy);
     void inflight(uint64_t seq, int& dx, int& dy) const;
     bool headlook_active() const;
-    void draw_tests_tab();
     void prune_captures();
     // Pipeline review 2026-10-10 (research\fc5_pipeline_review_improvements.md), F11 Debug > "Pipeline improvements (review)".
     // All off by default: the build behaves as before until switched on.
@@ -1124,7 +1182,27 @@ private:
     bool               m_menu_screen_on{ false };
 public:
     bool flat_screen_on() const { return m_menu_screen_on; }
+    // popupesc (Homard 25 Oct: "there were some tutorial pop up I could not close without pressing esc. Make them skipable with B"):
+    // a tutorial pop-up pauses the game and only the keyboard's Esc closes it (his 15:50 and 15:51 pop-ups: pad A, B, X and Y,
+    // A held 2 s, all ignored). The pause shows as a game camera that stops answering the aim's mouse sends; while it does, the
+    // right B sends Esc instead of pad Y (VR::on_xinput_get_state).
+    bool popup_esc_now() const;
+    void popup_esc_tap();   // Esc (scan code), held 120 ms
 private:
+    std::atomic<bool>  m_popup_esc{ true };      // cmd popupesc on|off (saved; F11 HUD and menus "B closes tutorial pop-ups")
+    std::atomic<bool>  m_pop_frozen{ false };    // the game camera has not answered kPopSends mouse sends in a row
+    std::atomic<int>   m_pop_frame{ -1000 };     // the frame popup_watch last ran (stale: the aim loop is not running)
+    int                m_pop_unanswered{ 0 };    // sends with a sideways move the camera did not answer, in a row
+    int                m_pop_prev_dx{ 0 };
+    float              m_pop_yaw{ 0.0f }, m_pop_pit{ 0.0f };
+    glm::vec3          m_pop_cam{ 0.0f };
+    // popuphold (Homard 27 Oct 21:56: the game's prompts turned to keyboard icons; his 21:35 log had ~45 s of aim sends into
+    // paused pop-ups, the likely cause): while the camera answers no sends, one probe send every 0.5 s instead of one per pair,
+    // and no snap-turn sends.
+    std::atomic<bool>  m_pop_hold{ true };       // cmd popuphold on|off (saved; F11 HUD and menus, "Tutorial pop-ups")
+    std::chrono::steady_clock::time_point m_pop_probe_at{};
+    int                m_pop_held{ 0 };          // aim sends held back since the camera stopped answering
+    void               popup_watch(int dx);
     int                m_no_player_frames{ 0 };
     int                m_player_frames{ 0 };   // consecutive frames with a player camera
 
@@ -1169,6 +1247,16 @@ private:
     std::atomic<bool>  m_lt_sent{ false };       // the pad's LT (aim down sights on foot) went to the game this poll
     std::atomic<bool>  m_dbg_lt{ false };
     std::atomic<bool>  m_sig_skip_gloves{ true };
+    // weaponidsplit on|off (default on, saved): the weapon id is the largest weapon-pass draw's index count, but a big gun's mesh
+    // comes in 65535-index pieces: 4 guns shared the id 65535 in Homard's 13:43 log (one pose, sight line and scope entry for all).
+    // On: such a gun's id is 65536 + its largest other piece (kept while that piece is still drawn). Off: 65535 for all of them.
+    std::atomic<bool>  m_weapon_id_split{ true };
+    // The draw size of a weapon id's own mesh (a split id, 0x10000 | its next piece, is still drawn as the 65535-index piece).
+    static uint32_t    sig_mesh(uint32_t sig) { return (sig & 0x10000u) ? 65535u : sig; }
+    UINT               m_weapon_sig2_frame{ 0 };   // the largest weapon-pass draw this frame other than a 65535-index piece
+    static constexpr int kSigCounts = 64;
+    UINT               m_sig_counts[kSigCounts]{};  // this frame's weapon-pass draw sizes (weaponidsplit keeps an id while its piece is drawn)
+    int                m_sig_counts_n{ 0 };
     float              m_hit_hold{ 0.0f };
     std::chrono::steady_clock::time_point m_hit_hold_time{};
     std::atomic<int>   m_hit_hold_ms{ 300 };       // keep the last barrel hit this long after a miss (cmd hithold MS, 0 = off)
@@ -1209,6 +1297,70 @@ private:
     // the culled camera onto the head, since the parachute's camera ignores the mouse; and no vehicle is entered meanwhile
     // (the parachute blinked in and out of "vehicle", recentring the view each time). [Fall] lines.
     std::atomic<bool>  m_chute_look{ true };
+    // fallvmin m/s (default 6, saved; 0 = as before 25 Oct; Homard 25 Oct 15:52 log: sprinting down a slope sank the camera
+    // 3.6 m/s, was taken for a fall and held as a vehicle for 4.5 s, the view turning with the running player by 140 deg): a
+    // fall is held as a vehicle only once it has sunk faster than this (a real fall passes 6 m/s within ~0.7 s, a run down a
+    // slope stays near 3-4), or once the game's parachute is seen as a vehicle.
+    std::atomic<float> m_fall_vmin{ 6.0f };
+    float              m_fall_peak{ 0.0f };   // the fastest sinking (most negative m_fall_vz) since the fall started
+    bool               m_fall_slope_said{ false };
+    // chutemin (default on, saved; F11 Comfort > Cinematics and vehicles; Homard 30 Oct 09:34 "a lot of false parachute detection from jumping
+    // balcony"). His 09:27 log: three balcony jumps (09:30:30, 09:30:47, 09:31:05) were held as a parachute for 3-7 s while he ran on: the
+    // game's "in air" ended (landing) 0.6-1.0 s after the jump, the fall was seen just as he landed (15 updates sinking past 3 m/s), and the
+    // hold came 0.5 s later on the old rule, which never looked at the sinking again. Now a fall is held only 0.8 s or more after it was seen
+    // with the fall not over (10 updates under 1 m/s), and, when the game says it is in the air (a jump or a free fall, vehscript's poll),
+    // once that has lasted 1.5 s (a free fall); an open chute or no answer is held on the timing alone. fallvmin as before.
+    std::atomic<bool>  m_chute_min{ true };
+    // chuteland (default on, saved; F11 Comfort > Cinematics and vehicles; Homard 30 Oct 12:30: "It took a long time after my parachute
+    // until the game settle back on the actual camera"). His 12:30 log: on the ground by about 12:30:10, "[Fall] landed" at 12:30:19.85:
+    // the old rule wants 90 updates in a row sinking under 1 m/s (3 s at 30 pairs/s), and running down the slope after the landing
+    // (the camera sinking 0.9-1.3 m/s) kept restarting it. The game has no parachute getter (research/2026-10-30_vehair_chuteland.md),
+    // so the landing stays a camera rule, in time: landed once the camera has not sunk faster than 1.6 m/s for 0.7 s (smoothed over
+    // 0.25 s, against the head bob). An open chute sinks about 2 m/s (his 09:10 descent), so it stays held. The old rule still lands too.
+    std::atomic<bool>  m_chute_land{ true };
+    // chuteopen (default on, saved; F11 Comfort > Cinematics and vehicles; Homard 30 Oct 13:25 play: "parachute still have culling when
+    // they open"). The game's vehicle answer is type 6 (wingsuit) for the glide AND the chute opened from it (13:30:29-13:31:10: 40 s under
+    // the chute, sinking 4 m/s, 5 m/s across), type 2 the paraglider class (never seen: the plain chute of 09:10 was "on foot"); it goes to
+    // none on landing (in air false; 12:30:09.9, Homard "on the ground by about 12:30:10") or
+    // when the chute is cut (in air true). vehscript dropped 2 and 6 and the rules took the chute opening (the hands' pass back) for getting
+    // out: "on foot again", a 2-3 s exit-animation wait with no aim, the eyes 30-90 deg off the culled camera. Now, while the game says 2 or
+    // 6: held as a parachute at once (no entry settle, recentre or exit wait, the heading kept, the head look on; chutelook or not); the
+    // answer going to none on the ground (in air false, sinking under 3 m/s) = landed at once (12:30 log: 10 s earlier than chuteland),
+    // in the air = a fall (chutelook). [Fall] chuteopen lines.
+    std::atomic<bool>  m_chute_open{ true };
+    // chuteground (default on, saved; Homard 30 Oct: "The parachute was still on for too long once on the ground if I kept running
+    // downhill"). Today's late landings were jumps with no chute (no type 2 / 6): 09:30:30 held 7.2 s, 09:30:48 3.9 s, 09:31:06 8.7 s,
+    // 12:29:32 4.8 s, 13:27:16 6.5 s past the game's "in air" going false, the camera sinking past 1.6 m/s while he ran down the slope.
+    // Now a fall the game does not call a wingsuit or parachute ends once the game says on the ground (in air false) for 0.25 s after
+    // under 1.5 s in the air (a plain chute, which the game calls on foot, opens after a longer free fall: the camera rules as before),
+    // and the next fall waits for the game to say in the air again (no new fall from the run itself).
+    std::atomic<bool>  m_chute_ground{ true };
+    // chuteprobe (log only, default on for now, saved): while falling, under a wingsuit or parachute and 3 s after, each new draw within
+    // 8 m of the camera (pixel shader and index count) is logged once with its offset ("2-8 m above" marked), and a summary at the end:
+    // whether the canopy can be told apart by its draw. [ChuteProbe] lines.
+    std::atomic<bool>  m_chute_probe{ true };
+    bool               m_co_suit{ false };       // chuteopen: the game says type 2 or 6 now
+    int                m_co_type{ -1 };
+    bool               m_cg_wait_air{ false };   // chuteground: landed by the game's answer: no new fall until it says in the air
+    bool               m_cg_ground{ false };     // chuteground: the game says on the ground since m_cg_ground_t0
+    float              m_cg_air_run{ 0.0f };     // chuteground: the last run the game said in the air, s (0 after a landing)
+    std::chrono::steady_clock::time_point m_cg_ground_t0{};
+    struct ChuteDraw { glm::vec3 off{ 0.0f }; int frames{ 0 }, last_frame{ -1 }; float first{ 0.0f }, last{ 0.0f }; std::string names; };
+    std::mutex                                     m_cp_mtx;
+    std::map<std::pair<void*, UINT>, ChuteDraw>    m_cp_draws;   // chuteprobe: by (pixel shader, index count)
+    std::atomic<bool>                              m_cp_on{ false };
+    int                                            m_cp_frame{ -1 }, m_cp_logged{ 0 };
+    std::chrono::steady_clock::time_point          m_cp_t0{}, m_cp_until{}, m_cp_land_t{};
+    void               chute_probe(ID3D11DeviceContext* ctx, UINT count);
+    void               chute_probe_tick();
+    float              m_land_vz{ 0.0f };      // the camera's vertical speed, smoothed over 0.25 s (chuteland)
+    bool               m_land_quiet{ false };  // sinking under 1.6 m/s since m_land_quiet_t0
+    std::chrono::steady_clock::time_point m_land_quiet_t0{};
+    int                m_vst_said{ 0 };   // vehscript stance: the last stance / GetPawnVehicle agreement logged (update_vehicle)
+    bool               m_fall_held{ false }, m_fall_old_would{ false }, m_fall_air_on{ false }, m_fall_ended{ false };
+    float              m_fall_z0{ 0.0f }, m_fall_zmin{ 0.0f }, m_fall_air_max{ 0.0f }, m_fall_sink_s{ 0.0f };
+    const char*        m_fall_why{ "" };
+    std::chrono::steady_clock::time_point m_fall_sink_t0{}, m_fall_air_t0{}, m_last_air_t{};
     bool               m_falling{ false }, m_fall_valid{ false };
     bool               m_chute_vehicle{ false };   // the vehicle state is a fall (held until landed)
     float              m_fall_vz{ 0.0f };
@@ -1234,6 +1386,11 @@ public:
     std::atomic<float> m_wheel_test_x{ 0.0f }, m_wheel_test_y{ 0.0f };
     // LT from the right grip: in vehicles and menus only (on foot the grip holds the gun; gripads was removed 24 Oct).
     bool grip_sends_lt() const { return in_vehicle() || flat_screen_on(); }
+    // vehtriggers (FarCry5VehTransition.cpp): driving, the right trigger shoots (LB), the left trigger is the throttle (RT) and the left grip
+    // the brake (LT); the right grip sends nothing.
+    bool veh_triggers_swapped() const { return m_veh_triggers.load() && in_vehicle() && !flat_screen_on(); }
+    void note_veh_triggers(bool swapped, bool right_held, bool left_held);
+    std::atomic<int> m_vt_shots{ 0 };   // right-trigger presses sent as LB since the layout last changed (log)
     bool debug_lt() const { return m_dbg_lt.load(); }
     void note_lt(bool sent);
     void note_grip(bool down) { m_grip_held = down; }
@@ -1247,11 +1404,46 @@ public:
     // throwable (FarCry5Throwable.cpp): the game draws its throwable (a rigid weapon-pass mesh) only while the throw button
     // is held. That draw is moved from the game's left hand to the left controller (throwhand), and recorded so it can be
     // drawn again on the chest between throws (throwchest).
+    // sidearm (FarCry5Holster.cpp): each weapon the game holds is recorded (its weapon-pass draws, in the gun's steadied axes) so the mod
+    // can draw it where it is carried while the game holds the other one: the main weapon on the sling, the sidearm on the hip, and the
+    // wanted one in the hand while a switch is pending.
+    struct HolsterState;
+    HolsterState*        m_hol{ nullptr };
+    void                 holster_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, UINT instances);   // a kept non-glove weapon-pass draw
+    void                 holster_show(ID3D11DeviceContext* ctx);      // at the gloves draw, before it: the copies
+    bool                 holster_model_build(ID3D11DeviceContext* ctx, uint32_t sig);   // holstermodel: the holster molded on that sidearm
+    void                 holster_model_draw(ID3D11DeviceContext* ctx, ID3D11Buffer* const* vcb);   // holstermodel: on the hip (vcb: the gloves draw's VS b0-b4)
+    void                 holster_frame_end();                         // the frame's weapon id known: commit a recording, the kinds held
+    bool                 holster_command(const std::string& cmd, const std::string& arg, float fv, std::istream& rest, bool& persist);
+    bool                 holster_is_side(uint32_t sig);               // a sidearm: by hand (sidearmweapons) or measured (gun_still_handgun)
+    std::atomic<bool>    m_hol_cur_side{ false };                     // the weapon in the game's hands now is a sidearm (for the pad thread)
+    std::atomic<bool>    m_hol_hiding{ false };                       // weapon_switch_hiding() at the last frame end (for the pad thread)
+    std::atomic<bool>    m_hol_known{ false };                        // the weapon in the game's hands has been recorded (for the pad thread)
+    std::atomic<bool>    m_hol_side_rec{ false };                     // the sidearm slot's weapon has been recorded (for the pad thread: sidearmpeek)
+    std::atomic<bool>    m_hol_side_known{ false };                   // the sidearm slot's weapon is known (sidearmsig set; for the pad thread)
+    std::atomic<uint32_t> m_hol_main{ 0 };                            // the main weapon last held still (0: none; loadslot, the pad thread)
+    std::atomic<uint32_t> m_hol_side_sig{ 0 };                        // that weapon (for the pad thread: sidearmy)
+    std::atomic<bool>    m_hol_side_unlisted{ false };                // the saved sidearm list has weapons, the one in hand is not one (for the pad thread)
+    std::atomic<bool>    m_hol_copy_hand{ true };                     // holsterhand on|off (test): the copy in the empty hand placed by where that hand holds it
+    std::atomic<bool>    m_hol_glove{ true };                         // holsterglove on|off (test): the copy in the hand held by the hand recorded with it
+    bool                 holster_hand_pose(uint32_t& sig, glm::vec3& pos, glm::mat3& rot, bool& empty_hand);   // the copy in the hand this frame
+    void                 holster_glove_note(const void* mesh, UINT count, UINT start, INT base, const glm::mat4& Om, const std::vector<float>& bones,
+                                            const std::vector<glm::vec4>& cent, int wside);
+    bool                 holster_glove(const void* mesh, UINT count, UINT start, INT base, const glm::mat4& Om, std::vector<float>& bones);   // the weapon hand's bones holding the copy
+    void                 holster_keep_hands(uint32_t sig);            // holsterglove: the recorded hands kept (fc5vr_holsterhands.txt)
+    bool                 holster_has_saved_hand(uint32_t sig) const;
+    bool                 holster_switch_hiding() const;               // the game's weapon is hidden for an instant switch (shoulder grab thread)
+    bool                 holster_hides_game() const;                  // a sidearm switch pending: the game's weapon-pass draws (its switch animation) hidden
+    bool                 holster_has_copy(uint32_t sig);              // that weapon recorded (shoulderinstant can draw it)
+    bool                 holster_records() const;                     // weapons are recorded (the sidearm, or shoulderinstant)
+    void                 draw_holster_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);
+    int                  gun_still_handgun(uint32_t sig) const;       // FarCry5GunStill.cpp: 1 handgun, 0 not, -1 not measured
     struct ThrowableState;
     ThrowableState*      m_th{ nullptr };
-    void                 throwable_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool record_only = false);   // a non-glove weapon-pass draw (record_only: an arm draw, hidden)
+    bool                 throwable_draw(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, bool record_only = false);   // a non-glove weapon-pass draw (record_only: an arm draw, hidden); true: not to be drawn
     void                 throwable_chest(ID3D11DeviceContext* ctx);   // at the gloves draw, before it
-    void                 throwable_pouch(ID3D11DeviceContext* ctx);   // the pouch marking the grab spot, with the gloves' material
+    void                 throwable_pouch(ID3D11DeviceContext* ctx, int host = 0, UINT count = 0, UINT start = 0, INT base = 0);   // the pouch marking the grab spot, in the hands' (0) or a clothing (1) draw
+    void                 throwable_pouch_cloth(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base);   // throwpouchmat cloth: a hidden first-person draw, the pouch's host if it is cloth
     void                 throwable_restore(ID3D11DeviceContext* ctx);
     bool                 throwable_command(const std::string& cmd, const std::string& arg, float fv, std::istream& rest, bool& persist);
     void                 throwable_note_support(const glm::mat4& A, const glm::vec3& F);   // the gloves draw's left-hand move
@@ -1264,6 +1456,7 @@ public:
     void                 draw_throw_v2_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint,
                                             const std::function<void(const char*)>& section);
     void                 throwable_hold_pose(glm::vec3& pos, glm::mat3& rot) const;
+    void                 hud_tex_probe(ID3D11DeviceContext* ctx);   // hudtexprobe (test)
     void                 throw_all_probe(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base, UINT inst);   // throwallprobe (test)   // the holding hand's controller (world); left unchanged for the left hand
     bool                 m_hand_bones_swapped{ false };
     std::atomic<int> m_plane_scan{ 0 };
@@ -1310,6 +1503,19 @@ public:
     bool              m_veh_settle_entry{ false };   // the running settle is getting in (not a seat change)
     std::atomic<bool> m_veh_entry_follow{ true };
     std::atomic<bool> m_veh_stick{ true };
+    // helipitch (default on, saved; Homard 30 Oct: "the helicopter move forward/back with left stick, but does not pitch"): piloting
+    // a helicopter the right stick's up / down goes to the game as its own right stick Y (its look / pitch), pushed forward = nose
+    // down. Off: never sent (as before).
+    std::atomic<bool> m_heli_pitch{ true };
+    // stickview (default on, saved; Homard 30 Oct 12:35 "right stick movement should move the chopper without moving the camera. Remove
+    // all camera movement from right stick in vehicles more generally"): in a vehicle the right stick reaches the game only in a
+    // helicopter or a plane (vehstick, helipitch); planelook's seat starts as the model's axes (y ahead, z up), so a flying vehicle's
+    // view hangs on its body from take-off, and the seat is not learnt while the right stick turns the game's camera ahead of the
+    // aircraft. Off: as before.
+    std::atomic<bool>     m_stick_view{ true };
+    std::atomic<uint64_t> m_veh_rstick_t{ 0 };   // GetTickCount64 of the last right stick sent to the game in a vehicle
+    void note_veh_rstick() { m_veh_rstick_t = GetTickCount64(); }
+    bool stick_view() const { return m_stick_view.load(); }
     // Getting in / out comfort (FarCry5VehTransition.cpp, Homard 23 Oct: "the camera movements were very unpleasant ... especially
     // when transitioning between vehicles"): vehfollowhead (default on, saved): the follow turns the view by the animation's turn
     // only, the head still turns it (before: the view's heading held on the game camera's, the head's yaw not seen for 1-3 s);
@@ -1325,6 +1531,39 @@ public:
     int               m_vf_snaps{ 0 };           // snaps in the running follow
     std::chrono::steady_clock::time_point m_vf_snap_t{};
     int               m_vf_seat_held{ 0 };       // frames the running seat-change settle was held (vehseatguard)
+    // vehseathold (default on, saved; Homard 28 Oct 22:17: "I was in a boat and could not accelerate"): a boat's model is 3 m from the
+    // driver's camera, outside vehicle_probe's window, so the hands' pass alone said in or out; the game draws the sidearm in the
+    // boat every few seconds and the mod went on foot each time (the trigger held for the aim, the sling cut it). Now the seat is
+    // learnt on the vehicle's model (the Vehicle_ draw within 8 m, the camera in its axes) when a settle ends; while the camera
+    // stays within vehseatholdm of it the player is in that vehicle, and a driver who draws a weapon is still driving.
+    struct VehSeatRec { int frame{ -100 }; UINT count{ 0 }; glm::vec3 cam{ 0.0f }; float dist{ 0.0f }; };
+    std::atomic<bool>  m_veh_seat_hold{ true };
+    std::atomic<float> m_veh_seat_hold_m{ 0.6f };
+    // vehtriggers (default left, saved; Homard 29 Oct 10:19: "right grip and right trigger are used for shooting but also for accelerating
+    // in some vehicles"; 10:39 "right grip also need to be free ... make left grip brakes"): driving, the right trigger is the game's vehicle
+    // fire (LB), the left trigger the throttle (RT) and the left grip the brake (LT); the right grip is free. right = as before.
+    std::atomic<bool>  m_veh_triggers{ true };
+    // vehdrivegun (default on, saved; F11 Comfort > Cinematics and vehicles; Homard 30 Oct 09:11 "I was not able to accelerate on the quad"):
+    // his right trigger during the quad's entry was sent as LB (the driver's fire), the game drew the sidearm, the weapon view came back and
+    // update_vehicle took it for a passenger seat (the left trigger back to LB for 6 s). A weapon view that shows while driving within 1.5 s
+    // of that LB (or while it is held, or after one sent during this vehicle's entry) is the driver's sidearm: latched until the vehicle is
+    // left, still driving meanwhile. First, though, the game's own answer (vehscript; seat from 1, driver's seat from 0, seat 0 = getting in):
+    // its driver drives (drive and shoot), its passenger rides; the LB latch decides only without it (research\2026-10-30_vehdrivegun_downview.md).
+    std::atomic<bool>    m_veh_drive_gun{ true };
+    std::atomic<int64_t> m_vt_lb_t{ 0 };        // steady_clock ticks of the last pad poll sending LB from the right trigger while driving (ModConfig)
+    std::atomic<bool>    m_vt_lb_held{ false };
+    bool                 m_vdg_latched{ false }, m_vdg_said{ false };
+    int                  m_vdg_frames{ 0 };     // frames a weapon view left the driver driving through the latch (log)
+    const char*          m_vdg_rule{ nullptr };   // the rule that decided driving / riding last (log on change)
+    std::string          game_seat_text() const;   // vehdrivegun: the game's seat, driver's seat and vehicle entity (log only)
+    VehSeatRec         m_vsh_rec[4]{};          // by frame: the camera in the axes of the Vehicle_ draw nearest the seat (or the largest)
+    glm::vec3          m_vsh_seat{ 0.0f };      // the learnt seat (the camera in the model's axes)
+    bool               m_vsh_valid{ false }, m_vsh_driving{ false }, m_vsh_near{ false }, m_vsh_kept_said{ false };
+    float              m_vsh_off_max{ 0.0f };   // the camera's largest distance from the seat while held (log)
+    int                m_vsh_kept{ 0 };         // frames a driver's weapon did not turn the driving into riding
+    void               veh_seat_probe(int frame, const float* f, UINT count, float dist);
+    bool               veh_seat_update(int frame);   // update_vehicle: the camera still in the learnt seat
+    void               veh_seat_learn(int frame);
     bool              vehtrans_command(const std::string& cmd, const std::string& arg, bool& persist);
     void              veh_follow_start();
     void              veh_follow_step(std::chrono::steady_clock::time_point now);
@@ -1376,19 +1615,38 @@ public:
     float              m_vig_target{ 0.0f }, m_vig_level{ 0.0f };
     bool               veh_flying() const { return m_veh_fly_force.load() >= 0 ? m_veh_fly_force.load() == 1 : m_veh_flying; }
     // airfollow's attitude is eased in only for these (the target is still read in every vehicle: AFW's cab frame uses it).
-    bool               air_follow_attitude() const { return m_ground_follow.load() || m_chute_vehicle || veh_flying(); }
+    // chutelevel (Homard 29 Oct 10:15 playtest, "the camera became weird when looking down"): a fall or a parachute (chutelook)
+    // follows the heading only unless groundfollow is on; see m_chute_level.
+    bool               air_follow_attitude() const { return m_ground_follow.load() || (m_chute_vehicle && !m_chute_level.load()) || veh_flying(); }
+    // planelook (FarCry5PlaneLook.cpp; Homard's 27 Oct playtest: in a plane he could not look down, nor aside with the nose straight
+    // up or down): airfollow's attitude read from the vehicle's own model, not the game camera less a head look the game holds back.
+    std::atomic<int>   m_plane_look{ 1 };      // cmd planelook off|fly|all (saved): 0 off, 1 flying vehicles (default), 2 every vehicle (test)
+    // vehnose (Homard 29 Oct: "When going into the plane, the camera was not looking the front of the plane"): at the entry's settle
+    // the front is the model's forward axis (y), not the model axis nearest the game camera (a plane's entry camera faces the door).
+    std::atomic<bool>  m_veh_nose{ true };     // cmd vehnose on|off (saved)
+    struct PlaneRec { int frame{ -100 }; UINT count{ 0 }; glm::mat3 rot{ 1.0f }; float dist{ 0.0f }; };
+    PlaneRec           m_plane_mdl[4]{};       // the vehicle's model by frame (world -> its axes; count = its indices)
+    PlaneRec           m_plane_cam[4]{};       // the camera's reading of the aim frame by frame (world -> view; count 1 = head ahead, near level)
+    glm::quat          m_plane_seat{ 1.0f, 0.0f, 0.0f, 0.0f };   // the model's axes -> the aim frame's (learnt with the head ahead)
+    int                m_plane_seat_n{ 0 }, m_plane_seat_bad{ 0 };
+    bool               m_plane_seat_axes{ false };   // stickview: the seat is the model's axes, not yet checked against a look ahead
+    glm::quat          m_plane_fix{ 1.0f, 0.0f, 0.0f, 0.0f };    // view -> view: the model's attitude against the camera's reading
+    int                m_plane_fix_frame{ -100 }, m_plane_fix_bad{ 0 };
+    float              m_plane_blend{ 0.0f };
+    uint64_t           m_plane_used{ 0 }, m_plane_nomodel{ 0 }, m_plane_refused{ 0 };
+    float              m_plane_fix_sum{ 0.0f }, m_plane_fix_max{ 0.0f };
+    std::chrono::steady_clock::time_point m_plane_t{}, m_plane_log_t{};
+    bool               planelook_command(const std::string& cmd, const std::string& arg, bool& persist);
+    void               planelook_reset();
+    void               plane_model_probe(int frame, const float* f, UINT count, float dist);
+    glm::mat3          plane_look_fix(int frame, const glm::mat3& a_cam);
+    void               draw_planelook_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);
     bool               vehcomfort_command(const std::string& cmd, const std::string& arg, bool& persist);
     void               veh_comfort_step(std::chrono::steady_clock::time_point now, const glm::vec3& pos, bool mesh_near);
     void               draw_vehcomfort_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint,
                                             const std::function<bool(const char*, float&, float, float, const char*, float)>& slider);
     void              fade_tick(float dt);
     void              fade_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye);
-    // shoreblur (FarCry5Shore.cpp, off): each eye's picture blurred a few pixels across the water's edge (the game's stepped pale rim).
-    std::atomic<bool>  m_shore_blur{ true };   // default on since 17 Oct (Homard), F11 Debug > Experimental
-    std::atomic<float> m_shore_blur_px{ 3.0f };   // cmd shoreblurpx N: how far from the edge, in eye pixels (1-8)
-    void              shore_note_cs(ID3D11ComputeShader* cs, UINT slot);
-    void              shore_capture(ID3D11DeviceContext* ctx, ID3D11ComputeShader* cs);
-    void              shore_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye);
     void              asm_note_dispatch(ID3D11DeviceContext* ctx);   // asmlog (research)
     void              asm_note_terrain_cs(bool swapped);              // asmlog (research)
     int               frame_now() const { return m_frame.load(); }
@@ -1441,6 +1699,13 @@ public:
     std::atomic<bool> m_aircraft_guard{ true };      // flying: the head does not steer the game camera (cmd aircraftguard)
     bool              m_veh_aircraft{ false };
     int               m_veh_air_frames{ 0 };
+    // vehair (under vehscript; Homard 30 Oct 12:31 log: on the quad, the game's type 0 wheeled, an off-road roll of 15 deg set
+    // m_veh_aircraft, the head stopped steering the game camera and the eyes sat 100-160 deg off it for 11 s, culled): the game's
+    // vehicle type while it answers (0 wheeled, 1 boat, 3 motorcycle, 4 helicopter, 5 plane; -1 no answer). A known type other
+    // than 4 or 5 is never flying (m_veh_aircraft and vehcomfort's veh_flying); a helicopter, a plane or no answer: the tests as before.
+    int               m_veh_game_type{ -1 };
+    bool              m_vehair_said{ false };   // the "not flying" line, once per ride
+    bool              veh_type_grounded() const { return m_veh_game_type >= 0 && m_veh_game_type != 4 && m_veh_game_type != 5; }
     uint64_t          m_veh_heading_spikes{ 0 };
     int               m_exit_settle{ 0 }, m_exit_stable{ 0 };
     float             m_exit_yaw{ 0.0f };
@@ -1461,12 +1726,19 @@ public:
         return m_veh_stick.load() && m_in_vehicle.load() && m_veh_driving.load() && m_veh_settle.load() == 0 &&
                (headlook_active() || (m_veh_aircraft && m_aircraft_guard.load()));
     }
+    // helipitch: piloting (vehstick's conditions with its own switch). The helicopter type is checked by the caller.
+    bool  heli_pitch_pass() const
+    {
+        return m_heli_pitch.load() && m_in_vehicle.load() && m_veh_driving.load() && m_veh_settle.load() == 0 &&
+               (headlook_active() || (m_veh_aircraft && m_aircraft_guard.load()));
+    }
     float stick_y() const { return m_stick_y.load(); }
     bool fire_open() const { return m_fire_open; }
 
 private:
     bool update_motion(int frame, const glm::mat3& game_rot, const glm::vec3& cam);
     void motion_post_present(float dt);
+    void note_stick_by_hand(const char* where);   // snapstick: the stick aim switched by hand is logged
     struct MotionFrame
     {
         int       frame{ -1 };
@@ -1501,6 +1773,9 @@ private:
         bool      chest_valid{ false };       // throwable: its place on the chest (FarCry5Gesture throw_pose), world
         glm::vec3 chest_pos_world{ 0.0f };
         glm::mat3 chest_rot_world{ 1.0f };
+        bool      carry_valid{ false };       // sidearm: the sling's and the hip's weapon places (as ctrl_*: origin the grip), world
+        glm::vec3 sling_pos_world{ 0.0f }, hip_pos_world{ 0.0f };
+        glm::mat3 sling_rot_world{ 1.0f }, hip_rot_world{ 1.0f };
         glm::vec3 draw_shift{ 0.0f };         // gunanchor: added to the drawn gun and hands (eyes' base minus game camera)
         glm::vec3 muzzle_drawn{ 0.0f };       // the drawn muzzle (barrel_origin + draw_shift): scope lens test, tracers
     };
@@ -1535,10 +1810,82 @@ private:
     uint64_t           m_snap_sync_seq{ 0 };        // snapready: the update the snap's counts were recorded at
     bool               m_snap_sync_full{ false };   // snapready: wait for the whole turn (the firing offset reads the aim, so a half-landed send set it 20 deg off)
     std::atomic<bool>  m_veh_pitch_guard{ true };  // cmd vehpitchguard (23 Oct): a car's pitch read against the head look past 20 deg is kept
+    std::atomic<bool>  m_veh_fly_guard{ true };    // vehflyguard (25 Oct, saved): a vehicle's tilt counts toward flying only while it moves (FarCry5VehComfort.cpp)
     float              m_veh_pitch_ref{ 0.0f };
     bool               m_veh_pitch_ref_ok{ false };
     int                m_veh_pitch_guarded{ 0 };
     std::atomic<bool>  m_settle_pitch{ true };     // cmd settlepitch (23 Oct): Extended View pitch follows the head during a vehicle's entry animation
+    // exitpitch on|off (default on, saved; F11 Comfort > Cinematics and vehicles; Homard 29 Oct 10:12 playtest: he got out of a car
+    // looking down, and for a second the eyes were 55 deg below the camera the game culls with, every frame past its view): settlepitch's
+    // Extended View pitch during the exit animation too, so the culled camera looks up / down with the head while getting out.
+    std::atomic<bool>  m_exit_pitch{ true };
+    // chutelevel on|off (default on, saved; F11 Comfort > Cinematics and vehicles; Homard 29 Oct 10:15 playtest: bailing out of the plane,
+    // "the camera became weird when looking down"). A fall held as a vehicle (chutelook) put the view on the fall's attitude: the game's
+    // camera less the head look, which in a free fall points at the ground (his log: 47-53 deg down, vehpitchguard 451 times), so the
+    // whole world tilted ~50 deg within 0.6 s and swung back on landing (~20 deg on a 1 s drop at 10:09:03). Now a fall or a parachute
+    // keeps the horizon level and turns with its heading only, as cars do (the head look still read in its aim frame, so culling is as
+    // before), and the eyes leave the body-based base (viewroot) over 0.15 s instead of in one pair (a 10-24 cm jump at the fall's
+    // start with the camera ahead of the body). groundfollow on still follows the attitude. Off: as before.
+    std::atomic<bool>  m_chute_level{ true };
+    // downedfoot on|off (default on, saved; F11 Comfort > Cinematics and vehicles; Homard 29 Oct 13:54: "a lot of camera bug (after being
+    // down and revived)"). A vehicle was told from the hands' pass alone: no weapon view for 20 updates = in a vehicle. Being knocked
+    // down hides the weapon view too, so his log (14:48:17) took it for getting into a car: the entry recentre, the view turned with the
+    // "car", its pitch guarded against the head (the eyes 38 deg off the game camera on average), then the getting-out recentre on the
+    // revive (75 deg off for a second). Three more the same day (a death, two animations), all with no vehicle model near the camera.
+    // Now no weapon view is a vehicle only with proof: a vehicle model under the camera since the weapon view went, the seat, or the
+    // camera moving over 3 m/s for 20 updates (a vehicle whose model is not found). Falls and parachutes (chutelook) are as before.
+    // On foot (walkbob): the eyes' level more than 0.5 m off the camera's height over the body (knocked down, getting up; the game
+    // animates a crouch, so the level keeps up with it) jumps to it instead of easing over 0.2 s (the eyes stayed 57-65 cm above the
+    // falling camera). Off: as before.
+    std::atomic<bool>  m_downed_foot{ true };
+    // downview (default on, saved; F11 Comfort > Cinematics and vehicles; Homard 30 Oct 09:10 "while down and getting up there is visible
+    // culling, and it is jarring"): knocked down (the game's IsPawnDown, read in vehscript's poll), the eyes were 50-81 deg off the game
+    // camera on average and their base jumped 15-96 cm getting up. While down and 1.5 s after: the view's heading is steered to the game
+    // camera's (a cut on a camera jump, eased past 15 deg), the horizon level; the eyes' base eased to the game camera (at most 4 cm of
+    // correction a pair, ~0.3 s), then eased back to the body view. The aim sends nothing while down (FarCry5DownView.cpp).
+    std::atomic<bool>  m_down_view{ true };
+    std::atomic<int>   m_down_force{ -1 };   // downforce on|off (test, unsaved): 1 fakes the down state, -1 the game's
+    bool               m_dv_active{ false }, m_dv_down{ false }, m_dv_steering{ false }, m_dv_yaw_ok{ false }, m_dv_pos_ok{ false };
+    float              m_dv_prev_yaw{ 0.0f }, m_dv_corr_max{ 0.0f }, m_dv_dy_sum{ 0.0f }, m_dv_dy_max{ 0.0f }, m_dv_dy_start{ 0.0f };
+    int                m_dv_pair{ -1 }, m_dv_cuts{ 0 }, m_dv_steers{ 0 }, m_dv_n{ 0 }, m_dv_cut_logs{ 0 };
+    glm::vec3          m_dv_pos{ 0.0f }, m_dv_off{ 0.0f }, m_dv_prev_cam{ 0.0f }, m_dv_prev_base{ 0.0f }, m_dv_prev_gcam{ 0.0f };
+    std::chrono::steady_clock::time_point m_dv_t0{}, m_dv_up_t{}, m_dv_t{}, m_dv_pos_t{};
+    void               update_downview();   // beside update_vehicle: the down state and the view's heading
+    glm::vec3          down_view_base(int frame, const glm::vec3& cam, const glm::vec3& base_cam);   // the eyes' base eased to the game camera
+    bool               down_view_holds_aim() const { return m_dv_active && m_dv_down; }
+    void               down_view_release(const char* why);
+    bool               downview_command(const std::string& cmd, const std::string& arg, bool& persist);
+    void               draw_downview_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);
+    bool               m_veh_proof_mesh{ false };   // a vehicle model under the camera, or within 4 m of it, since the weapon view went
+    // vehnear (Homard 29 Oct 15:01, headset: "a big problem when getting inside a small truck, it seems to have not been detected as a
+    // vehicle"; log 15:56:42): the truck's model origin sat 2.1 m from the seated camera, never under it, so the truck counted only once it
+    // drove over 3 m/s, 4 s late, and the entry animation turned the game camera 42-84 deg away from a view kept on foot. Any vehicle
+    // model within 4 m of the camera is proof too (the downed, death and animation cases had none within 8 m).
+    int                m_veh_close_frame{ -100 };
+    bool               m_veh_proof_said{ false };
+    int                m_veh_fast_frames{ 0 };      // updates in a row with the camera over 3 m/s, while no weapon view
+    float              m_veh_cam_speed{ 0.0f };     // the game camera's speed, eased over 0.3 s
+    int                m_downed_kept{ 0 }, m_bob_drop_snaps{ 0 };
+    // bobsnapguard (under downedfoot; Homard's 13:25 log, 13:30:42-13:31:04: ~30 snaps "the camera dropped/rose 1.6 m over the body" under
+    // the chute, the body root seen 0.2-0.7 m and 1.85 m under the camera in turn): no snap under a chute, in a fall, in a vehicle or with
+    // downview active; one snap, then none until the level has stayed within 0.5 m for 1 s; a root sample 1 m off the last kept one is
+    // held back for 0.5 s (the bob off meanwhile) and dropped if the root comes back. Logged once per episode, with a count.
+    bool               m_bsg_armed{ true }, m_bsg_pend{ false };
+    float              m_bsg_ref_lvl{ 0.0f }, m_bsg_h_kept{ 0.0f };
+    int                m_bsg_blocked{ 0 }, m_bsg_flips{ 0 }, m_bsg_episode{ 0 }, m_bsg_snaps{ 0 };
+    bool               m_bsg_h_kept_ok{ false };
+    std::chrono::steady_clock::time_point m_bsg_quiet_t0{}, m_bsg_pend_t0{}, m_bsg_last_t{};
+    // vehscript on|off (default on, saved; F11 Comfort > Cinematics and vehicles, "Vehicles: ask the game"; Homard 29 Oct 15:22: "go to
+    // game-script route"): in a vehicle or not is the game's own answer (its GetPawnVehicle for the player, fc5::lua::vehicle_state,
+    // asked every 150 ms) instead of the hands' pass and the downedfoot proofs. Falls and parachutes (chutelook) still come first; with
+    // no answer (off, a fault, menus, the script thread not seen) the rules above decide. Off: as before.
+    std::atomic<bool>  m_veh_script{ true };
+    // gamestate on|off (log only, off by default, saved; F11 Comfort > Cinematics and vehicles "Log the game's own state (test)"; command gamestatestatus): the game's own state (fc5::lua::gamestate_*) logged on each
+    // change, the pause byte beside the mod's menu/cinematic/vehicle state, to check the engine natives before any rule uses them.
+    std::atomic<bool>  m_gamestate{ false };
+    bool               m_veh_heur_want{ false };      // what the hands' pass rules alone would say (compared every 10 s)
+    int                m_vsc_n{ 0 }, m_vsc_game_in{ 0 }, m_vsc_rules_in{ 0 }, m_vsc_in_out{ 0 }, m_vsc_out_in{ 0 }, m_vsc_unknown{ 0 }, m_vsc_drv{ 0 };
+    std::chrono::steady_clock::time_point m_vsc_t0{};
     std::atomic<bool>  m_wheel_force{ false };     // cmd wheelforce (test): the aim loop acts as if the weapon wheel were open
     std::atomic<bool>  m_wheel_look{ true };       // cmd wheellook (23 Oct): Extended View keeps the culled camera on the head while the weapon wheel is open
     std::atomic<bool>  m_body_start_head{ true };  // cmd bodystarthead (23 Oct): the body frame starts with the head where the game looks (was the controller)
@@ -1662,6 +2009,17 @@ private:
     // on the eye's line of sight. scopelearn: each gun's magnification from the game's aim-down-sights zoom.
     std::atomic<bool>  m_scope_auto{ true };      // cmd scopeauto on|off (saved)
     std::atomic<bool>  m_scope_learn{ true };     // cmd scopelearn on|off (saved)
+    // adsprobe off|optic|all (default optic, saved; F11 Weapon > Sights; Homard 29 Oct 13:48: "some [weapons] when near the eye get into
+    // a kind of ADS mode"): sightlearn and scopelearn pressed the game's aim down sights for 0.3-1.5 s the first time a gun came near
+    // the eye (5 guns in his 13:43 log: the game's narrow aim-down-sights camera, its blur and slow walk). optic: only a gun that draws
+    // sight glass (a scope, a red dot) is read so, for its zoom; an iron-sight gun never (its line from the gun's axes is the barrel's,
+    // and a line is still read whenever you aim down sights yourself). off: never. all: every gun (before 29 Oct).
+    std::atomic<int>   m_ads_probe{ 1 };
+    bool               ads_probe_ok(uint32_t sig) const { const int m = m_ads_probe.load(); return m == 2 || (m == 1 && optic_now(sig)); }
+    // scopesticky on|off (default on, saved): the last magnifying entry is kept through a moment's change of weapon id (a bolt cycling)
+    // only while the eye stays behind the scope; off: for 1.5 s whatever the eye does (an iron-sight gun taken within 1.5 s of a
+    // scoped one showed its x3.3 lens: weapon 60537 after 23397, 13:46:46 in Homard's log).
+    std::atomic<bool>  m_scope_sticky_eye{ true };
     std::atomic<bool>  m_scope_probe_lt{ false }; // scopelearn's short aim-down-sights press (read by the pad hook)
     std::atomic<float> m_game_hfov{ 0.0f };       // the game camera's horizontal FOV (world view, before the eye rewrite)
     struct ScopeAds { int state{ 0 }; std::chrono::steady_clock::time_point t0{}, drop{}; float hip{ 0.0f }, min{ 0.0f }; UINT sig{ 0 }; bool probe{ false }, upgrade{ false }, optic{ false }; UINT extra[4]{}; int extra_n{ 0 }; } m_scope_ads{};
@@ -1896,12 +2254,39 @@ private:
     bool               sight_command(const std::string& cmd, const std::string& arg, std::istringstream& ls, bool from_settings, bool& persist_changed);
     bool               gun_still_held(uint32_t sig, glm::mat4& pose);   // FarCry5GunStill.cpp: the weapon's held pose (game camera axes)
     bool               sight_gun_pose(uint32_t sig, glm::mat4& pose);   // the drawn gun's pose (held, or the game's own), game camera axes
+    bool               sight_axes(uint32_t sig, glm::vec3& d, glm::vec3& u);   // a learned sight line's direction and up, the gun's axes (gunaxes)
     std::atomic<float> m_hud_distance{ 1.2f }, m_hud_width{ 1.4f }, m_hud_height{ -0.05f };
     std::atomic<bool>  m_hud_screen{ false };     // cmd hudscreen (HUD report A): HUD in the image drawn per eye as a screen at huddist
     std::atomic<float> m_hud_size_deg{ 70.0f };   // cmd hudsize: that screen's width in degrees
     std::atomic<bool>  m_hud_panel_image{ true }; // cmd hudpanel image|layer: the HUD panel drawn into the eye images (no extra headset layer)
     std::unordered_set<ID3D11PixelShader*> m_hud_shaders{};
     std::unordered_set<ID3D11PixelShader*> m_hud_solid_ps{};   // HUD shaders that read no texture (shapes): m_ps_mtx
+    // hudprim (default on, saved; Homard 30 Oct 12:29 F6: a white and a red chevron 8 deg wide on a rock, a wolf to the right,
+    // big pixel blocks): the game's other 2D primitive shader with a texture (CScenePrimitive + DiffuseSampler0, #4BA2D4B5 in
+    // that frame's census) drew a screen indicator straight into the eye picture at the game's screen size, about 5x too big
+    // and magnified. Taken into the HUD with the CSceneFireUi shaders when its target is the HUD image's size. m_ps_mtx.
+    std::unordered_set<ID3D11PixelShader*> m_hud_prim_ps{};
+    std::atomic<bool>        m_hud_prim{ true };
+    uint64_t                 m_hud_prim_draws{ 0 }, m_hud_prim_left{ 0 };   // taken into the HUD / left in the picture (other size), last second
+    bool hud_prim_fits(ID3D11DeviceContext* ctx);   // hudprim: the bound target has the HUD image's size
+    // hudprimcam (default on, saved; Homard 30 Oct 13:27 F6 with hudprim: "smaller, but only in one eye and not in the right
+    // place in the world"): these draws read the world camera's buffer at b0 (census pass M), which holds this eye's camera, so
+    // they were placed in the marker image for the eye while the world pass reads that image as the game camera's picture (the
+    // red pair shown ~20 deg up and right of the enemies). Taken into the HUD, they get a copy of the game's own upload of that
+    // buffer (this call's first world camera upload, before the mod's rewrite), as the flat game draws them.
+    std::atomic<bool>        m_hud_prim_cam{ true };
+    std::vector<float>       m_hud_game_cb{};                    // the game's own world camera upload of this call
+    int                      m_hud_game_cb_frame{ -1 };
+    ID3D11Buffer*            m_hud_prim_standin{ nullptr };
+    UINT                     m_hud_prim_standin_size{ 0 };
+    ID3D11Buffer*            m_hud_prim_cb_orig{ nullptr };
+    bool                     m_hud_prim_cb_swapped{ false };
+    bool                     m_hud_prim_now{ false };            // this draw is a hudprim draw taken into the HUD
+    uint64_t                 m_hud_prim_eye[2]{}, m_hud_prim_mark_n[2]{}, m_hud_prim_panel_n[2]{};   // per eye (L, R): taken, to the marker image, to the panel; last second
+    uint64_t                 m_hud_prim_cam_n{ 0 }, m_hud_prim_cam_miss{ 0 };   // given the game's camera / not (no copy of this call, other buffer), last second
+    std::unordered_set<const void*> m_hud_prim_vs_seen{};        // their vertex shaders, logged once each (what they read)
+    bool hud_prim_cb_swap(ID3D11DeviceContext* ctx);
+    void hud_prim_cb_restore(ID3D11DeviceContext* ctx);
     int                      m_hud_mark_widget_frame{ -1 };      // the call whose marker phase has reached a widget (control hints)
     bool                     m_hud_mark_hint_now{ false };       // this marker draw belongs to that widget
     std::atomic<bool>        m_hud_hint_test{ false };           // hudhinttest (test): every marker draw shown as a hint, on the panel
@@ -1960,7 +2345,19 @@ private:
     // hudmarkdump N (test, off by default since 23 Oct: its GPU read-backs stall frames, the FOV audit): the next N new prompt
     // calls logged with their draws and groups (HUDDump).
     std::atomic<int>         m_hud_mark_dump{ 0 };
+    // hudmarkcap (Homard 29 Oct 14:50 headset picture: "Some in-world hud elements were also very big (C4, some enemy marks)"): the
+    // game draws a few markers several times bigger than the rest (a 28-texel icon over a quarter of its picture), so after the
+    // common hudmarksize shrink they still covered 10 deg. Each marker is shrunk further until it is at most hudmarkmax degrees
+    // across; also a lone icon put on the panel only because it came after a prompt. Last read-back: m_hud_cap_*.
+    std::atomic<bool>        m_hud_mark_cap{ true };
+    std::atomic<float>       m_hud_mark_max{ 4.0f };
+    // hudmarkicon (Homard 29 Oct 16:00: "marker were still big" at 4 deg): the icon alone kept to this many degrees as well.
+    std::atomic<float>       m_hud_mark_icon{ 2.0f };
+    float                    m_hud_cap_icon_max{ 0.0f };
+    float                    m_hud_cap_world_max{ 0.0f }, m_hud_cap_panel_max{ 0.0f };   // largest seen (deg, before the limit), last second
+    uint64_t                 m_hud_cap_frames{ 0 };                                    // calls with a marker made smaller, last second
     void hud_mark_log(ID3D11DeviceContext* ctx, const glm::mat4& ginv, float mw, float mh);
+    void hud_mark_cap_read(ID3D11DeviceContext* ctx);   // hudmarkcap: its numbers read back for the probe line
     // The draw being hooked: 1 DrawIndexed, 2 Draw, 3 DrawIndexedInstanced, 4 DrawInstanced, 5 DrawIndexedInstancedIndirect,
     // 6 DrawInstancedIndirect, 0 other (DrawAuto: no box). Instanced draws: their instance count and first instance; indirect
     // ones: their arguments buffer and offset (not held).
@@ -1986,7 +2383,7 @@ private:
     int                      m_hud_game_vrp_frame{ -1 };
     std::atomic<float> m_grip_off[3]{ 0.10f, -0.10f, -0.28f };   // the weapon's grip in the game camera's view (m)
     std::atomic<float> m_barrel_off[3]{ 0.0f, 0.03f, -0.30f };   // the muzzle from the grip, controller axes (m)
-    std::atomic<float> m_grip_pitch{ 0.0f };
+    std::atomic<float> m_grip_pitch{ -5.0f };   // grippitch (saved; -5 default, Homard 30 Oct 15:09)
     std::atomic<float> m_model_yaw{ 0.0f }, m_model_pitch{ 0.0f };
     std::atomic<float> m_converge_m{ 25.0f };
     std::atomic<bool>  m_converge_auto{ true };
@@ -1995,7 +2392,12 @@ private:
     std::atomic<float> m_fire_gate_deg{ 0.3f };   // sim 2026-10-10: 0.75 -> release error mean 0.35 / max 0.60 deg; 0.3 -> 0.09 / 0.17 deg, +37 ms
     std::atomic<bool>  m_stick_aim{ false };
     std::atomic<float> m_stick_x{ 0.0f }, m_stick_y{ 0.0f }, m_stick_gain{ 0.065f };
-    int                m_mouse_failures{ 0 };
+    int                m_mouse_failures{ 0 };   // camera-not-following pauses since the mouse last turned the camera (2 = stick aim fallback)
+    std::atomic<bool>  m_stick_auto{ false };   // stick aim switched on by that fallback, not by hand (F11 and cmd aimstick clear it)
+    std::chrono::steady_clock::time_point m_stick_auto_since{};
+    std::atomic<int>   m_stick_retry_s{ 10 };   // cmd aimstickretry N (tester 28 Oct): the fallback tries the mouse again after N s with the trigger up (0 = never)
+    std::atomic<int>   m_fire_wait_max_ms{ 250 };   // cmd firewaitmax N (tester 28 Oct): a held trigger goes through after N ms even off the gate, aim error under 5 deg (0 = never)
+    std::atomic<bool>  m_mouse_drop{ false };   // cmd mousedrop (test): the aim loop's mouse moves are dropped, as when the game ignores the mouse
     bool               m_fire_open{ false }, m_trigger_was{ false }, m_mouse_fire_down{ false };
     std::chrono::steady_clock::time_point m_trigger_since{};
     std::atomic<float> m_dbg_ctrl[3]{ 0.15f, -0.25f, -0.35f };   // flat test: the simulated controller (reference space, m)
@@ -2105,7 +2507,8 @@ private:
     // Floating left hand: the weapon pass's game camera and weapon placement of the current frame, the gloves'
     // left-hand bones (handbones a b), on/off (hands on).
     struct HandMap { int frame{ -1 }; glm::mat3 rot{ 1.0f }; glm::vec3 cam{ 0.0f }; glm::mat3 w_rot{ 1.0f }; glm::vec3 w_pos{ 0.0f }, grip{ 0.0f }; glm::mat3 corr{ 1.0f };
-                     glm::vec3 grip0{ 0.0f }; bool empty{ false }; };   // grip0: the grip point put on the controller; empty: no weapon in hand
+                     glm::vec3 grip0{ 0.0f }; bool empty{ false };    // grip0: the grip point put on the controller; empty: no weapon in hand
+                     glm::mat3 cr{ 1.0f }; glm::vec3 ct{ 0.0f }; };   // gunstill's steadying of this pass (q -> cr q + ct), for the sidearm's recordings
     HandMap            m_hand_map{};
     std::atomic<bool>  m_hands_float{ true };
     std::atomic<int>   m_left_bone_lo{ 1 }, m_left_bone_hi{ 63 };
@@ -2127,6 +2530,12 @@ private:
     int                m_ssr_form{ -1 };       // the game's ReprojectionMatrix form, once recognised
     int                m_ssr_tries{ 0 };
     int                m_ssr_next_try{ 0 };
+    // ssrretry (default on, F11 Debug > Mandatory > Water): the form is looked for in both calls of a pair (an odd step; every
+    // 30 calls landed on the call whose game camera never moves, so it took minutes), never while the menu or map is on the
+    // flat screen (its camera fits no form), and a failed round of 8 is tried again 1200 calls later instead of never.
+    std::atomic<bool>  m_ssr_retry{ true };
+    int                m_ssr_rounds{ 0 };
+    std::atomic<int>   m_snap_burst{ 0 };   // snappairs N: N snappairs of consecutive pairs
     uint64_t           m_ssr_swaps{ 0 };
     uint64_t           m_indirect_dispatches{ 0 };
     ID3D11Buffer*      m_ssr_standin{ nullptr };
@@ -2194,8 +2603,14 @@ private:
     glm::vec3 steady_cam(int frame, const glm::vec3& cam);
     std::atomic<bool>  m_steady_view{ false };    // steady view while shooting (cmd steadyview)
     std::atomic<bool>  m_grip_held{ false };     // the weapon hand's grip (from the pad mapping)
-    glm::vec3          m_body_root{ 0.0f }, m_body_root_prev{ 0.0f };
-    int                m_body_root_frame{ -100 }, m_body_root_prev_frame{ -100 };
+    glm::vec3          m_body_root{ 0.0f }, m_body_root_prev{ 0.0f }, m_body_root_prev2{ 0.0f };
+    int                m_body_root_frame{ -100 }, m_body_root_prev_frame{ -100 }, m_body_root_prev2_frame{ -100 };
+    // rootsteady on|off (default on, saved; F11 Debug > Head tracking and view; Homard 29 Oct 11:15 "quite judder movement when going
+    // uphill"): the body root the eyes stand on (viewroot across the ground, walkbob's height) read from its last three samples, not
+    // the last two. His log: the samples came with long and short steps in turn, and the prediction from the last two tripled that,
+    // so the eyes' base moved 3 and 16 cm a pair in turn (2 and 12 m/s) at a steady run. Off: the last two, as before.
+    std::atomic<bool>  m_root_steady{ true };
+    bool               root_steady_at(float at, glm::vec3& out) const;
     int                m_steady_pair{ -100 };
     glm::vec3          m_steady_result{ 0.0f }, m_steady_off{ 0.0f };
     bool               m_steady_locked{ false };
@@ -2300,7 +2715,7 @@ private:
     std::atomic<bool>  m_post_clean{ true };   // default on since 17 Oct (Homard), F11 Debug > Experimental
     std::atomic<int>   m_post_log{ 0 };
     ID3D11Buffer*      m_postfx_zero16{ nullptr };
-    std::atomic<bool>  m_xr_half{ false };          // xrhalf (Stereo only): see runtimes::OpenXR::s_fc5_xr_half
+    std::atomic<int>   m_frame_lock{ 0 };           // framelock auto|off|1|2 (saved, 29 Oct; replaces xrhalf; off by default 30 Oct): see runtimes::OpenXR::s_fc5_frame_lock
 
     std::atomic<bool>  m_no_recoil{ false }, m_no_sway{ false };
     std::atomic<bool>  m_pair_check{ false };   // F11 Debug "Check stereo pairs" (cmd paircheck on|off [N])
@@ -2350,6 +2765,14 @@ private:
     // afwfoot, afwrail (default on since 25 Oct, Homard: "great work on AFW, add it as a default setting in debug AFW"; F11 Debug >
     // AFW): from the BioShock VR mod's rebuild, see FarCry5Afw.h.
     std::atomic<bool>  m_afw_foot{ true }, m_afw_rail{ true };
+    // afwfoliage (default on, 29 Oct; Homard: "visible shimmering on foliage in AFW"; F11 Debug > AFW): the rebuild's test for
+    // a held point that moved took needles, leaves and grass for moved (the fresh eye sees past them, on other specks), so the
+    // rebuilt eye showed the tree's dark inside every other frame. See FarCry5Afw.h.
+    std::atomic<bool>  m_afw_foliage{ true };
+    // afwcopies (default on, 29 Oct; Homard: "in AFW the pouch, and the weapon in sling/holster that was not the last weapon pickup were
+    // transparent"; F11 Debug > AFW): the mod's own weapon-pass draws (holster, sling and hand copies, the throwable on the chest or in the
+    // hand, the pouch) drawn again for the held eye, as afwfpeye does with the game's weapon draws.
+    std::atomic<bool>  m_afw_copies{ true };
     // afwdepthlate (default on, only in a vehicle): AFW's depth copy retaken at present, after everything of the frame is
     // drawn (the copy at the scene depth's first release may come before the player's vehicle is drawn: the cab then
     // has the road's depth and the rebuilt eye throws it off by a frame of driving). Every 2 s in a vehicle the log
@@ -2412,6 +2835,27 @@ private:
     // gunstillpredict (test, not saved): how the next update's gun is guessed: 0 hold (the last pose), 1 moved on by the last
     // change (before 23 Oct), 2 the last change scaled by the time since the last update over the one before, 3 half the change.
     std::atomic<int>   m_gst_predict{ 1 };
+    // gunaxes on|off (FarCry5GunStill.cpp; default on, saved; F11 Controls; Homard 29 Oct 13:48: "some weapons still rotate along the wrong
+    // axis (especially many pistols) ... make the system more robust"): each gun's angle in the hand comes from its own model axes (the
+    // gun mesh's +Y is its barrel, +Z its top: every sight line read so far runs along +Y within 3.4 deg), turned so the barrel lies along
+    // the controller's axis and the top faces up (or, once read from the game's aim down sights, its sight line along the controller and
+    // the sight's top up), about the game's own right hand on it, which stays at the gun's grip point. Off: the
+    // pose learned from the game standing still (gunstill), which was missing for pistols the game holds within 10 cm of the camera
+    // (27144, 32472 and 29850 in his 13:43 log: the game's animation and a pivot 20 cm off the hand) and wrong for some saved guns
+    // (32472 learned 31 deg off the barrel, 40362 36 deg, 51543 rolled 65 deg). Melee weapons and a mesh whose +Y the game does not
+    // hold forward (a bow, a launcher) keep their way; gunaxesgame lists guns kept on the game's pose by hand (F11, per gun).
+    std::atomic<bool>  m_gun_axes{ true };
+    std::set<uint32_t> m_gun_axes_game{};          // gunaxesgame <sig> ... | none (saved; under m_weapon_cal_mtx)
+    bool               gun_axes_game(uint32_t sig);
+    std::string        gun_axes_game_line();
+    // The weapon hand's centre (the right glove's, game-camera axes) of the last weapon pass that drew it, whether or not the game's
+    // left hand was drawn too (gunaxes: one-handed pistols draw only the right glove).
+    glm::vec3          m_wpn_grip_cam{ 0.0f };
+    int                m_wpn_grip_frame{ -100 };
+    // The weapon in hand's gunaxes state, for F11: 0 none (off, no weapon, melee), 1 measuring, 2 own axes, 3 game's pose (its mesh's
+    // +Y is not held forward), 4 game's pose (gunaxesgame).
+    std::atomic<int>   m_gun_axes_state{ 0 };
+    const char*        gun_axes_status() const;
     // gunstilllate (Homard 23 Oct 19:44: "the right eye before was really good, so I would like both eye to be like the right eye
     // before"): the pass whose camera was placed with a guessed gun (Stereo's left eye, every AFW frame) has its weapon camera
     // uploaded again at the gun mesh's draw, from the game's own values, now with that pass's own gun pose (on_viewport_constants
@@ -2516,8 +2960,20 @@ private:
     bool               m_walk_basis_ok{ false };
     void               sprint_update();
     bool               walk_command(const std::string& cmd, const std::string& arg, bool& persist);
+    // bodyview on|off (saved, default on; F11 Comfort > Smooth motion "Body-based view"; Homard 29 Oct 13:49, headset: "it felt a lot more
+    // responsive, did you also brought all the different parameters into the unified system"): one switch for where the eyes stand on
+    // foot. On: viewpivot, viewroot, viewrootsmooth, rootsteady on and walkbob off (the bob taken out), as since 29 Oct. Off: all of them
+    // off, the eyes on the game camera with its bob, as before 23 Oct. Those five are no longer saved on their own (test commands now).
+    std::atomic<bool>  m_body_view{ true };
     // viewpivot, viewlog (FarCry5ViewPivot.cpp, 23 Oct): the eyes' base off the game camera's neck pivot.
-    std::atomic<bool>  m_view_pivot{ true };       // viewpivot on|off (saved)
+    std::atomic<bool>  m_view_pivot{ true };       // viewpivot on|off (test; part of bodyview)
+    // aimease ms (saved, default 300, 0 = off; F11 Debug > Head tracking and view): the game's aim turned from the head to the barrel (a weapon taken in
+    // hand) or back over that time instead of in one or two sends (the update_motion aim loop), so the camera on the neck does not jolt the view.
+    std::atomic<int>   m_aim_ease_ms{ 300 };
+    bool               m_aim_ease_barrel{ false }, m_aim_ease_valid{ false }, m_aim_ease_on{ false };
+    glm::vec3          m_aim_ease_from{ 0.0f, 1.0f, 0.0f }, m_aim_ease_last{ 0.0f, 1.0f, 0.0f };
+    std::chrono::steady_clock::time_point m_aim_ease_t0{};
+    uint64_t           m_aim_eased{ 0 };
     std::atomic<int>   m_view_log{ 0 };            // viewlog N (test): one line per world upload
     int                m_view_log_frame{ -1 };
     struct PivotAim { int frame{ -100 }; float yaw{ 0.0f }, pitch{ 0.0f }; };
@@ -2525,7 +2981,7 @@ private:
     glm::vec3          m_pivot_off{ 0.0f };        // the game camera minus the body root at the last root seen (world)
     float              m_pivot_psi{ 0.0f }, m_pivot_len{ 0.0f };   // its horizontal heading (world yaw) and length
     float              m_pivot_psi_now{ 0.0f };    // the heading estimated for this pair
-    std::atomic<int>   m_view_pivot_lag{ 2 };      // viewpivotlag K (test): the aim's turn taken K updates back
+    std::atomic<int>   m_view_pivot_lag{ 2 };      // the aim's turn taken 2 updates back (viewpivotlag, a test knob, retired 29 Oct)
     int                m_pivot_off_frame{ -1 };
     int                m_pivot_pair{ -100 };
     glm::vec3          m_pivot_shift{ 0.0f };      // this pair's shift of the eyes' base from the game camera
@@ -2537,7 +2993,73 @@ private:
     void               pivot_note_aim(int frame);
     bool               pivot_aim_at(int frame, float& yaw) const;
     void               pivot_note_root(int frame, const glm::vec3& camoff);
-    glm::vec3          view_pivot_shift(int frame);
+    glm::vec3          view_pivot_shift(int frame, const glm::vec3& cam);
+    // viewroot on|off (saved, default on; F11 Debug > Head tracking and view): the eyes' base across the ground = the player's body root (predicted
+    // from its last two) plus the camera's offset from it with the aim level, turned to the head's heading: the neck's swing with the aim's
+    // heading AND pitch left out (Homard 27 Oct jolts: the game camera moved 4.5 cm per update, 9-13 cm in all, as the aim went from the
+    // head to the gun; viewpivot turned only the heading). Falls back to viewpivot without a fresh root or a learned offset.
+    std::atomic<bool>  m_view_root{ true };
+    float              m_vr_ref_fwd{ 0.0f }, m_vr_ref_right{ 0.0f };
+    bool               m_vr_ref_ok{ false };
+    uint64_t           m_vr_used{ 0 }, m_vr_fallback{ 0 };
+    // viewrootsmooth on|off (saved, default on; same tab; Homard 27 Oct 20:26 "when entering a building there was a lot of camera movement"):
+    // viewroot no longer waits for viewpivot's offset, which is refused while the camera is over 25 cm from the root (the gun held low, the
+    // aim pitched down: 26-29 cm in his 21:09 log, for seconds), so the eyes no longer snap 20+ cm back onto the neck and out again; and a
+    // fall back to the game camera, or the way back onto the body, is eased over 0.15 s instead of in one pair.
+    std::atomic<bool>  m_vr_smooth{ true };
+    float              m_vr_w{ 0.0f };             // the body-based shift's weight (eased)
+    glm::vec2          m_vr_sh{ 0.0f };            // its last shift from the game camera, held while it eases out
+    glm::vec2          m_vr_hd{ 0.0f };            // and the part of it turned with the head (smoothmotion keeps it out of its filter)
+    glm::vec2          m_vr_prev_rel{ 0.0f };      // last pair's eyes' base from the body root (the step log)
+    bool               m_vr_rel_ok{ false };
+    std::chrono::steady_clock::time_point m_vr_t{}, m_vr_log_t{};
+    uint64_t           m_vr_gate{ 0 }, m_vr_stale{ 0 }, m_vr_far{ 0 };   // pairs on the body with viewpivot's offset old; fall backs: root old, too far or fast
+    float              m_vr_step_max{ 0.0f };      // the largest pair-to-pair step of the shift (m), last 5 s
+    uint64_t           m_vr_log_used{ 0 }, m_vr_log_fb{ 0 }, m_vr_log_gate{ 0 }, m_vr_log_stale{ 0 }, m_vr_log_far{ 0 };
+    // viewjump (log only, 29 Oct; Homard's 10:07 playtest: "smaller hiccups movement that felt like rubberbanding"; the log had nothing
+    // per frame to find them): once per stereo pair, the eyes' base (where the head is added; the mod's own part of the view) against a
+    // steady motion, and its horizon's tilt. A pair whose base steps over viewjumpcm (default 4 cm) off its last step (scaled to the
+    // pair's time), or whose horizon tilts over 1.5 deg, is counted; one [ViewJump] line per 5 s with the largest of each and what
+    // was on then, and a line at once for one over 3x the threshold. viewjumpcm N (saved, 0 = off).
+    std::atomic<float> m_vj_cm{ 4.0f };
+    int                m_vj_pair{ -100 };
+    bool               m_vj_ok{ false };
+    glm::vec3          m_vj_cam{ 0.0f }, m_vj_step{ 0.0f }, m_vj_up{ 0.0f, 0.0f, 1.0f };
+    float              m_vj_dt{ 0.0f };
+    std::chrono::steady_clock::time_point m_vj_t{}, m_vj_log_t{};
+    uint64_t           m_vj_n{ 0 }, m_vj_tilt_n{ 0 }, m_vj_pairs{ 0 };
+    float              m_vj_max{ 0.0f }, m_vj_tilt_max{ 0.0f };
+    glm::vec3          m_vj_dev{ 0.0f };           // the last counted step off a steady motion (world, m)
+    std::string        m_vj_max_what, m_vj_tilt_what;
+    void               view_jump_note(int frame, const glm::mat3& base, const glm::vec3& base_cam);
+    // smoothmotion on|off (default on, saved; F11 Comfort > Smooth motion; Homard 29 Oct 11:50 "still quite juddery ... too many
+    // switches ... none really adresse the issue"): on foot, the eyes' base (where the head is added: body-based position, walkbob's
+    // height) through one tracking filter run on the headset's display clock, once per picture. The game moves the player by its own
+    // frame times and the body is sampled unevenly (his log: the base stepped 0 and 20 cm in turn at a run); the headset shows each
+    // picture at its own display time. The filter advances the base by its pace times the display time between pictures and pulls it
+    // onto the game's position over smoothtau (0.06 s), with no lag at a steady pace; over 0.75 m off (a vault, a load) it starts
+    // again. Both eyes of a pair stand on the same point. The head is not filtered. Off: the base as before (the filter still runs
+    // for its log line).
+    // Second round (Homard 29 Oct 12:49, headset: "the judder felt a lot better, movement felt a bit more sluggish"): only the body is
+    // filtered; the part of the base that turns with the head (viewroot's and viewpivot's offset of the camera from the body) is added
+    // after it, so a head turn or a stick turn moves the eyes at once. An error the same way two pictures running is the player
+    // starting, stopping or turning (the uneven sampling alternates): pulled in over smoothquick (0.025 s). Modelled: the view trailed
+    // a start and ran on past a stop by ~15 cm at a run, now 4-8 cm (unsmoothed: ~8 cm of sampling noise), the evened steps ~30 % rougher.
+    std::atomic<bool>  m_smooth_motion{ true };
+    std::atomic<float> m_smooth_tau{ 0.06f };      // smoothtau S (test)
+    std::atomic<float> m_smooth_quick{ 0.025f };   // smoothquick S (test; at smoothtau or more: never quick)
+    glm::vec3          m_ms_head{ 0.0f };          // this pair's part of the base turned with the head (view_pivot_shift), added after the filter
+    glm::vec3          m_ms_out{ 0.0f }, m_ms_err_prev{ 0.0f };
+    uint64_t           m_ms_quick_n{ 0 };
+    int                m_ms_pair{ -100 };
+    bool               m_ms_ok{ false }, m_ms_used{ false }, m_ms_raw_ok{ false };
+    glm::vec3          m_ms_x{ 0.0f }, m_ms_v{ 0.0f }, m_ms_raw{ 0.0f }, m_ms_raw_step{ 0.0f }, m_ms_out_step{ 0.0f };
+    float              m_ms_dt{ 0.0f };
+    int64_t            m_ms_T{ 0 };
+    std::chrono::steady_clock::time_point m_ms_t{}, m_ms_log_t{};
+    uint64_t           m_ms_pairs{ 0 }, m_ms_disp{ 0 }, m_ms_resets{ 0 }, m_ms_raw_n{ 0 }, m_ms_out_n{ 0 };
+    float              m_ms_raw_max{ 0.0f }, m_ms_out_max{ 0.0f }, m_ms_lag_max{ 0.0f };
+    glm::vec3          motion_smooth(int frame, const glm::vec3& z);
     // walkbob, boblog (FarCry5WalkBob.cpp, 23 Oct): the eyes' height without the game camera's step-rate bob.
     std::atomic<bool>  m_no_bob{ true };           // walkbob off|on (saved): true = "walkbob off", the bob taken out
     std::atomic<float> m_bob_jump{ 0.15f };        // bobjump M (test): a stance change (crouch, stand up, slide) past the held level (m)
@@ -2574,76 +3096,9 @@ private:
     void               bob_note_root(int frame, const glm::vec3& root, const glm::vec3& camoff);
     float              walk_bob_shift(int frame, const glm::vec3& cam);
     void               bob_note_base(int frame, float z);
-    void               draw_bob_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);
-    // skinpose, skinposelog (FarCry5SkinPose.cpp, 23 Oct; FC2 VR item 1, route A): the weapon pass's move given to each of its draws.
-    std::atomic<bool>  m_skin_pose{ false };       // skinpose on|off (saved)
-    std::atomic<int>   m_skp_log{ 0 };             // skinposelog N (test): N weapon-pass draws logged, and the call order per frame
-    struct SkinPoseMove { int frame{ -100 }; glm::mat3 A{ 1.0f }; glm::vec3 cam{ 0.0f }, off{ 0.0f }; uint64_t seq{ 0 }; glm::mat4 fvrp{ 1.0f }; glm::vec3 fcam{ 0.0f }; };
-    SkinPoseMove       m_skp{};                    // this frame's move (the weapon camera upload): world' = A (world - cam) + off; fvrp, fcam: the floating camera it replaces
-    SkinPoseMove       m_skp_hist[4]{};            // by frame & 3 (the previous frame's floating camera, for motion vectors)
-    std::unordered_map<uint32_t, ID3D11Buffer*> m_skp_standins{};   // slot 1 stand-ins by size
-    ID3D11Buffer*      m_skp_orig{ nullptr };
-    bool               m_skp_swapped{ false };
-    struct SkinPoseCount { uint64_t passes{ 0 }, skinned{ 0 }, rigid{ 0 }, moved{ 0 }, left{ 0 }; int pass_frame{ -100 }; };
-    std::map<UINT, SkinPoseCount> m_skp_counts{};  // by weapon signature
-    uint64_t           m_skp_stale{ 0 }, m_skp_no_obj{ 0 };
-    uint64_t           m_skp_draw_first{ 0 }, m_skp_draw_last{ 0 };
-    int                m_skp_draw_frame{ -100 }, m_skp_order_logged{ -100 }, m_skp_order_tail{ 0 };
-    uint32_t           m_skp_draw_n{ 0 };
-    std::chrono::steady_clock::time_point m_skp_stat_t{};
-    bool               skin_pose_active() const;
-    bool               skin_pose_command(const std::string& cmd, const std::string& arg, bool& persist);
-    void               skin_pose_camera(int frame, const glm::mat3& A, const glm::vec3& cam, const glm::vec3& off, const glm::mat4& fvrp, const glm::vec3& fcam);
-    void               skin_pose_prev(int frame, float* vrp_pv, float* cam_pv);
-    void               skin_pose_draw(ID3D11DeviceContext* ctx, UINT count);
-    void               skin_pose_restore(ID3D11DeviceContext* ctx);
-    void               skin_pose_present();
-    void               draw_skin_pose_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint,
-                                           const std::function<void(const char*)>& section);
-    // FC2 VR motion (FarCry5Fc2Vr.cpp, 24 Oct): skelhand's render side and measurement, and the F11 Experimental section.
-    std::atomic<bool>  m_skh_stat{ false };        // skelhandstat on|off (test)
-    glm::mat4          m_skh_root{ 1.0f };         // the arms' root object matrix (world), last weapon pass
-    int                m_skh_root_frame{ -100 };
-    struct SkhMove { int frame{ -100 }; glm::mat4 Mw{ 1.0f }; glm::mat3 Wc{ 1.0f }; glm::vec3 ctrl{ 0.0f }; bool active{ false }; };
-    SkhMove            m_skh{};
-    int                m_skh_g_frame{ -100 };
-    UINT               m_skh_gun_sig{ 0 };          // skelhand 3: the weapon whose entity was learned
-    std::atomic<bool>  m_skh_still{ true };         // skelhandstill on|off (saved): skelhand 3 holds the gun at gunstill's standing pose (off: the game's sway kept)
-    std::atomic<uint64_t> m_skh_raw_hits{ 0 }, m_skh_raw_miss{ 0 };   // the drawn gun matched to the game's own matrix (gunstill's input)
-    bool               skel_hand_still() const;
-    bool               skel_hand_arms() const;
-    // skelhandlate on|off (saved, default off): with skelhand 3, the weapon pass's camera turned by the controller's move since the
-    // placement the game's update was given (the one-update trail while swinging).
-    std::atomic<bool>  m_skh_late{ false };
-    struct SkhCtrl { int frame{ -100 }; glm::mat3 Wc{ 1.0f }; glm::vec3 ctrl{ 0.0f }; };
-    SkhCtrl            m_skh_ctrl[16]{};
-    bool               m_skh_late_ok{ false };
-    bool               m_skh_late_pos{ false };   // skelhandlate pos (test): the controller's move only, not its turn
-    glm::mat3          m_skh_late_R{ 1.0f };
-    glm::vec3          m_skh_late_from{ 0.0f }, m_skh_late_to{ 0.0f };   // p -> R (p - from) + to
-    int                m_skh_late_frame{ -100 };
-    uint64_t           m_skh_late_n{ 0 }, m_skh_late_miss{ 0 };
-    int                m_skh_lag{ 2 };   // render frames from the placement to the frame that draws it (measured at the gun's draw)
-    int                m_skh_lag_min{ 99 }, m_skh_lag_max{ -99 };
-    float              m_skh_late_cm{ 0.0f };
-    struct SkhStat
-    {
-        std::vector<glm::vec3> ps;
-        std::vector<glm::quat> qs;
-        glm::vec3              prev_p[2]{};
-        glm::quat              prev_q[2]{};
-        int                    prev_frame[2]{ -100, -100 };
-        uint64_t               steps{ 0 };
-        double                 step_cm{ 0 }, step_deg{ 0 };
-        float                  step_max_cm{ 0 }, step_max_deg{ 0 };
-    };
-    SkhStat            m_skh_st{};
-    bool               skel_hand_active() const;
-    bool               skel_hand_command(const std::string& cmd, const std::string& arg, bool& persist);
-    void               skel_hand_camera(int frame, const glm::mat3& Wc, const glm::vec3& ctrl, const glm::vec3& grip, const glm::mat3& wrot, const glm::vec3& cam,
-                                        const glm::mat3& w_full, const glm::vec3& w_off);
-    void               skel_hand_draw(ID3D11DeviceContext* ctx, UINT count);
-    void               skel_hand_present();
+    // throwarc, meleeswing (FarCry5Fc2Vr.cpp, 24 Oct).
+    bool               throw_arc_command(const std::string& cmd, const std::string& arg, bool& persist);
+    void               throw_melee_present();   // meleeswing's frame, a measured throw
     std::atomic<bool>  m_throw_arc{ false };       // throwarc on|off (saved)
     std::atomic<float> m_arc_speed{ 15.0f }, m_arc_up{ 10.0f };   // throwarcspeed m/s, throwarcup deg (saved)
     ID3D11View*        m_arc_view{ nullptr };
@@ -2658,6 +3113,12 @@ private:
     bool               m_arc_v2_dir_ok{ false };
     bool               m_arc_rel_v2{ false };         // the measured release was a throwv2 throw (against its trajectory)
     float              m_arc_rel_up_used{ 0.0f };     // the lift its camera was lowered by
+    // throwarcstop on|off (saved, default on): the trajectory marched through the scene depth (aim channel 2), drawn up to where it meets it.
+    std::atomic<bool>  m_arc_stop{ true };
+    glm::vec3          m_arc_live_o{ 0.0f }, m_arc_live_v{ 0.0f };   // the trajectory drawn this frame (world), for the march
+    float              m_arc_live_g{ 9.81f };
+    int                m_arc_live_frame{ -100 };
+    uint64_t           m_arc_hit_said{ 0 };
     std::atomic<bool>  m_arc_snap{ false };        // throwarcsnap (test)
     std::atomic<UINT>  m_arc_sig{ 0 };              // the throwable held now (throwable_draw)
     bool               m_arc_was_held{ false }, m_arc_wait{ false };
@@ -2700,6 +3161,12 @@ private:
     std::atomic<float> m_mel_buzz_amp{ 1.0f };     // meleebuzz 0-1: the hit's pulse on the hand (0 = none)
     std::atomic<bool>  m_mel_aim_on{ true };       // meleeaim on|off: the game's aim turned onto the point hit for the press
     std::atomic<float> m_mel_slew{ 60.0f };        // meleeslew deg: the aim's largest step per send while turning onto it (firesplitslew 12 otherwise)
+    // Instant melee (Homard 26 Oct 12:44: "too big of a delay between the gesture and the hitting").
+    std::atomic<int>   m_mel_early_ms{ 100 };      // meleeearly ms (saved, 0 = off): the game's melee pressed when the swing will reach a body this soon
+    std::chrono::steady_clock::time_point m_mel_early_t{};   // the last early press (its contact then pulses and deals the damage)
+    std::atomic<int>   m_mel_dmg{ 2 };             // meleedamage 0|1|2|3 (saved): off, find the NPC hit only, damage at contact + the game's melee, damage only
+    std::atomic<float> m_mel_dmg_hp{ 200.0f };     // meleedamagehp: the damage sent at contact (the player has 250)
+    bool               m_mel_dmg_watching{ false };   // the game's entity lookup watched (fc5::lua::damage_watch)
     // meleestill (Homard 25 Oct 10:22): a melee weapon held at a made pose, its length along the aim's axis turned by meleepitch /
     // meleeyaw / meleeroll (deg), the game's animations of it (and the hands with it) taken out (FarCry5GunStill.cpp).
     std::atomic<bool>  m_mel_still{ false };       // meleestill on|off (saved; off by default since release 0.12.1)
@@ -2741,8 +3208,8 @@ public:
     void               melee_pad(WORD& buttons, BYTE& rt, float& buzz) ;   // the pad (VR::on_xinput_get_state): the press and the pulse
     bool               melee_wants_characters() const { return m_mel_mode.load() > 0; }
 private:
-    void               melee_frame();    void               draw_fc2vr_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint,
-                                       const std::function<void(const char*)>& section);    void               view_log_line(int frame, const glm::mat3& eye_rot, const glm::vec3& eye_cam, const glm::vec3& cam, const glm::vec3& base_cam);
+    void               melee_frame();
+    void               view_log_line(int frame, const glm::mat3& eye_rot, const glm::vec3& eye_cam, const glm::vec3& cam, const glm::vec3& base_cam);
     void               draw_pivot_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint);
     void               draw_walk_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint,
                                       const std::function<void(const char*)>& section);
@@ -2801,6 +3268,8 @@ private:
                        const glm::mat3& view_rot, const glm::vec3& view_cam);
     bool fp_eye_begin(ID3D11DeviceContext* ctx);
     void fp_eye_end(ID3D11DeviceContext* ctx);
+    void fp_eye_again(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base);   // afwcopies: a mod-drawn weapon-pass draw, again for the held eye
+    uint64_t m_fp_copy_draws{ 0 };   // afwcopies: those drawn again since the last beat
     bool fp_eye_target(ID3D11DeviceContext* ctx, UINT gw, UINT gh);
     int  m_fp_target_log{ 0 };   // the first weapon draws' bound depth, logged after each afwfpeye on
     uint64_t    m_fp_skip_nocam{ 0 };       // weapon draws with no held-eye camera for their frame

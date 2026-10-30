@@ -27,13 +27,6 @@
 #include <unordered_map>
 #include <vector>
 
-// skelhand (below): its work in the getter's hook.
-namespace fc5::skelhand
-{
-    void on_getter(safetyhook::Context& c);
-    int  mode();
-}
-
 namespace fc5::skinorder
 {
     uint64_t next();
@@ -76,7 +69,6 @@ namespace fc5::poseprobe
 
         void getter_probe(safetyhook::Context& c)
         {
-            if (fc5::skelhand::mode() > 0) fc5::skelhand::on_getter(c);
             if (!g_armed.load(std::memory_order_relaxed)) return;
             TBuf* b = t_buf;
             if (!b) {
@@ -378,32 +370,6 @@ namespace fc5::poseprobe
             spdlog::info("[PoseProbe] report done");
         }
     }
-    float rot_angle_deg(const float* a, const float* b) { return rot_angle(a, b); }
-    float quat_angle_deg(const float* a, const float* b) { return quat_angle(a, b); }
-
-    bool install_getter(const std::atomic<int>* frame)
-    {
-        if (frame) g_frame_src = frame;
-        auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleA("FC_m64.dll"));
-        g_fc       = reinterpret_cast<uintptr_t>(base);
-        if (!base) return false;
-        if (!g_getter) {
-            static const uint8_t kEntry[16]{ 0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x6C, 0x24, 0x18, 0x48, 0x89, 0x74, 0x24, 0x20, 0x57 };
-            if (std::memcmp(base + 0x7253310, kEntry, sizeof(kEntry)) != 0) {
-                std::string got;
-                for (int k = 0; k < 16; ++k) got += fmt::format(" {:02x}", base[0x7253310 + k]);
-                spdlog::info("[PoseProbe] the bone getter's entry bytes differ at FC_m64+0x7253310:{}", got);
-                return false;
-            }
-            if (auto h = safetyhook::MidHook::create(base + 0x7253310, getter_probe); h) g_getter = std::move(*h);
-            else {
-                spdlog::info("[PoseProbe] mid hook at FC_m64+0x7253310 failed (error type {})", (int)h.error().type);
-                return false;
-            }
-        }
-        return true;
-    }
-
     bool start(int frames, const std::atomic<int>* frame)
     {
         g_frame_src = frame;
@@ -506,397 +472,16 @@ namespace fc5::poseprobe
     }
 }
 
-// skelhand 0|1|2 (FC2 VR item 1 route B, 24 Oct): the player's weapon hand put on the controller in the game's own skeleton, so the
-// gun (attached through the hand's subtree), its muzzle flash and tracers follow. In the getter's hook (job threads): on the first read
-// of a bone under B (mode 1: the hand, bone 194; mode 2: the shoulder, 191) in an update (B still marked unresolved), the hand is
-// resolved through the getter itself, B's model transform is replaced by D x B (D: the render thread's model-space move, the mod's
-// controller placement without gunstill taken through the arms' root matrix), and B's descendants are marked unresolved, so the
-// fingers, the helper bones 320-324 and the gun attachment resolve again from the moved hand. The player's pose is the model storage
-// [ctx+0x10] read by the callers +725a23c / +725a2ec (seen on the player only), checked every 2 s against the arms' skin matrices
-// (the bones' turns between updates must match). The quaternion layout is taken from a child's position (self-test).
-namespace fc5::skelhand
+// throwarc's probe (Fc2Vr.cpp): after a throw's release, every entity the writer sets near the hand is followed for 2.5 s, and the launch
+// of the one that flew furthest is fitted. It once shared this writer hook with skelhand (removed 30 Oct with the F11 Experimental
+// section "Research for alternatives").
+namespace fc5::throwprobe
 {
-    namespace
-    {
-        std::atomic<int>       g_mode{ 0 };
-        std::atomic<uintptr_t> g_player_model{ 0 }, g_player_skel{ 0 };
-        std::atomic<bool>      g_player_ok{ false };
-        std::atomic<int>       g_conv{ -1 };          // bit 0 wxyz layout, bit 1 transposed rotation, bit 2 local position scaled; -1 unknown, -2 no fit
-        std::atomic<uint32_t>  g_dirty_mask{ 0x08 };  // the flag bit the resolve clears (simulator 24 Oct: 0b -> 03 for the hand, 0a -> 02 below it); re-learned at the first move
-        std::mutex             g_t_mtx;
-        struct Target { bool ok{ false }; int frame{ -100 }; glm::mat4 D{ 1.0f }; };
-        Target                 g_target{};
-        std::mutex             g_tree_mtx;
-        uintptr_t              g_tree_skel{ 0 };
-        std::vector<int>       g_parent;
-        std::vector<uint8_t>   g_sub[3];   // descendants of 194, of 191, of the left shoulder (skelhandarms)
-        int                    g_chain[2][4]{ { 191, 192, 193, 194 }, { -1, -1, -1, 344 } };   // shoulder, elbow, wrist, hand: right, left (from the left hand 344 up)
-        std::atomic<bool>      g_arms{ false };   // skelhandarms: two-bone IK of both arms onto the moved hands (mode 3)
-        std::atomic<uint64_t>  g_ik_applied[2]{}, g_ik_clamped[2]{}, g_ik_reached[2]{};
-        std::atomic<int>       g_ik_log{ 12 };
-        thread_local bool      t_in = false;
-        std::atomic<uint64_t>  g_applied{ 0 }, g_no_target{ 0 }, g_not_player{ 0 };
-        std::atomic<int>       g_delta_log{ 100 }, g_order_log{ 50 }, g_flag_log{ 40 };
-        int                    g_chk_bad{ 0 };
-        std::atomic<int>       g_apply_frame{ -100 };
-        std::atomic<uint64_t>  g_apply_seq{ 0 };
-        uintptr_t              g_fcb{ 0 };
-        const std::atomic<int>* g_fsrc{ nullptr };
-        // the identity check (render thread)
-        std::vector<uint16_t>  g_chk_remap;
-        std::vector<float>     g_chk_skin, g_chk_q;
-        int                    g_chk_frame{ -100 };
-        double                 g_chk_err{ 0.0 };
-        int                    g_chk_n{ 0 };
-        std::chrono::steady_clock::time_point g_chk_t{};
-
-        bool rd(uintptr_t p, void* out, size_t n) { __try { std::memcpy(out, reinterpret_cast<const void*>(p), n); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
-        bool wr(uintptr_t p, const void* in, size_t n) { __try { std::memcpy(reinterpret_cast<void*>(p), in, n); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
-        using Getter = void*(__fastcall*)(uintptr_t, uint32_t);
-        void resolve(uintptr_t ctx, uint32_t bone)
-        {
-            __try { reinterpret_cast<Getter>(g_fcb + 0x7253310)(ctx, bone); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        }
-
-        glm::mat4 decode(const float* m, int conv)
-        {
-            glm::quat q = (conv & 1) ? glm::quat{ m[0], m[1], m[2], m[3] } : glm::quat{ m[3], m[0], m[1], m[2] };   // glm::quat{w, x, y, z}
-            glm::mat3 R = glm::mat3_cast(glm::normalize(q));
-            if (conv & 2) R = glm::transpose(R);
-            glm::mat4 M{ R };
-            M[3] = glm::vec4{ m[4], m[5], m[6], 1.0f };
-            return M;
-        }
-        void encode(const glm::mat4& M, int conv, float* m)
-        {
-            glm::mat3 R{ M };
-            if (conv & 2) R = glm::transpose(R);
-            glm::quat       q   = glm::normalize(glm::quat_cast(R));
-            const glm::quat old = (conv & 1) ? glm::quat{ m[0], m[1], m[2], m[3] } : glm::quat{ m[3], m[0], m[1], m[2] };
-            if (glm::dot(q, old) < 0.0f) q = -q;
-            if (conv & 1) { m[0] = q.w; m[1] = q.x; m[2] = q.y; m[3] = q.z; }
-            else { m[0] = q.x; m[1] = q.y; m[2] = q.z; m[3] = q.w; }
-            m[4] = M[3].x; m[5] = M[3].y; m[6] = M[3].z;
-        }
-
-        bool tree(uintptr_t skel)
-        {
-            std::lock_guard _{ g_tree_mtx };
-            if (g_tree_skel == skel && g_parent.size() > 194) return true;
-            g_parent.clear();
-            for (int b = 0; b < 1024; ++b) {
-                int16_t pa = -2;
-                if (!rd(skel + uintptr_t(b) * 48 + 0x24, &pa, 2) || pa < -1 || (b > 0 && pa >= b) || (b == 0 && pa != -1)) break;
-                g_parent.push_back(pa);
-            }
-            const size_t n = g_parent.size();
-            // The left arm from its hand up (shoulder - elbow - wrist - hand, as the right arm's 191 - 192 - 193 - 194).
-            g_chain[1][2] = n > 344 ? g_parent[344] : -1;
-            g_chain[1][1] = g_chain[1][2] >= 0 ? g_parent[g_chain[1][2]] : -1;
-            g_chain[1][0] = g_chain[1][1] >= 0 ? g_parent[g_chain[1][1]] : -1;
-            const int lsh = g_chain[1][0] > 0 ? g_chain[1][0] : 100000;
-            for (int k = 0; k < 3; ++k) {
-                const int root = k == 0 ? 194 : (k == 1 ? 191 : lsh);
-                g_sub[k].assign(n, 0);
-                for (size_t b = 0; b < n; ++b) g_sub[k][b] = (int(b) == root || (g_parent[b] >= 0 && g_sub[k][g_parent[b]])) ? 1 : 0;
-            }
-            g_tree_skel = skel;
-            size_t c194 = 0, c191 = 0;
-            for (size_t b = 0; b < n; ++b) { c194 += g_sub[0][b]; c191 += g_sub[1][b]; }
-            spdlog::info("[SkelHand] skeleton {:x}: {} bones; under the hand (194) {}, under the shoulder (191) {}; 194's parent {}, 191's parent {}", skel, n, c194, c191,
-                         n > 194 ? g_parent[194] : -9, n > 191 ? g_parent[191] : -9);
-            spdlog::info("[SkelHand] arms: right {} - {} - {} - {} (parents {} {} {}), left {} - {} - {} - 344", g_chain[0][0], g_chain[0][1], g_chain[0][2], g_chain[0][3], n > 192 ? g_parent[192] : -9,
-                         n > 193 ? g_parent[193] : -9, n > 194 ? g_parent[194] : -9, g_chain[1][0], g_chain[1][1], g_chain[1][2]);
-            return n > 194;
-        }
-
-        // The quaternion convention from a child of the hand: its position = the hand's position + the hand's rotation x its local position.
-        void self_test(uintptr_t ctx, uintptr_t model)
-        {
-            int child = -1;
-            {
-                std::lock_guard _{ g_tree_mtx };
-                for (size_t b = 195; b < g_parent.size(); ++b) if (g_parent[b] == 194) { child = int(b); break; }
-            }
-            if (child < 0) { g_conv = -2; spdlog::info("[SkelHand] self-test: no child of bone 194: off"); return; }
-            t_in = true;
-            resolve(ctx, uint32_t(child));
-            t_in = false;
-            uint64_t local = 0;
-            float    mh[8]{}, mc[8]{}, lc[8]{}, scale = 1.0f;
-            rd(ctx + 8, &local, 8);
-            rd(ctx + 0x24, &scale, 4);
-            if (!rd(model + 194 * 32, mh, 32) || !rd(model + uintptr_t(child) * 32, mc, 32) || !local || !rd(uintptr_t(local) + uintptr_t(child) * 32, lc, 32)) {
-                g_conv = -2;
-                spdlog::info("[SkelHand] self-test: transforms unreadable: off");
-                return;
-            }
-            int   best = -2;
-            float be   = 1e9f;
-            std::string all;
-            for (int conv = 0; conv < 8; ++conv) {
-                const glm::mat4 H = decode(mh, conv);
-                const glm::vec3 lp = glm::vec3{ lc[4], lc[5], lc[6] } * ((conv & 4) ? scale : 1.0f);
-                const float     e  = glm::length(glm::vec3{ H * glm::vec4{ lp, 1.0f } } - glm::vec3{ mc[4], mc[5], mc[6] });
-                all += fmt::format(" {}:{:.2f}", conv, 100.0f * e);
-                if (e < be) { be = e; best = conv; }
-            }
-            g_conv = be < 0.005f ? best : -2;
-            spdlog::info("[SkelHand] self-test with bone {} (local ({:.3f}, {:.3f}, {:.3f}), scale {:.3f}): error per convention, cm{} -> {}", child, lc[4], lc[5], lc[6], scale, all,
-                         be < 0.005f ? fmt::format("convention {} ({} layout, {} rotation, local position {})", best, (best & 1) ? "w x y z" : "x y z w", (best & 2) ? "transposed" : "as is",
-                                                   (best & 4) ? "scaled" : "unscaled")
-                                     : std::string{ "none fits within 5 mm: skelhand off" });
-        }
-    }
-
-    // skelhandarms (mode 3): on the first read of a bone under a shoulder in an update, both hands go where the gun's move takes them
-    // (the game's hands sit on the game's gun: the same move keeps the right one on the grip and the left one on the fore-end), and the arm
-    // follows by a two-bone IK: shoulder S fixed, the elbow on the circle |E' - S| = a, |T - E'| = b, bent toward the game's own elbow (the
-    // pole). The upper arm turns by the shortest arc from E - S to E' - S, the forearm (with the wrist) by the arc from the turned forearm
-    // to T - E'. The shoulder's other descendants (twist helpers, fingers) are marked unresolved and follow.
-    void arms_on_read(uintptr_t ctx, uintptr_t model, uint32_t bone, int frame)
-    {
-        int side = -1;
-        {
-            std::lock_guard _{ g_tree_mtx };
-            if (bone < g_sub[1].size() && g_sub[1][bone]) side = 0;
-            else if (bone < g_sub[2].size() && g_sub[2][bone]) side = 1;
-        }
-        if (side < 0) return;
-        const int S = g_chain[side][0], E = g_chain[side][1], W = g_chain[side][2], H = g_chain[side][3];
-        if (S <= 0 || E <= 0 || W <= 0) return;
-        uint64_t flags = 0;
-        if (!rd(ctx + 0x18, &flags, 8) || !flags) return;
-        uint8_t fs = 0;
-        rd(uintptr_t(flags) + S, &fs, 1);
-        if (!(fs & g_dirty_mask.load())) return;   // this arm already done this update
-        Target tg;
-        {
-            std::lock_guard _{ g_t_mtx };
-            tg = g_target;
-        }
-        if (!tg.ok || frame - tg.frame > 4) { g_no_target++; return; }
-        t_in = true;
-        resolve(ctx, uint32_t(H));   // the hand and the arm above it resolved by the game
-        t_in = false;
-        if (g_conv.load() == -1) self_test(ctx, model);
-        const int conv = g_conv.load();
-        if (conv < 0) return;
-        float     m[4][8]{};
-        const int ids[4]{ S, E, W, H };
-        for (int i = 0; i < 4; ++i) if (!rd(model + uintptr_t(ids[i]) * 32, m[i], 32)) return;
-        glm::mat4 M[4];
-        for (int i = 0; i < 4; ++i) M[i] = decode(m[i], conv);
-        const glm::vec3 s0{ M[0][3] }, e{ M[1][3] }, h{ M[3][3] };
-        const glm::mat4 H2 = tg.D * M[3];
-        glm::vec3       T{ H2[3] };
-        const float     a = glm::length(e - s0), b = glm::length(h - e);
-        float           d = glm::length(T - s0);
-        if (a < 0.05f || b < 0.05f || d < 1e-3f) return;
-        const glm::vec3 u = (T - s0) / d;
-        // Out of reach (the controller holds the gun further out than the game: the left hand on the fore-end 0.70 m from its shoulder
-        // against 0.58 m of arm, simulator 24 Oct): the shoulder itself goes up to 15 cm toward the hand (the arm reaching forward).
-        const float     shift = std::clamp(d - (a + b - 0.01f), 0.0f, 0.15f);
-        const glm::vec3 s     = s0 + u * shift;
-        d -= shift;
-        if (shift > 0.0f) g_ik_reached[side]++;
-        const float     dc      = std::clamp(d, std::abs(a - b) + 0.01f, a + b - 0.01f);
-        const bool      clamped = dc != d;
-        if (clamped) { g_ik_clamped[side]++; T = s + u * dc; d = dc; }
-        const float x  = (a * a - b * b + d * d) / (2.0f * d);
-        const float hh = std::sqrt(std::max(0.0f, a * a - x * x));
-        glm::vec3   p  = (e - s0) - glm::dot(e - s0, u) * u;   // the game's elbow as the pole
-        if (glm::length(p) < 1e-4f) p = glm::cross(u, glm::vec3{ 0.0f, 0.0f, 1.0f });
-        if (glm::length(p) < 1e-4f) return;
-        p = glm::normalize(p);
-        const glm::vec3 e2  = s + x * u + hh * p;
-        auto            arc = [](glm::vec3 f, glm::vec3 t) {   // the shortest turn taking direction f onto t
-            f = glm::normalize(f);
-            t = glm::normalize(t);
-            const float     c  = glm::dot(f, t);
-            const glm::vec3 ax = glm::cross(f, t);
-            if (c < -0.9999f) return glm::angleAxis(glm::pi<float>(), glm::normalize(glm::abs(f.x) < 0.9f ? glm::cross(f, glm::vec3{ 1, 0, 0 }) : glm::cross(f, glm::vec3{ 0, 1, 0 })));
-            return glm::normalize(glm::quat{ 1.0f + c, ax.x, ax.y, ax.z });
-        };
-        const glm::quat r1  = arc(e - s0, e2 - s);
-        const glm::quat r2  = arc(r1 * (h - e), T - e2);
-        const glm::mat3 R1  = glm::mat3_cast(r1), R21 = glm::mat3_cast(r2 * r1);
-        glm::mat4       N[4];
-        N[0]    = glm::mat4{ R1 * glm::mat3{ M[0] } };
-        N[0][3] = glm::vec4{ s, 1.0f };
-        N[1]    = glm::mat4{ R21 * glm::mat3{ M[1] } };
-        N[1][3] = glm::vec4{ e2, 1.0f };
-        N[2]    = glm::mat4{ R21 * glm::mat3{ M[2] } };
-        N[2][3] = glm::vec4{ e2 + R21 * (glm::vec3{ M[2][3] } - e), 1.0f };
-        N[3]    = H2;
-        N[3][3] = glm::vec4{ T, 1.0f };
-        for (int i = 0; i < 4; ++i) {
-            float out[8];
-            std::memcpy(out, m[i], sizeof(out));
-            encode(N[i], conv, out);
-            wr(model + uintptr_t(ids[i]) * 32, out, 28);
-        }
-        {
-            std::lock_guard _{ g_tree_mtx };
-            const uint8_t mk  = uint8_t(g_dirty_mask.load());
-            const auto&   sub = g_sub[side + 1];
-            for (size_t dd = size_t(S) + 1; dd < sub.size(); ++dd) {
-                if (!sub[dd] || int(dd) == E || int(dd) == W || int(dd) == H) continue;
-                uint8_t f = 0;
-                if (rd(uintptr_t(flags) + dd, &f, 1)) { f |= mk; wr(uintptr_t(flags) + dd, &f, 1); }
-            }
-        }
-        g_ik_applied[side]++;
-        g_applied++;
-        if (g_ik_log.load() > 0) {
-            g_ik_log--;
-            auto deg = [](const glm::quat& q) { return glm::degrees(2.0f * std::acos(std::min(1.0f, std::abs(q.w)))); };
-            spdlog::info("[SkelHand] frame {}: {} arm IK: hand moved {:.1f} cm; upper arm {:.2f} m, forearm {:.2f} m, shoulder to hand {:.2f} m (shoulder moved {:.1f} cm){}; elbow moved {:.1f} cm, upper arm turned {:.1f} deg, "
-                         "forearm {:.1f} deg",
-                         frame, side ? "left" : "right", 100.0f * glm::length(T - h), a, b, glm::length(glm::vec3{ H2[3] } - s0), 100.0f * shift, clamped ? " (out of reach: clamped)" : "",
-                         100.0f * glm::length(e2 - e), deg(r1), deg(r2 * r1));
-        }
-    }
-
-    void on_getter(safetyhook::Context& c)
-    {
-        if (t_in) return;
-        const int mode = g_mode.load(std::memory_order_relaxed);
-        if (mode == 0 || !g_fcb) return;
-        uint64_t ret = 0, model = 0, skel = 0;
-        rd(c.rsp, &ret, 8);
-        rd(c.rcx + 0x10, &model, 8);
-        rd(c.rcx, &skel, 8);
-        const uint64_t off   = ret - g_fcb;
-        const int      frame = g_fsrc ? g_fsrc->load() : 0;
-        if ((off == 0x725a23c || off == 0x725a2ec) && model) {
-            if (g_player_model.load() != uintptr_t(model)) {
-                g_player_model = uintptr_t(model);
-                g_player_skel  = uintptr_t(skel);
-                g_player_ok    = true;
-                spdlog::info("[SkelHand] the player's pose (read by +{:x}): model transforms {:x}, skeleton {:x}", off, model, skel);
-            }
-            if (off == 0x725a23c && g_order_log.load() > 0) {
-                g_order_log--;
-                spdlog::info("[SkelHand] order: +725a23c reads bone {} in frame {} (seq {}); the hand was last moved in frame {} (seq {})", uint32_t(c.rdx), frame, fc5::skinorder::next(),
-                             g_apply_frame.load(), g_apply_seq.load());
-            }
-        }
-        if (!g_player_ok.load() || uintptr_t(model) != g_player_model.load()) return;
-        if (g_conv.load() == -2 || !tree(uintptr_t(skel))) return;
-        if (mode == 3 && g_arms.load()) { arms_on_read(c.rcx, uintptr_t(model), uint32_t(c.rdx), frame); return; }
-        const int      k    = mode == 2 ? 1 : 0;   // mode 3 moves the hand as mode 1 (and the gun at its writer)
-        const uint32_t B    = mode == 2 ? 191 : 194;
-        const uint32_t bone = uint32_t(c.rdx);
-        uint64_t       flags = 0;
-        {
-            std::lock_guard _{ g_tree_mtx };
-            if (bone >= g_sub[k].size() || !g_sub[k][bone]) return;
-        }
-        if (!rd(c.rcx + 0x18, &flags, 8) || !flags) return;
-        uint8_t fb = 0;
-        rd(uintptr_t(flags) + B, &fb, 1);
-        if (g_flag_log.load() > 0) {
-            // The flags as they are at a read under B (what marks a bone unresolved?): B's, the bone's own, and bytes around B.
-            g_flag_log--;
-            uint8_t own = 0, around[16]{};
-            rd(uintptr_t(flags) + bone, &own, 1);
-            rd(uintptr_t(flags) + (B & ~7u), around, 16);
-            std::string a;
-            for (uint8_t x : around) a += fmt::format(" {:02x}", x);
-            uint64_t q0 = 0;
-            rd(uintptr_t(flags) + (B / 8), &q0, 1);
-            spdlog::info("[SkelHand] flags at a read of bone {} (frame {}, by +{:x}): B {} = {:02x}, the bone's own {:02x}; bytes from {}:{}; as a bit array, B's byte {:02x} (bit {})", bone, frame, off, B, fb,
-                         own, B & ~7u, a, uint8_t(q0), B % 8);
-        }
-        if (!(fb & g_dirty_mask.load())) return;   // B already resolved this update (moved, or nothing to do)
-        Target tg;
-        {
-            std::lock_guard _{ g_t_mtx };
-            tg = g_target;
-        }
-        if (!tg.ok || frame - tg.frame > 4) { g_no_target++; return; }
-        uint8_t f194_before = 0, f194_after = 0;
-        rd(uintptr_t(flags) + 194, &f194_before, 1);
-        t_in = true;
-        resolve(c.rcx, 194);   // the hand and its ancestors (191-193) resolved by the game
-        t_in = false;
-        rd(uintptr_t(flags) + 194, &f194_after, 1);
-        if (g_applied.load() == 0) {
-            const uint32_t cleared = uint32_t(f194_before & ~f194_after);
-            if (cleared) g_dirty_mask = cleared;
-            spdlog::info("[SkelHand] first move: bone 194's flags {:02x} before the resolve, {:02x} after: unresolved mask {:02x}", f194_before, f194_after, g_dirty_mask.load());
-        }
-        if (g_conv.load() == -1) self_test(c.rcx, uintptr_t(model));
-        const int conv = g_conv.load();
-        if (conv < 0) return;
-        float mb[8]{}, mh[8]{};
-        if (!rd(uintptr_t(model) + B * 32, mb, 32) || !rd(uintptr_t(model) + 194 * 32, mh, 32)) return;
-        const glm::mat4 MB  = decode(mb, conv);
-        const glm::mat4 MB2 = tg.D * MB;
-        float           out[8];
-        std::memcpy(out, mb, sizeof(out));
-        encode(MB2, conv, out);
-        wr(uintptr_t(model) + B * 32, out, 28);
-        // B's descendants resolve again from it (B itself stays resolved: no second move this update).
-        {
-            std::lock_guard _{ g_tree_mtx };
-            const uint8_t m = uint8_t(g_dirty_mask.load());
-            for (size_t d = B + 1; d < g_sub[k].size(); ++d) {
-                if (!g_sub[k][d]) continue;
-                uint8_t f = 0;
-                if (rd(uintptr_t(flags) + d, &f, 1)) { f |= m; wr(uintptr_t(flags) + d, &f, 1); }
-            }
-        }
-        g_applied++;
-        g_apply_frame = frame;
-        g_apply_seq   = fc5::skinorder::next();
-        if (g_delta_log.load() > 0) {
-            g_delta_log--;
-            const glm::mat4 H  = decode(mh, conv);
-            const glm::mat4 H2 = tg.D * H;
-            const glm::mat3 dR = glm::mat3{ H2 } * glm::transpose(glm::mat3{ H });
-            const float     ang = glm::degrees(std::acos(std::clamp((dR[0][0] + dR[1][1] + dR[2][2] - 1.0f) * 0.5f, -1.0f, 1.0f)));
-            spdlog::info("[SkelHand] frame {} (target of frame {}): bone {} moved; the hand {:.1f} cm / {:.1f} deg from the game's (model ({:.3f}, {:.3f}, {:.3f}) -> ({:.3f}, {:.3f}, {:.3f})), "
-                         "read for bone {} by +{:x}",
-                         frame, tg.frame, B, 100.0f * glm::length(glm::vec3{ H2[3] } - glm::vec3{ H[3] }), ang, H[3].x, H[3].y, H[3].z, H2[3].x, H2[3].y, H2[3].z, bone, off);
-        }
-    }
-
-    // skelhand 3: the gun itself, where the game sets an entity's world transform (FC_m64+0x6a10660, reached by the jmp at +0x4db3b0 from
+    // The entity writer: where the game sets an entity's world transform (FC_m64+0x6a10660, reached by the jmp at +0x4db3b0 from
     // +0xc85c1f on the animation job threads): it stores a 4x4 column-major matrix at [rbx+0x10] and the scale at [rbx+0x50]. Hooked
-    // right after the matrix stores (+0x6a10785, mov ecx,[rsi] / mov [rbx+0x50],ecx). The gun's entity is learned once per weapon by
-    // matching the incoming matrix with the drawn gun's (the render thread's last gun draw); its matrix is then replaced by Mw0 x it.
-    safetyhook::MidHook g_gun_hook{};
-    std::mutex          g_gun_mtx;
-    struct GunRef { int frame{ -100 }; glm::vec3 t{ 0.0f }, c0{ 0.0f }; };
-    GunRef              g_gun_ref{};
-    std::atomic<uintptr_t> g_gun_obj{ 0 };
-    std::atomic<uintptr_t> g_gun_objs[8]{};   // every entity matched while learning (the game alternates 4 for a rifle; a pistol: 6 matched, 24 Oct)
-    std::atomic<int>    g_gun_learn_until{ 0 };
-    std::atomic<bool>   g_gun_learn{ true };
-    std::atomic<uint64_t> g_gun_moves{ 0 }, g_gun_calls{ 0 };
-    struct WTarget { bool ok{ false }; int frame{ -100 }; glm::mat4 Mw{ 1.0f }; };
-    WTarget             g_wtarget{};
-    std::atomic<int>    g_gun_log{ 20 };
-    // The gun's parts (scope, silencer, clip ...): other entities the writer sets whose game position lies within 0.6 m of the gun body's
-    // latest game position get the same move, so they stay with the body. Logged per frame (the first 30 frames).
-    std::mutex          g_part_mtx;
-    glm::vec3           g_body_game{ 0.0f };
-    int                 g_body_frame{ -100 };
-    struct PartFrame { int frame{ -100 }; int body{ 0 }, parts{ 0 }, left{ 0 }; float max_d{ 0.0f }; };
-    PartFrame           g_pf{};
-    std::atomic<int>    g_part_log{ 30 };
-    std::atomic<uint64_t> g_part_moves{ 0 };
-    std::atomic<int>    g_used_frame{ -100 };
-    glm::mat4           g_body_M{ 1.0f };   // the gun body's last game matrix
-    struct FarPart { glm::vec3 off{ 0.0f }; int frame{ -100 }; int stable{ 0 }; bool said{ false }; };
-    std::unordered_map<uintptr_t, FarPart> g_far;
-    // skelhandstill: the gun body's last matrices as moved and as the game set them (column-major 4x4), so the render side can give
-    // gunstill the game's own pose of the gun it draws (the drawn one is already moved).
-    struct RawGun { bool ok{ false }; int frame{ -100 }; float moved[16]{}, raw[16]{}; };   // frame: the render frame whose placement it got
-    RawGun              g_raw[16]{};
-    unsigned            g_raw_i{ 0 };
+    // right after the matrix stores (+0x6a10785, mov ecx,[rsi] / mov [rbx+0x50],ecx).
+    safetyhook::MidHook g_writer_hook{};
+    bool rd(uintptr_t p, void* out, size_t n) { __try { std::memcpy(out, reinterpret_cast<const void*>(p), n); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
 
     // throwarc's probe (see the header): every entity set near the hand after a release, its positions (one per change) for 2.5 s.
     struct TrackPt { float t; glm::vec3 p; };
@@ -920,274 +505,30 @@ namespace fc5::skelhand
         if (v.size() < 400) v.push_back({ t, p });
     }
 
-    void gun_probe(safetyhook::Context& c)
+    void writer_probe(safetyhook::Context& c)
     {
-        if (g_tp_on.load(std::memory_order_relaxed)) {
-            float p3[3]{};
-            if (rd(c.rbx + 0x10 + 48, p3, sizeof(p3))) throw_track(c.rbx, glm::vec3{ p3[0], p3[1], p3[2] });
-        }
-        if (g_mode.load(std::memory_order_relaxed) != 3) return;
-        g_gun_calls++;
-        float m[16]{};
-        if (!rd(c.rbx + 0x10, m, sizeof(m))) return;
-        const glm::vec3 t{ m[12], m[13], m[14] }, c0{ m[0], m[1], m[2] };
-        if (g_gun_learn.load()) {
-            GunRef ref;
-            {
-                std::lock_guard _{ g_gun_mtx };
-                ref = g_gun_ref;
-            }
-            const int fl = g_fsrc ? g_fsrc->load() : 0;
-            if (g_gun_obj.load() && fl > g_gun_learn_until.load()) { g_gun_learn = false; return; }
-            bool known = false;
-            for (auto& o : g_gun_objs) known = known || o.load() == c.rbx;
-            if (!known && ref.frame >= 0 && glm::length(t - ref.t) < 0.02f && glm::length(c0 - ref.c0) < 0.01f) {
-                for (auto& o : g_gun_objs) { uintptr_t z = 0; if (o.compare_exchange_strong(z, c.rbx)) break; }
-                if (!g_gun_obj.load()) g_gun_learn_until = fl + 90;   // learn the others for 90 frames
-                g_gun_obj   = c.rbx;
-                spdlog::info("[SkelHand] the gun's entity {:x}: its world matrix matches the drawn gun ({:.3f}, {:.3f}, {:.3f})", c.rbx, t.x, t.y, t.z);
-            }
-            return;
-        }
-        bool mine = false;
-        for (auto& o : g_gun_objs) mine = mine || (o.load() == c.rbx && c.rbx != 0);
-        WTarget wt;
-        {
-            std::lock_guard _{ g_gun_mtx };
-            wt = g_wtarget;
-        }
-        const int frame = g_fsrc ? g_fsrc->load() : 0;
-        if (!wt.ok || frame - wt.frame > 4) return;
-        // Per-frame tally (logged when the frame changes).
-        {
-            std::lock_guard _{ g_part_mtx };
-            if (g_pf.frame != frame) {
-                if (g_pf.frame >= 0 && g_part_log.load() > 0 && (g_pf.body || g_pf.parts)) {
-                    g_part_log--;
-                    spdlog::info("[SkelHand] frame {}: gun body entities moved {}, parts moved {} (furthest {:.2f} m from the body), near but left (0.6-1.5 m) {}", g_pf.frame, g_pf.body,
-                                 g_pf.parts, g_pf.max_d, g_pf.left);
-                }
-                g_pf = PartFrame{};
-                g_pf.frame = frame;
-            }
-            if (mine) {
-                g_body_game  = t;
-                g_body_frame = frame;
-                for (int col = 0; col < 4; ++col) for (int r = 0; r < 4; ++r) g_body_M[col][r] = m[col * 4 + r];
-                g_pf.body++;
-            } else {
-                const float d = (frame - g_body_frame <= 4) ? glm::length(t - g_body_game) : 1e9f;
-                // 0.6-1.2 m (a rifle's muzzle end: the silencer of 42000 sits ~0.7 m from the body's origin, simulator 24 Oct): a part only
-                // once it has kept its place in the body's own axes (5 mm) for 5 updates running, so things on the player's body are left.
-                bool far_part = false;
-                if (d > 0.6f && d < 1.2f) {
-                    const glm::vec3 off{ glm::inverse(g_body_M) * glm::vec4{ t, 1.0f } };
-                    auto&           st = g_far[c.rbx];
-                    st.stable          = (st.frame >= 0 && frame - st.frame <= 4 && glm::length(off - st.off) < 0.005f) ? st.stable + 1 : 0;
-                    st.off             = off;
-                    st.frame           = frame;
-                    far_part           = st.stable >= 5;
-                    if (far_part && !st.said) {
-                        st.said = true;
-                        spdlog::info("[SkelHand] entity {:x} {:.2f} m from the gun body, fixed in its axes ({:.2f}, {:.2f}, {:.2f}): moved with the gun as a part", c.rbx, d, off.x, off.y, off.z);
-                    }
-                    if (g_far.size() > 256) g_far.clear();
-                }
-                if (d > 0.6f && !far_part) {
-                    if (d < 1.5f) g_pf.left++;
-                    return;
-                }
-                g_pf.parts++;
-                g_pf.max_d = std::max(g_pf.max_d, d);
-                g_part_moves++;
-            }
-        }
-        glm::mat4 M{ 1.0f };
-        for (int col = 0; col < 4; ++col) for (int r = 0; r < 4; ++r) M[col][r] = m[col * 4 + r];
-        const glm::mat4 M2 = wt.Mw * M;
-        float out[16];
-        for (int col = 0; col < 4; ++col) for (int r = 0; r < 4; ++r) out[col * 4 + r] = M2[col][r];
-        wr(c.rbx + 0x10, out, sizeof(out));
-        g_gun_moves++;
-        if (mine) {
-            g_used_frame = wt.frame;   // skelhandlate: the render frame whose placement this update got
-            std::lock_guard _{ g_part_mtx };
-            auto& r = g_raw[g_raw_i++ % std::size(g_raw)];
-            std::memcpy(r.moved, out, sizeof(out));
-            std::memcpy(r.raw, m, sizeof(m));
-            r.ok    = true;
-            r.frame = wt.frame;
-        }
-        if (g_gun_log.load() > 0) {
-            g_gun_log--;
-            spdlog::info("[SkelHand] frame {}: the gun's world matrix moved {:.1f} cm ({:.3f}, {:.3f}, {:.3f}) -> ({:.3f}, {:.3f}, {:.3f})", frame, 100.0f * glm::length(glm::vec3{ M2[3] } - t), t.x, t.y,
-                         t.z, M2[3].x, M2[3].y, M2[3].z);
-        }
+        if (!g_tp_on.load(std::memory_order_relaxed)) return;
+        float p3[3]{};
+        if (rd(c.rbx + 0x10 + 48, p3, sizeof(p3))) throw_track(c.rbx, glm::vec3{ p3[0], p3[1], p3[2] });
     }
-    // The bone resolve (FC_m64+0x70aa130: rcx = the pose context, edx = the bone, as the getter's) gets the same check: some code resolves
-    // bones directly (the job behind the gun's world matrix, writer +0x6a1076d, simulator 24 Oct), not through the getter.
-    safetyhook::MidHook g_resolve_hook{};
-    void resolve_probe(safetyhook::Context& c) { if (g_mode.load(std::memory_order_relaxed) > 0) on_getter(c); }
 
     bool install_writer_hook()
     {
         static std::mutex mx;
         std::lock_guard   _{ mx };
-        if (g_gun_hook) return true;
+        if (g_writer_hook) return true;
         auto*                base = reinterpret_cast<uint8_t*>(GetModuleHandleA("FC_m64.dll"));
         static const uint8_t kAt[5]{ 0x8B, 0x0E, 0x89, 0x4B, 0x50 };
         if (base && std::memcmp(base + 0x6a10785, kAt, sizeof(kAt)) == 0) {
-            g_gun_hook = safetyhook::create_mid(base + 0x6a10785, gun_probe);
-            spdlog::info("[SkelHand] gun world-matrix hook at FC_m64+0x6a10785 {}", g_gun_hook ? "installed" : "failed");
+            g_writer_hook = safetyhook::create_mid(base + 0x6a10785, writer_probe);
+            spdlog::info("[ThrowArc] entity writer hook at FC_m64+0x6a10785 {}", g_writer_hook ? "installed" : "failed");
         } else {
-            spdlog::info("[SkelHand] the code differs at FC_m64+0x6a10785: no gun hook");
+            spdlog::info("[ThrowArc] the code differs at FC_m64+0x6a10785: no throw measure");
         }
-        return bool(g_gun_hook);
+        return bool(g_writer_hook);
     }
 
-    bool set_mode(int m, const std::atomic<int>* frame)
-    {
-        g_fsrc = frame;
-        if (m > 0) {
-            if (!fc5::poseprobe::install_getter(frame)) return false;
-            if (!g_resolve_hook) {
-                auto*                base = reinterpret_cast<uint8_t*>(GetModuleHandleA("FC_m64.dll"));
-                static const uint8_t kEntry[15]{ 0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC, 0x60 };
-                if (base && std::memcmp(base + 0x70aa130, kEntry, sizeof(kEntry)) == 0) {
-                    g_resolve_hook = safetyhook::create_mid(base + 0x70aa130, resolve_probe);
-                    spdlog::info("[SkelHand] bone resolve hook at FC_m64+0x70aa130 {}", g_resolve_hook ? "installed" : "failed");
-                } else {
-                    spdlog::info("[SkelHand] the bone resolve's entry bytes differ at FC_m64+0x70aa130: getter path only");
-                }
-            }
-            install_writer_hook();
-            g_fcb = reinterpret_cast<uintptr_t>(GetModuleHandleA("FC_m64.dll"));
-            g_delta_log = 100;
-            g_order_log = 50;
-            g_flag_log  = 40;
-        }
-        g_mode      = std::clamp(m, 0, 3);
-        g_gun_learn = true;
-        g_gun_obj   = 0;
-        for (auto& o : g_gun_objs) o = 0;
-        g_gun_log   = 20;
-        g_part_log  = 30;
-        return true;
-    }
-    int  mode() { return g_mode.load(std::memory_order_relaxed); }
-    void set_target(int frame, const glm::mat4& D, bool ok)
-    {
-        std::lock_guard _{ g_t_mtx };
-        g_target.ok    = ok;
-        g_target.frame = frame;
-        g_target.D     = D;
-    }
-    bool player_ok() { return g_player_ok.load() && g_conv.load() >= 0; }
-    std::string status()
-    {
-        return fmt::format("mode {}, player pose {:x} ({}), convention {}, moves {}, skipped with no target {}{}", g_mode.load(), g_player_model.load(), g_player_ok.load() ? "checked" : "not checked",
-                           g_conv.load(), g_applied.load(), g_no_target.load(),
-                           g_arms.load() ? fmt::format(", arms IK right {} (shoulder moved {}, out of reach {}), left {} ({}, {})", g_ik_applied[0].load(), g_ik_reached[0].load(), g_ik_clamped[0].load(), g_ik_applied[1].load(), g_ik_reached[1].load(), g_ik_clamped[1].load()) : std::string{});
-    }
-
-    // The identity check (render thread, the palette writer): an arms mesh's skin rotations and the player's model quats for its bones,
-    // against the last update's. Every 2 s: a mean turn mismatch over 0.25 deg (with the bones moving) drops the pose until it is read
-    // again by +725a23c / +725a2ec.
-    void note_skin(uintptr_t rcx, uintptr_t rdx)
-    {
-        const uintptr_t model = g_player_model.load();
-        if (!model || g_mode.load() == 0) return;
-        uint64_t list = 0, cnt = 0;
-        if (!rd(rdx, &list, 8) || !rd(rdx + 8, &cnt, 8)) return;
-        const uint32_t n = uint32_t(cnt >> 32) & 0x7fffffff;
-        if (!list || n < 30 || n > 60) return;
-        std::vector<uint16_t> remap(n);
-        if (!rd(uintptr_t(list), remap.data(), n * 2)) return;
-        std::vector<float> skin(size_t(n) * 9), q(size_t(n) * 4);
-        for (uint32_t i = 0; i < n; ++i) {
-            float m[16]{};
-            rd(rcx + uintptr_t(remap[i]) * 64, m, sizeof(m));
-            for (int r = 0; r < 3; ++r) for (int cc = 0; cc < 3; ++cc) skin[i * 9 + r * 3 + cc] = m[r * 4 + cc];
-            rd(model + uintptr_t(remap[i]) * 32, &q[i * 4], 16);
-        }
-        const int frame = g_fsrc ? g_fsrc->load() : 0;
-        if (remap == g_chk_remap && frame != g_chk_frame) {
-            for (uint32_t i = 0; i < n; ++i) {
-                const float as = fc5::poseprobe::rot_angle_deg(&g_chk_skin[i * 9], &skin[i * 9]);
-                const float aq = fc5::poseprobe::quat_angle_deg(&g_chk_q[i * 4], &q[i * 4]);
-                if (as < 0.05f || aq < 0.0f) continue;
-                g_chk_err += std::abs(as - aq);
-                g_chk_n++;
-            }
-        }
-        if (remap == g_chk_remap || g_chk_remap.empty()) {
-            g_chk_remap = remap;
-            g_chk_skin  = std::move(skin);
-            g_chk_q     = std::move(q);
-            g_chk_frame = frame;
-        }
-        const auto now = std::chrono::steady_clock::now();
-        if (now - g_chk_t > std::chrono::seconds(2)) {
-            g_chk_t = now;
-            if (g_chk_n >= 20) {
-                // Fast arm motion shows a few tenths to ~3 deg here (the next update's animation can be under way while the render thread
-                // reads): only a mismatch over 3 deg in two checks running drops the pose; anything else is logged.
-                const double e = g_chk_err / g_chk_n;
-                g_chk_bad      = e > 3.0 ? g_chk_bad + 1 : 0;
-                if (g_chk_bad >= 2) {
-                    g_player_ok    = false;
-                    g_player_model = 0;
-                    g_chk_bad      = 0;
-                    spdlog::info("[SkelHand] identity check: the player's pose {:x} no longer matches the arms' skin ({:.2f} deg mean turn error over {} bone turns, twice): dropped", model, e, g_chk_n);
-                } else if (e > 0.25) {
-                    spdlog::info("[SkelHand] identity check: {:.2f} deg mean turn error over {} bone turns (kept)", e, g_chk_n);
-                }
-            }
-            g_chk_err = 0.0;
-            g_chk_n   = 0;
-        }
-    }
-}
-
-namespace fc5::skelhand
-{
-    void set_world_target(int frame, const glm::mat4& Mw, bool ok)
-    {
-        std::lock_guard _{ g_gun_mtx };
-        g_wtarget.ok    = ok;
-        g_wtarget.frame = frame;
-        g_wtarget.Mw    = Mw;
-    }
-    void note_gun(int frame, const glm::mat4& Om)   // the drawn gun (row-major object matrix as a glm mat4)
-    {
-        std::lock_guard _{ g_gun_mtx };
-        g_gun_ref.frame = frame;
-        g_gun_ref.t     = glm::vec3{ Om[3] };
-        g_gun_ref.c0    = glm::vec3{ Om[0] };
-    }
-    void set_arms(bool on) { g_arms = on; g_ik_log = 12; }
-    bool arms() { return g_arms.load(); }
-    int  used_target_frame() { return g_used_frame.load(); }
-    void relearn_gun() { g_gun_obj = 0; for (auto& o : g_gun_objs) o = 0; g_gun_learn = true; g_part_log = 10; g_gun_log = 4; }   // the new weapon's parts logged too
-    std::atomic<int> g_drawn_frame{ -100 };
-    int  drawn_target_frame() { return g_drawn_frame.load(); }
-    bool raw_gun(const float* d, float* raw12)
-    {
-        std::lock_guard _{ g_part_mtx };
-        for (unsigned k = 0; k < std::size(g_raw); ++k) {
-            const auto& r = g_raw[(g_raw_i - 1 - k) % std::size(g_raw)];   // newest first
-            if (!r.ok) continue;
-            bool same = true;
-            for (int row = 0; row < 3 && same; ++row)
-                for (int col = 0; col < 4 && same; ++col) same = std::abs(d[row * 4 + col] - r.moved[col * 4 + row]) < (col == 3 ? 2e-3f : 1e-4f);   // world positions ~3000 m: float steps 0.25 mm
-            if (!same) continue;
-            for (int row = 0; row < 3; ++row) for (int col = 0; col < 4; ++col) raw12[row * 4 + col] = r.raw[col * 4 + row];
-            g_drawn_frame = r.frame;
-            return true;
-        }
-        return false;
-    }
-    void throw_probe_arm(const glm::vec3& hand)
+    void arm(const glm::vec3& hand)
     {
         if (!install_writer_hook()) return;
         std::lock_guard _{ g_tp_mtx };
@@ -1198,7 +539,7 @@ namespace fc5::skelhand
     }
     // The object that flew furthest from the hand; its launch: the first sample moving over 3 m/s, then p(t) = p0 + v0 t + a t^2 / 2
     // fitted (least squares, per axis) over the next 0.5 s.
-    ThrowFit throw_fit(const glm::vec3& head_dir)
+    ThrowFit fit(const glm::vec3& head_dir)
     {
         ThrowFit r;
         std::lock_guard _{ g_tp_mtx };
@@ -1275,5 +616,4 @@ namespace fc5::skelhand
             r.path += fmt::format(" {:.3f}s ({:.2f} {:.2f} {:.2f})", v[i].t, v[i].p.x - g_tp_hand.x, v[i].p.y - g_tp_hand.y, v[i].p.z - g_tp_hand.z);
         return r;
     }
-    std::string gun_status() { return fmt::format("gun entity {:x}, writer calls {}, gun moves {} (parts {})", g_gun_obj.load(), g_gun_calls.load(), g_gun_moves.load(), g_part_moves.load()); }
 }

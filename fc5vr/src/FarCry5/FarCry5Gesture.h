@@ -45,16 +45,29 @@ struct Input
     bool      wheel{ false };          // the weapon wheel is open (throwv2's peek waits for it to close)
     bool      recorded{ false };       // throwv2: the mod has the selected throwable's model (its peek has nothing to do)
     bool      moving{ false };         // walking, running or sprinting (or within 1 s of it): no peek then
+    uint32_t  sig{ 0 };                // sidearm: the game's weapon id now (m_weapon_sig)
+    bool      cur_side{ false };       // sidearm: that weapon is a sidearm (FarCry5Holster.cpp)
+    bool      hiding{ false };         // sidearm: shoulderdraw hides the game's weapon now (weapon_switch_hiding)
+    bool      sig_known{ false };      // sidearm: that weapon has been recorded (a real weapon, not an id the switch animation shows)
+    bool      side_recorded{ false };  // sidearm: the sidearm (the slot's weapon) has been recorded this session (sidearmpeek has nothing to do)
+    bool      side_known{ false };     // sidearm: the sidearm slot's weapon is known (sidearmsig): a wheel pick that keeps the weapon in hand teaches nothing
+    uint32_t  side_sig{ 0 };           // sidearm: that weapon (0: not known yet)
+    uint32_t  main_sig{ 0 };           // sidearm: the main weapon last held still (0: none known; FarCry5Holster.cpp)
+    bool      side_unlisted{ false };  // sidearm: the saved sidearm list holds weapons and the one in hand is not among them (no "kept" proof then)
 };
 
 struct Output
 {
     uint16_t buttons{ 0 };            // XINPUT_GAMEPAD_* bits to add this poll
     bool     grip_taken[2]{};         // that hand's grip belongs to a gesture: no usual grip action
+    bool     miss_press[2]{};         // gesturemisswalk: that grip was pressed just outside a zone (the left stick stays the stick)
     float    buzz[2]{};               // haptic pulse on that hand this poll: amplitude (0 = none) ...
     float    buzz_s[2]{};             // ... and length (s): light on entering a zone, firmer when a gesture fires
     bool     slung{ false };          // the weapon hangs on the sling (not in the hand): it must not fire
-    bool     no_fire{ false };        // a throw is under way: the right trigger must not fire
+    bool     no_fire{ false };        // a throw is under way (or a sidearm switch): the right trigger must not fire
+    uint16_t key_scan{ 0 };           // sidearm with sidearmkey N: a keyboard key (scan code) to tap once now
+    bool     wheel{ false };           // sidearm (sidearmkey wheel): LB held and the right stick at (wheel_x, wheel_y) this poll: the wheel's slot pick
+    float    wheel_x{ 0.0f }, wheel_y{ 0.0f };
 };
 
 // Called once per pad poll (the XInput hook). Keeps the press / pulse / sling state.
@@ -68,7 +81,27 @@ Output update(const Input& in);
 // saved ones.
 bool command(const std::string& cmd, const std::string& arg, float fv, std::istream& rest, bool& persist);
 bool test_grip();
-bool test_input();   // a gesture test drives the controllers (gesturegrip, throwtest): counts as controller use
+bool test_input();
+// shoulderdraw (FarCry5WeaponSwitch.cpp): how many weapon-switch gestures have fired (each tap gesture, and each
+// note_weapon_switch() from a gesture that switches weapon some other way). A change starts the switch window.
+uint32_t weapon_switch_count();
+void     note_weapon_switch();
+// shoulderwheel on|off (saved, default on; Homard 30 Oct: "make left shoulder weapon slot 1 and right shoulder weapon slot 2"): the weapon hand
+// at the left shoulder (shoulderleft, new, on, saved) picks the weapon wheel's slot 1, at the right shoulder (shoulderswitch) slot 2, through the
+// wheel instead of pad Y (shoulderslots, saved, default left upleft up upright: the wheel spots of his slots 1-4, from the left); never the sidearm. A slot
+// whose weapon is in hand (known from an earlier pick) is not picked; a pick that gave nothing is made once more. shoulder_pick_target(): while
+// a pick is under way, the weapon that slot gave before (0: not known); shoulder_pick_drops(): picks that gave no weapon (the switch window ends).
+uint32_t shoulder_pick_target();
+uint32_t shoulder_pick_drops();
+bool     shoulder_wheel_on();
+// shoulderleftslot / shoulderrightslot N (saved, default 1 / 2): the wheel slot each shoulder takes: 1-4 from the left of the weapon wheel (left, upper-left, top, upper-right; the rightmost is the sidearm).
+// shoulderkeys on|off (saved, default on; Homard 30 Oct 12:43): the slot is taken with the game's weapon slot key N (keyboard 1-4) instead of the wheel.
+int      shoulder_slot(int right);
+void     set_shoulder_slot(int right, int slot);
+// shoulderdraw on: with the sling on, a tap gesture's grip press also holds the weapon in the hand (the sling's hold) while
+// the grip lasts, so the new weapon is in the hand, not on the sling.
+void     set_switch_grab(bool on);   // a gesture test drives the controllers (gesturegrip, throwtest): counts as controller use
+bool miss_walk();                 // gesturemisswalk on|off (saved): a press just outside a zone leaves the left stick walking
 bool zone_buzz();                 // gesturebuzz on|off (saved): the light buzz on entering any gesture zone
 void set_zone_buzz(bool on);
 
@@ -131,6 +164,7 @@ void       reset_throw();   // throwpos back to its default
 bool throw_v2();
 bool throw_v2_right();       // throwv2hand right
 bool throw_v2_rb_arm();      // throwv2rb arm
+bool throw_v2_rb_grab();     // throwv2rb grab: RB held from the grab (the pouch)
 bool throw_peek_on();
 bool throw_rock();          // throwrock on|off (saved, default off): with no throwable to draw at the last peek, the gesture throws a rock (D-pad down)
 bool throw_is_rock();       // the throw under way is a rock
@@ -145,6 +179,32 @@ bool throw_rb_held();        // throwv2: the gesture holds RB now (the game draw
 bool throw_peeking();
 void throw_peek_seen();
 void throw_peek_again();     // the selection may have changed (the wheel closed): peek again
+
+// Sidearm (sidearm on|off, saved, default off, experimental; Homard 26 Oct: "the sidearm model should always be visible on the right
+// hip (like with the sling)"; needs the sling on). The game holds the weapon the hand last grabbed: the main weapon (the sling's) or the
+// sidearm (the hip's). Not in the hand, the game's weapon hangs where it is carried (rest_pose: the sling for a main weapon, the hip for
+// a sidearm) and the mod draws its recorded copy of the other one in its own place (FarCry5Holster.cpp). Grabbing the one the game does
+// not hold taps the game's "last weapon" (pad Y, or a keyboard key with sidearmkey N) once; until the game shows another weapon (or
+// 2.5 s) the switch is pending: the game's weapon stays where it is carried, the copy of the wanted one is in the hand, and it does not
+// fire. hip_pose: the sidearm's place, tracking space, from the head pose (x right, y up, -z along the barrel, origin = its grip);
+// sidearmpos right down forward (m), sidearmrot left down roll (deg), as slingpos / slingrot.
+glm::mat4 hip_pose(const glm::mat4& head, bool mirror);
+glm::mat4 rest_pose(const glm::mat4& head, bool mirror);   // where the game's weapon hangs when not in the hand
+bool      side_on();          // sidearm and sling both on
+bool      cur_side();         // the game's weapon at the last poll is a sidearm
+int       switch_want();      // a pending switch: 0 to the main weapon, 1 to the sidearm; -1 none
+bool      switch_grabbed();   // that switch is a sling or hip grab's (the copy in the hand), not the look at the sidearm slot after a load
+void      get_hip_place(float pos[3], float rot[3]);
+void      set_hip_place(const float pos[3], const float rot[3]);
+void      reset_hip_place();
+int       side_key();         // sidearmkey: -1 the weapon wheel's rightmost slot (default), 0 pad Y, else a keyboard scan code
+bool      side_peek_on();     // sidearmpeek on|off (saved, default on): look at the sidearm slot once after a load
+int       side_peek_state();  // the load popup: 2 looking at the sidearm slot, 1 looked since the load, 0 not yet, -1 no look (sidearm or sidearmpeek off)
+int       load_slot_state();  // the load popup: 1 loadslot will take the left shoulder's slot, 2 that pick is under way, 0 nothing to do
+bool      side_y_on();        // sidearmy on|off (saved, default on): the hip switches with pad Y when the game's last weapon is the sidearm
+bool      wheel_pick_now();   // the mod's wheel pick is under way (and 0.2 s after): the game's HUD (the wheel) is not drawn then
+void      side_peek_again();  // the sidearm slot to be looked at again (a wrong sidearm forgotten)
+uint32_t  take_side_landed();   // once: the weapon a hip grab switched to (0 none): the sidearm, unless measured otherwise
 
 // The weapon-switch zone at the weapon hand's shoulder (gestureshoulder side down back, m, saved, default 0.18 0.25 0.13): from the
 // eyes when looking straight ahead, to the side, below them, behind them. It hangs from the neck and turns with the body's heading

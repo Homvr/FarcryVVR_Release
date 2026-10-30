@@ -2,7 +2,7 @@
 // It lives in the game's bin folder (next to FarCry5.exe and the mod's dxgi.dll) and writes there:
 //   fc5vr_launcher.txt   "mode vr" or "mode flat", "headset quest3" and the headset's typical eye size "headsetsize <w> <h>"
 //                        (read by the mod at start, src\Main.cpp and FarCry5Stereo.cpp load_forced_resolution)
-//   fc5vr_settings.txt   only its "resscale" line, the same one F11 Display > Resolution multiplier changes
+//   fc5vr_settings.txt   only its "render", "resscale", "dlss" and "loadpopup" lines, the same ones F11 changes
 // Built by build_launcher.bat (C# 5, so the compiler in Windows' .NET Framework can build it too).
 // After Play in VR it stays minimised until the game closes; if the game closed during the start (VR never ran) or
 // crashed, it offers a report zip (FC5VR_report_<date>.zip in bin: logs, crash report, system and Windows event
@@ -137,6 +137,20 @@ static class Launcher
         return stereo;
     }
 
+    // Loading popup: fc5vr_settings.txt "loadpopup off" (F11 HUD and menus > Loading popup). No line: shown, the mod's default.
+    public static bool ReadSkipPopup()
+    {
+        bool skip = false;
+        try {
+            if (File.Exists(SettingsFile))
+                foreach (var raw in File.ReadAllLines(SettingsFile)) {
+                    var l = raw.Trim();
+                    if (l.StartsWith("loadpopup ")) skip = l == "loadpopup off" || l == "loadpopup 0";
+                }
+        } catch { }
+        return skip;
+    }
+
     public static void ReadChoice(out bool flat, out string headset, out float scale)
     {
         flat = false;
@@ -176,7 +190,7 @@ static class Launcher
     }
 
     // dlssMode -1: fc5vr_resolution.txt left as it is.
-    public static void WriteChoice(bool flat, string headset, bool stereo, float scale, bool dlss, int dlssMode)
+    public static void WriteChoice(bool flat, string headset, bool stereo, float scale, bool dlss, int dlssMode, bool skipPopup)
     {
         var hs = FindHeadset(headset);
         File.WriteAllText(LauncherFile, "mode " + (flat ? "flat" : "vr") + "\r\nheadset " + headset + "\r\n" +
@@ -191,6 +205,8 @@ static class Launcher
         SetLine(lines, "render", stereo ? "render stereo" : "render afw");
         SetLine(lines, "resscale", "resscale " + scale.ToString("0.0", CultureInfo.InvariantCulture));
         SetLine(lines, "dlss", dlss ? "dlss on" : "dlss off");
+        // The loading popup's line only when it is skipped or already there (no line: shown).
+        if (skipPopup || lines.Exists(l => l.Trim().StartsWith("loadpopup "))) SetLine(lines, "loadpopup", skipPopup ? "loadpopup off" : "loadpopup on");
         // The mod writes with \n; keep it.
         var tmp = SettingsFile + ".launcher.tmp";
         File.WriteAllText(tmp, string.Join("\n", lines) + "\n", new UTF8Encoding(false));
@@ -486,6 +502,8 @@ class LauncherForm : Form
     readonly CheckBox dlss = new CheckBox();
     readonly ComboBox dlssMode = new ComboBox();
     readonly Label dlssInfo = new Label();
+    readonly CheckBox skipPopup = new CheckBox();
+    readonly Label popupInfo = new Label();
     bool dlssKeepFile;   // fc5vr_resolution.txt is not "auto" (a test setup): kept unless the mode is changed
     readonly Button play = new Button();
 
@@ -538,6 +556,11 @@ class LauncherForm : Form
         AddRow(table, "DLSS", dl);
         AddInfo(table, dlssInfo);
 
+        // Loading popup: F11 HUD and menus > Loading popup ("loadpopup off" skips it).
+        skipPopup.Text = "Skip the loading popup"; skipPopup.AutoSize = true;
+        AddRow(table, "After a load", skipPopup);
+        AddInfo(table, popupInfo);
+
         // Headset
         headset.DropDownStyle = ComboBoxStyle.DropDownList;
         headset.Width = 200;
@@ -577,11 +600,13 @@ class LauncherForm : Form
         dlss.Checked = dlssOn;
         dlssKeepFile = dm < 0;
         dlssMode.SelectedIndex = Math.Max(0, dm);
+        skipPopup.Checked = Launcher.ReadSkipPopup();
 
         vr.CheckedChanged += delegate { UpdateInfo(); };
         scale.SelectedIndexChanged += delegate { UpdateInfo(); };
         render.SelectedIndexChanged += delegate { UpdateInfo(); };
         dlss.CheckedChanged += delegate { UpdateInfo(); };
+        skipPopup.CheckedChanged += delegate { UpdateInfo(); };
         dlssMode.SelectedIndexChanged += delegate { dlssKeepFile = false; UpdateInfo(); };
         headset.SelectedIndexChanged += delegate { UpdateInfo(); };
         play.Click += delegate { Play(); };
@@ -675,6 +700,10 @@ class LauncherForm : Form
                                                      (int)(ew * ratio) & ~7, (int)(eh * ratio) & ~7);
         else dlssInfo.Text = "The game renders smaller and DLSS scales it up to the eye images. Lower is faster and softer.";
         dlssInfo.Text += " Turning DLSS on or off in F11 needs a game restart.";
+        skipPopup.Enabled = isVr;
+        popupInfo.Text = !isVr ? "Not used in Flatscreen."
+                       : skipPopup.Checked ? "Play starts at once after a load; the first seconds can hitch and the sidearm shows once the mod has seen it."
+                                           : "After a load, \"VR mod loading\" counts down in the headset while the mod gets your weapons ready; the controllers wait until it closes.";
         headsetInfo.Text = isVr ? HeadsetText() : "";
     }
 
@@ -687,7 +716,7 @@ class LauncherForm : Form
         if (vr.Checked && !CheckGameOptions()) return;
         try {
             Launcher.WriteChoice(flat.Checked, HeadsetId(), render.SelectedIndex == 0, Multiplier(),
-                                 dlss.Checked, dlssKeepFile ? -1 : Math.Max(0, dlssMode.SelectedIndex));
+                                 dlss.Checked, dlssKeepFile ? -1 : Math.Max(0, dlssMode.SelectedIndex), skipPopup.Checked);
         } catch (Exception e) {
             MessageBox.Show(this, "Could not save the choice in " + Launcher.GameDir + ":\n" + e.Message, "Far Cry 5 VR", MessageBoxButtons.OK, MessageBoxIcon.Error);
             return;

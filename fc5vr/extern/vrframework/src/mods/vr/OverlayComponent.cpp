@@ -89,6 +89,17 @@ void OverlayComponent::update_input_mouse_emulation() {
         return;
     }
 
+    // Left button: A or (Far Cry 5) the right trigger, one state for both (29 Oct: two separate down/up streams made an extra
+    // click when one was held and the other tapped). Statics here so a press held off the panel is released too.
+    static bool was_pressing = false;
+    static bool was_pressing_right = false;
+    if (!(m_framework_intersect_state.intersecting && VR::get()->is_using_controllers())) {
+        auto& io = ImGui::GetIO();
+        if (was_pressing) io.AddMouseButtonEvent(0, false);
+        if (was_pressing_right) io.AddMouseButtonEvent(1, false);
+        was_pressing = was_pressing_right = false;
+    }
+
     if (m_framework_intersect_state.intersecting && VR::get()->is_using_controllers()) {
         auto vr = VR::get();
         auto& io = ImGui::GetIO();
@@ -109,13 +120,10 @@ void OverlayComponent::update_input_mouse_emulation() {
         io.AddMousePosEvent(m_last_mouse_pos.x, m_last_mouse_pos.y);
         io.MouseDrawCursor = true;
         {
-
-            static bool was_pressing = false;
-            static bool was_pressing_right = false;
-
             // Left click.
             const auto& a_button_right = !vr->m_swap_controllers->value() ? VR::s_action_a_button_right : VR::s_action_a_button_left;
-            if (VR::get()->is_action_active_any_joystick(vr->get_action_handle(a_button_right))) {
+            const bool  a_down         = VR::get()->is_action_active_any_joystick(vr->get_action_handle(a_button_right));
+            if (a_down || VR::s_fc5_menu_trigger.load()) {
                 // Clear any gamepad A events.
                 auto ctx = io.Ctx;
 
@@ -130,7 +138,7 @@ void OverlayComponent::update_input_mouse_emulation() {
                     }
                 }
 
-                io.AddMouseButtonEvent(0, true);
+                if (!was_pressing) io.AddMouseButtonEvent(0, true);
                 was_pressing = true;
             } else if (was_pressing) {
                 io.AddMouseButtonEvent(0, false);
@@ -785,7 +793,7 @@ void OverlayComponent::update_overlay_openvr() {
 }
 
 std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::OpenXR::generate_framework_ui_quad(bool keep) {
-    if (!g_framework->is_drawing_ui()) {
+    if (!g_framework->is_ui_layer_shown()) {
         m_parent->m_framework_intersect_state.intersecting = false;
         if (!keep) {
             return std::nullopt;
@@ -832,8 +840,8 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
         layer.space = vr->m_openxr->stage_space;
     }
 
-    const auto size_meters = g_framework->is_drawing_ui() ? m_parent->m_framework_size->value() : m_parent->m_slate_size->value();
-    const float scale_factor =  g_framework->is_drawing_ui() ? ((float)ui_swapchain.width / 1920.0f) : 1.0f;
+    const auto size_meters = g_framework->is_ui_layer_shown() ? m_parent->m_framework_size->value() : m_parent->m_slate_size->value();
+    const float scale_factor =  g_framework->is_ui_layer_shown() ? ((float)ui_swapchain.width / 1920.0f) : 1.0f;
 
     // Adjust size_meters based on scaling factor.
     const float adjusted_size_meters = size_meters * scale_factor;
@@ -844,7 +852,7 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
 
     layer.size = {meters_w, meters_h};
 
-    if (g_framework->is_drawing_ui()) {
+    if (g_framework->is_ui_layer_shown()) {
         glm_matrix[3] -= glm_matrix[2] * m_parent->m_framework_distance->value();
     } else {
         glm_matrix[3] -= glm_matrix[2] * (m_parent->m_slate_distance->value() - 0.01f);
@@ -859,7 +867,8 @@ std::optional<std::reference_wrapper<XrCompositionLayerQuad>> OverlayComponent::
     layer.pose.position = runtimes::OpenXR::to_openxr(glm_matrix[3]);
 
     // Check if the controller pointer intersects with the quad, and we can use this to emulate the mouse
-    if (vr->is_using_controllers()) {
+    // (Far Cry 5: only the menu's; a notice takes no pointer).
+    if (g_framework->is_drawing_ui() && vr->is_using_controllers()) {
         // Right only for now for testing
         const auto controller_index = !vr->m_swap_controllers->value() ? vr->get_right_controller_index() : vr->get_left_controller_index();
         const auto right_controller_rot = glm::quat{vr->get_rotation(controller_index)};

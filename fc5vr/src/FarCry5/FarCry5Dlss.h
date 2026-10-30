@@ -12,6 +12,12 @@
 namespace fc5::dlss
 {
     void set_enabled(bool on);
+    // ofxrguides (default on): OFXR Bridge's DLSS frame generation needs each eye image tagged with the DLSS evaluation it
+    // came from; the tag OFXR puts on the DLSS output is carried to the eye's swapchain image before its release.
+    void tag_xr_image(int eye, ID3D11Texture2D* image);
+    void set_ofxr_tags(bool on);
+    bool ofxr_tags();
+    std::string ofxr_tag_stats();   // since the last call
     // NGX DLSS feature flags (1 HDR, 2 MV low res, 4 MV jittered, 8 depth inverted, 64 auto exposure); recreates the features.
     void set_flags(int flags);
     // The DLSS model preset (0 default, 10 J, 11 K = DLSS 4 transformer); recreates the features.
@@ -30,6 +36,8 @@ namespace fc5::dlss
     bool motion_best();
     void set_motion_check(bool on);   // cmd dlssmvcheck: an object's own motion only where this eye's previous depth confirms it
     bool motion_check();
+    void  set_motion_sway(float px);   // cmd dlssmvsway on|off|<px>: swaying foliage's own motion passes above px + 5 % (0 = off, on = 0.5)
+    float motion_sway();
     void motion_dump(int n);   // cmd dlssmvdump N (test): game, camera and final vectors and depth to probes
     void set_dlaa_phases(int n);   // cmd dlaaphases 8|16 (research 15 Oct): jitter phases per eye in DLAA (no upscaling)
     int  dlaa_phases();

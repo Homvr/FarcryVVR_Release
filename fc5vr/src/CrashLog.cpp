@@ -1194,4 +1194,17 @@ void start_boot_watchdog()
     }).detach();
 }
 
+void process_exit(bool normal)
+{
+    // DllMain (loader lock held, other threads gone): no spdlog, no heap, one plain line. A process killed with TerminateProcess
+    // never gets here, so after a normal quit this is the log's last line and its absence means killed (or a crash, which
+    // has its own report). Homard 27 Oct: two logs that "ended mid-play" were plain process ends, but nothing said so.
+    char       line[160];
+    SYSTEMTIME t{};
+    GetLocalTime(&t);
+    sprintf_s(line, "[%02u:%02u:%02u.%03u] [I] [tid:%lu] [Boot] process exit (%s); lines of the last second may be missing above\r\n", t.wHour, t.wMinute, t.wSecond,
+              t.wMilliseconds, GetCurrentThreadId(), normal ? "the game quit: ExitProcess" : "the mod's DLL unloaded");
+    append_log_line(line);
+}
+
 }   // namespace fc5::crash

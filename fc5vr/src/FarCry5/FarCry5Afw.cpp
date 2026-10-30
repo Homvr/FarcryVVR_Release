@@ -50,7 +50,7 @@ cbuffer P : register(b0) {
     float4 prm2;                 // debug tint, stale tolerance (relative), near-miss (texels), foreground by stencil (1) / by depth limit (0)
     float4 prm4;                 // one grid step in uv: fresh x, y, held x, y
     float4 prm5;                 // afwvehnear: in a vehicle, nearer than this (m) only the fresh image (0 = off); y afwvehbody (m);
-                                 // z experiments (bits): 1 afwfoot, 2 afwrail
+                                 // z experiments (bits): 1 afwfoot, 2 afwrail, 4 afwfoliage
     float4 fB0, fB1, fB2, fBo;   // afwvehbody: fresh view -> target view for points fixed in the vehicle (its raw frame)
     float4 hB0, hB1, hB2, hBo;   // held, same
 };
@@ -105,6 +105,24 @@ float3 mapH(float2 s, float zr) {
 // Experiments from the BioShock VR mod's rebuild (24 Oct, F11 Experimental > AFW), prm5.z bits.
 bool xFoot() { return fmod(prm5.z, 2.0) >= 1.0; }
 bool xRail() { return fmod(floor(prm5.z * 0.5), 2.0) >= 1.0; }
+bool xFoliage() { return fmod(floor(prm5.z * 0.25), 2.0) >= 1.0; }
+static const float2 kRing8[8] = { float2(1, 0), float2(1, 1), float2(0, 1), float2(-1, 1), float2(-1, 0), float2(-1, -1), float2(0, -1), float2(1, -1) };
+// afwfoliage: needles, leaves and grass blades are thinner than the gaps between them, so their depth is a speckle of near
+// texels over the background, and the two eyes and two frames (other jitter, a little wind) hit different specks. A held
+// point is porous when at least 4 of the 8 held depth texels 2 apart around it are clearly farther (a straight edge of a
+// solid thing has 3, so a moving person's or car's edge is not porous).
+bool porousH(float2 s, float z) {
+    float2 sz; heldDepth.GetDimensions(sz.x, sz.y); float2 o = 2.0 / sz; float n = 0.0;
+    [unroll] for (int k = 0; k < 8; ++k) n += zH(saturate(s + kRing8[k] * o)) > z * 1.1 + 0.05 ? 1.0 : 0.0;
+    return n >= 4.0;
+}
+// The nearest fresh depth on two rings (3 and 6 texels) around uf: a porous held point the fresh eye sees past only at its
+// exact spot still has its plant there, on a speck beside it.
+float nearRingF(float2 uf) {
+    float2 sz; freshDepth.GetDimensions(sz.x, sz.y); float2 o = 1.0 / sz; float z = 60000.0;
+    [unroll] for (int k = 0; k < 8; ++k) z = min(z, min(zF(saturate(uf + kRing8[k] * o * 3.0)), zF(saturate(uf + kRing8[k] * o * 6.0))));
+    return z;
+}
 // afwfoot: a refined point must still lie on the surface its last correction reaches: if the step it still needs crosses a
 // depth break, it is the wrong side of an edge (a one-texel rail widened into two, an edge pixel from behind the gun).
 bool offFoot(float z0, float z1) { return abs(z1 - z0) > min(z0, z1) * 0.04 + 0.02; }
@@ -145,7 +163,7 @@ float4 shade(Texture2D tex, float2 uv, int cls) {
         // purple from a fresh weapon texel nearby.
         float3 k = cls == 0 ? float3(0.5, 1.0, 0.5) : cls == 2 ? float3(0.5, 0.6, 1.0) : cls == 3 ? float3(1.0, 0.4, 0.4)
                  : cls == 5 ? float3(1.0, 0.4, 1.0) : cls == 6 ? float3(0.4, 1.0, 1.0) : cls == 7 ? float3(1.0, 1.0, 0.3)
-                 : cls == 8 ? float3(1.0, 0.6, 0.2) : cls == 9 ? float3(0.7, 0.4, 1.0) : float3(1.0, 1.0, 1.0);
+                 : cls == 8 ? float3(1.0, 0.6, 0.2) : cls == 9 ? float3(0.7, 0.4, 1.0) : cls == 4 ? float3(1.0, 0.6, 0.8) : float3(1.0, 1.0, 1.0);
         c *= k;
     }
     return float4(c, 1.0);
@@ -193,7 +211,7 @@ float4 ladder(float2 t, bool worldOnly) {
     if (!worldOnly && okF && bF) return shade(freshTex, sF, 0);
     // The stale test: the held point, carried to now as static, seen from the fresh view. If the fresh eye
     // sees PAST it (nearest fresh depth around the spot is farther), it moved and gives way.
-    bool stale = false;
+    bool stale = false, plant = false;   // plant: kept by afwfoliage (tint pink)
     if (eH < prm2.z) {
         // target view point -> world-model fresh view: invert the fresh world map (rows are orthonormal).
         float3 Lt = viewDir(t, tanT) * tH;
@@ -209,6 +227,13 @@ float4 ladder(float2 t, bool worldOnly) {
                                min(min(zF(uf + float2(2.0 * o.x, 0)), zF(uf - float2(2.0 * o.x, 0))),
                                    min(zF(uf + float2(0, o.y)), zF(uf - float2(0, o.y)))));
                 stale = !isFg(zFr(uf)) && zn > zf * (1.0 + prm2.y) + 0.01;
+                // afwfoliage: a porous held point (needles, leaves, grass) is not stale while the fresh eye still has a speck of
+                // the plant within 6 texels. Before, the rebuilt eye showed what is behind the needles (the tree's dark inside,
+                // the fill) and the next frame its own needles again: trees and grass shimmered at half the frame rate.
+                // Nested: HLSL's && does not skip its right side, and these taps are only needed where the point went stale.
+                [branch] if (stale && xFoliage()) {
+                    [branch] if (porousH(sH, zH(sH))) { if (nearRingF(uf) <= zf * (1.0 + prm2.y) + 0.01) { stale = false; plant = true; } }
+                }
             }
         }
     }
@@ -219,7 +244,7 @@ float4 ladder(float2 t, bool worldOnly) {
     if (prm5.x > 0.0 && tH < prm5.x && !isBody(zHr(sH))) stale = true;
     if (prm5.x > 0.0 && okF && !bF && tF < prm5.x && !isBody(zFr(sF))) return shade(freshTex, sF, 2);
     // 3. The held eye's own world: true stereo, its own shading.
-    if (okH && !bH && !stale && !(okF && tF < tH * (1.0 - prm2.y))) return shade(heldTex, sH, 1);
+    if (okH && !bH && !stale && !(okF && tF < tH * (1.0 - prm2.y))) return shade(heldTex, sH, plant ? 4 : 1);
     // 4. Silhouette near-miss: keep the held near-miss over a farther fresh surface (parallax).
     if (!okH && !stale && !bH && eH < prm2.z && okF && tF > tH * (1.0 + prm2.y)) return shade(heldTex, sH, 6);
     // 5. Fresh world: what moved, what the held image could not see.
@@ -488,7 +513,7 @@ float4 psdiff(VSOut i) : SV_Target {
     std::atomic<bool>             g_held_gun{ false };   // afwheldgun (research): the old way, the held eye's own gun allowed in the fallback
     std::atomic<float>            g_veh_near{ 0.0f };    // afwvehnear: in a vehicle, nearer than this (m) only the fresh image
     std::atomic<float>            g_veh_body{ 0.0f };    // afwvehbody: in a vehicle, nearer than this (m) carried with the vehicle
-    std::atomic<int>              g_experiments{ 0 };    // afwfoot (1), afwrail (2): F11 Experimental > AFW
+    std::atomic<int>              g_experiments{ 0 };    // afwfoot (1), afwrail (2), afwfoliage (4): F11 Debug > AFW
     ID3D11ShaderResourceView*     g_stencil_srv{ nullptr };
     ID3D11Texture2D*              g_stencil_srv_of{ nullptr };
     std::atomic<int>              g_dump{ 0 };
@@ -1045,7 +1070,7 @@ ID3D11Texture2D* rebuild(ID3D11DeviceContext* ctx, int held, const Camera& targe
     set4(p.prm, { float(w), float(h), 1.5f * depth_texel, g_fg_limit.load() });
     set4(p.prm2, { g_tint.load() ? 1.0f : 0.0f, 0.015f, 6.0f, (H.stencil && F.stencil) ? (g_held_gun.load() ? 2.0f : 1.0f) : 0.0f });
     set4(p.prm4, { float(kGridStep) / dw, float(kGridStep) / dh, float(kGridStep) / dw, float(kGridStep) / dh });
-    set4(p.prm5, { g_veh_near.load(), g_veh_body.load(), float(g_experiments.load() & 3), 0.0f });
+    set4(p.prm5, { g_veh_near.load(), g_veh_body.load(), float(g_experiments.load() & 7), 0.0f });
 
     StateScope scope{ ctx };
     bind_common(ctx);
@@ -1222,6 +1247,10 @@ cbuffer C : register(b0) { uint slice; uint W; uint H; uint pad; };
         std::mutex        g_res_mtx;
         Result            g_res{};
         std::vector<float> g_prev[2];
+        // An eye image without a shader view (the swap chain's back buffer: DLAA, no upscaling) is copied here first.
+        ID3D11Texture2D*   g_copy{ nullptr };
+        D3D11_TEXTURE2D_DESC g_copy_desc{};
+        bool               g_copy_logged{ false };
 
         DXGI_FORMAT typed(DXGI_FORMAT f)
         {
@@ -1380,6 +1409,27 @@ cbuffer C : register(b0) { uint slice; uint W; uint H; uint pad; };
         D3D11_TEXTURE2D_DESC sd{};
         image->GetDesc(&sd);
         if (!init(ctx, sd.Width, sd.Height)) return;
+        if (!(sd.BindFlags & D3D11_BIND_SHADER_RESOURCE)) {
+            // DLAA (resscale 1.0): the eye image is the back buffer, which the game made without a shader view
+            // (smoke 24, 28, 30 Oct: "stereo pair check (frame -1): none"). Read it from a copy.
+            if (sd.SampleDesc.Count != 1 || sd.ArraySize != 1 || sd.MipLevels != 1) return;
+            if (!g_copy || g_copy_desc.Width != sd.Width || g_copy_desc.Height != sd.Height || g_copy_desc.Format != sd.Format) {
+                if (g_copy) { g_copy->Release(); g_copy = nullptr; }
+                D3D11_TEXTURE2D_DESC cd{};
+                cd.Width = sd.Width; cd.Height = sd.Height; cd.MipLevels = 1; cd.ArraySize = 1; cd.Format = sd.Format; cd.SampleDesc.Count = 1;
+                cd.Usage = D3D11_USAGE_DEFAULT; cd.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+                if (FAILED(g_d->CreateTexture2D(&cd, nullptr, &g_copy)) || !g_copy) {
+                    if (!g_copy_logged) spdlog::error("[Pair] no copy of the eye image ({}x{} format {})", sd.Width, sd.Height, (int)sd.Format);
+                    g_copy_logged = true;
+                    g_copy = nullptr;
+                    return;
+                }
+                g_copy_desc = sd;
+                spdlog::info("[Pair] the eye image has no shader view (back buffer, no upscaling): read from a {}x{} copy", sd.Width, sd.Height);
+            }
+            ctx->CopyResource(g_copy, image);
+            image = g_copy;
+        }
         D3D11_SHADER_RESOURCE_VIEW_DESC vd{};
         vd.Format = typed(sd.Format);
         vd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;

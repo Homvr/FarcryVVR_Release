@@ -36,6 +36,9 @@ bool FarCry5Stereo::vehcomfort_command(const std::string& cmd, const std::string
     if (cmd == "groundfollow") { m_ground_follow = on; persist = true; return true; }                          // groundfollow on|off (saved)
     if (cmd == "vehvignette") { m_veh_vignette = std::clamp(fv, 0.0f, 1.0f); persist = true; return true; }    // vehvignette 0-1 (saved)
     if (cmd == "vehfly") { m_veh_fly_force = arg == "auto" ? -1 : on ? 1 : 0; return true; }                  // vehfly on|off|auto (test)
+    if (cmd == "vehflyguard") { m_veh_fly_guard = on; persist = true; return true; }                           // vehflyguard on|off (saved)
+    if (cmd == "fallvmin") { m_fall_vmin = std::clamp(fv, 0.0f, 30.0f); persist = true; return true; }         // fallvmin m/s, 0 = off (saved)
+    if (cmd == "chutelevel") { m_chute_level = on; persist = true; return true; }                              // chutelevel on|off (saved)
     return false;
 }
 
@@ -60,10 +63,20 @@ void FarCry5Stereo::veh_comfort_step(std::chrono::steady_clock::time_point now, 
         if (glm::length(up) > 0.5f) tilt = glm::degrees(std::acos(std::clamp(std::abs(glm::normalize(up).z), 0.0f, 1.0f)));
     }
     m_vfly_tilt = tilt;
-    if (!m_veh_flying && m_veh_driving.load() && !m_chute_vehicle) {
+    // vehair: the game says a car, quad, boat or motorcycle: never flying (Homard's 12:31 quad ride read a 45 deg tilt off-road).
+    if (veh_type_grounded()) {
+        if (m_veh_flying) spdlog::info("[VehComfort] vehair: flying cleared (the game says type {}, tilt {:.0f} deg)", m_veh_game_type, tilt);
+        m_veh_flying   = false;
+        m_vfly_climb_t = m_vfly_tilt_t = 0.0f;
+    } else if (!m_veh_flying && m_veh_driving.load() && !m_chute_vehicle) {
         const bool climb = vel.z > 2.0f && vel.z > 1.2f * m_veh_speed;   // steeper than 50 deg: no car climbs that
         m_vfly_climb_t   = climb ? m_vfly_climb_t + dt : std::max(0.0f, m_vfly_climb_t - dt);
-        m_vfly_tilt_t    = tilt > 30.0f ? m_vfly_tilt_t + dt : std::max(0.0f, m_vfly_tilt_t - dt);
+        // vehflyguard (Homard 25 Oct 15:49 log: a parked car read 80 deg of tilt while he looked 74 deg down, its aim frame being the
+        // game camera less a head look the game had not fully applied, and was taken for flying: the view then pitched and rolled
+        // with that wrong attitude for the rest of the drive). The tilt counts only while the vehicle moves (over 3 m/s over the
+        // ground or 1 m/s up or down: nothing banks or noses over standing still) and the head look's pitch is under 25 deg.
+        const bool tilt_ok = !m_veh_fly_guard.load() || ((m_veh_speed > 3.0f || std::abs(vel.z) > 1.0f) && std::abs(m_mo.ev_op) < glm::radians(25.0f));
+        m_vfly_tilt_t    = tilt > 30.0f && tilt_ok ? m_vfly_tilt_t + dt : std::max(0.0f, m_vfly_tilt_t - dt);
         m_vfly_zt += dt;
         if (m_vfly_zt >= 0.25f || m_vfly_zn == 0) {
             m_vfly_zt                = 0.0f;
@@ -120,4 +133,18 @@ void FarCry5Stereo::draw_vehcomfort_menu(const std::function<void(const char*, s
     }
     hint("In a vehicle, the edges of the picture darken while it turns, speeds up, brakes or bumps hard, and clear again when the ride is calm. More = a smaller clear area. "
          "0 = off (default).");
+    bool fg = m_veh_fly_guard.load();
+    if (ImGui::Checkbox("Flying is seen only while the vehicle moves", &fg)) {
+        m_veh_fly_guard = fg;
+        keep("vehflyguard", fg ? "vehflyguard on" : "vehflyguard off");
+    }
+    hint("On (default): a vehicle counts as flying from its tilt only while it moves and you are not looking far down, so a parked car is not taken "
+         "for a plane and the view does not tilt with it. Off: as before 25 Oct.");
+    float fm = m_fall_vmin.load();
+    if (slider("Falls: held as a vehicle once faster than", fm, 0.0f, 12.0f, fm <= 0.001f ? "any fall (as before)" : "%.1f m/s", 0.5f)) {
+        m_fall_vmin = fm;
+        keep("fallvmin", fmt::format("fallvmin {:.1f}", fm));
+    }
+    hint("A fall turns the view with the parachute (the game camera then follows it). Running down a hill sinks 3-4 m/s: below this speed it stays "
+         "on foot and the view does not turn with your running. 6 m/s = default; 0 = any fall over half a second, as before 25 Oct.");
 }

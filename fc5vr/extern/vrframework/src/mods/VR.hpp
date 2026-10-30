@@ -650,6 +650,9 @@ public:
     ID3D11Texture2D* m_fc5_hud_texture{nullptr};
     // Far Cry 5: the eye images' size sent to the headset (DLSS output / resolution multiplier); 0 = the back buffer's.
     static inline uint32_t s_fc5_eye_size[2]{0, 0};
+    // Far Cry 5 F11 menu: the right trigger, which clicks like A (set by ModConfig each frame). OverlayComponent turns A or the
+    // trigger into one left-button state, so holding one while tapping the other is no second click (29 Oct, Homard's 14:50 log).
+    static inline std::atomic<bool> s_fc5_menu_trigger{false};
     // Far Cry 5 HUD panel diagnostics: frames offered with a HUD texture, layers submitted, end-frame passes.
     static inline uint32_t s_fc5_hud_offered{0}, s_fc5_hud_submits{0}, s_fc5_end_frames{0};
     float            m_fc5_hud_distance{1.2f}, m_fc5_hud_width{1.4f}, m_fc5_hud_height{-0.05f}; // this frame's eye image when it is not the back buffer (DLSS upscaling)

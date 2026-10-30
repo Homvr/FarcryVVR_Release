@@ -217,12 +217,12 @@ void FarCry5Stereo::gesture_zones_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D
     }
     fc5::gesture::ZoneView zv[kBalls - 2]{};
     const int              nz = fc5::gesture::zone_views(head, m_left_handed.load(), zv, kBalls - 2);
-    // By gesture: the shoulder (switch weapon), the sling, the throwable.
-    static const float kHue[3][3]{ { 0.25f, 0.6f, 1.0f }, { 1.0f, 0.55f, 0.1f }, { 0.25f, 1.0f, 0.4f } };
+    // By gesture: the shoulder (switch weapon), the sling, the throwable, the sidearm on the hip.
+    static const float kHue[4][3]{ { 0.25f, 0.6f, 1.0f }, { 1.0f, 0.55f, 0.1f }, { 0.25f, 1.0f, 0.4f }, { 0.75f, 0.35f, 1.0f } };
     UINT n = 0;
     for (int i = 0; i < nz; ++i) {
         const auto& z = zv[i];
-        const float* hue = kHue[std::min(i, 2)];
+        const float* hue = kHue[std::min(i, 3)];
         float fill = 0.16f, rim = 0.75f, white = 0.0f;
         float rgb[3]{ hue[0], hue[1], hue[2] };
         if (!z.on) {

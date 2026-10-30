@@ -243,6 +243,17 @@ bool FarCry5Stereo::sight_gun_pose(uint32_t sig, glm::mat4& pose)
     return true;
 }
 
+// gunaxes: a learned sight line's direction and up in the gun's own axes (from the game's aim-down-sights pose).
+bool FarCry5Stereo::sight_axes(uint32_t sig, glm::vec3& d, glm::vec3& u)
+{
+    if (!m_sight) return false;
+    const auto it = m_sight->lines.find(sig);
+    if (it == m_sight->lines.end() || !it->second.ok) return false;
+    d = it->second.d;
+    u = it->second.u;
+    return true;
+}
+
 // The drawn gun's sight line in the controller's axes (o: the aim-down-sights eye point, d: along the line). False without
 // a learned line for the weapon in hand or its held pose.
 bool FarCry5Stereo::sight_line(glm::vec3& o_ctrl, glm::vec3& d_ctrl)
@@ -364,6 +375,7 @@ void FarCry5Stereo::sight_tick()
     }
     if (!can || m_scope_probe_lt.load() || m_lt_sent.load() || now - s.sig_t < std::chrono::seconds(1)) return;
     if (const auto it = s.lines.find(sig); it != s.lines.end() && it->second.ok) return;
+    if (!ads_probe_ok(sig)) return;   // adsprobe: by default only a gun with sight glass is read by pressing aim down sights
     glm::mat4 H{ 1.0f };
     if (!sight_gun_pose(sig, H)) return;
     if (m_trigger.load() || m_dbg_trigger.load()) return;

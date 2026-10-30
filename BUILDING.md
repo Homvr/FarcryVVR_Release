@@ -1,4 +1,4 @@
-# Building the Far Cry 5 VR mod (alpha 0.12.1, commit 4442a1a)
+# Building the Far Cry 5 VR mod (alpha 0.15, commit f667974)
 
 The build makes `dxgi.dll` (the mod) and `FC5VR_Launcher.exe`. Windows 10 or 11, 64-bit.
 

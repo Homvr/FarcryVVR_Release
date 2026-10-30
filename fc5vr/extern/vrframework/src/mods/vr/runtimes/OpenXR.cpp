@@ -40,13 +40,78 @@ VRRuntime::Error OpenXR::synchronize_frame(int frame) {
 
     XrFrameWaitInfo frame_wait_info{XR_TYPE_FRAME_WAIT_INFO};
     {
-        // Far Cry 5 xrhalf: every pair spans exactly two refreshes. The period is the runtime's own (the last frame state).
+        // Far Cry 5 framelock (29 Oct, replaces xrhalf; Homard 29 Oct "the movement are too juddery and janky for vr"): every
+        // picture is shown for the same number of refreshes. His log: AFW made 74-78 pictures a second for a 90 Hz headset (GPU
+        // ~12.5 ms each), Stereo ~50 pairs (~21 ms each), so the headset showed each picture for one refresh or two, unevenly,
+        // and the world stalled and jumped while moving. auto: two refreshes per picture at 85 Hz or more once over 10 % of the
+        // last 2 s of pictures took longer than a refresh (their work, from the last xrWaitFrame's return to this call), back to
+        // one under 3 % for 4 s; one below 85 Hz (two would be 40 or 36 a second). The period is the runtime's own.
+        // Back-off (Homard 29 Oct 12:49 log: auto changed 19 times in 7 minutes, every 4-10 s, as at 45 a second the GPU has room and
+        // the pictures come in early): each time it has to halve again within 20 s of going back to one, the calm time needed to go back
+        // doubles (4, 8, 16, 32, 60 s); a minute at one refresh resets it.
+        // Mode switch (Homard 29 Oct 13:54, "lost a lot of FPS and ... trouble getting them back up": F11 switched Stereo to AFW at
+        // 14:50:28 and auto stayed at two refreshes, its wait grown to a minute in Stereo): Stereo pairs at 85 Hz or more are always two
+        // (a pair is ~20-22 ms of GPU, never inside one refresh); a switch between Stereo and AFW starts auto afresh (AFW at one refresh,
+        // the back-off at 4 s).
         static double period_ms = 0.0;
         if (const auto p = this->pipeline_state.frame_state.predictedDisplayPeriod; p > 0) period_ms = double(p) / 1e6;
         const auto last_return = s_fc5_last_wait_return;
-        if (s_fc5_xr_half.load() && period_ms > 5.0 && period_ms < 20.0 && last_return.time_since_epoch().count() != 0) {
+        const auto t0          = std::chrono::steady_clock::now();
+        if (period_ms > 5.0 && period_ms < 20.0 && last_return.time_since_epoch().count() != 0) {
+            static uint32_t frames = 0, over = 0, calm = 0, hold = 2;   // hold: calm 2 s windows needed to go back to one
+            static auto     window = t0;
+            static std::chrono::steady_clock::time_point back{};      // when it last went back to one
+            static int      pairs_was = -1;
+            const int       pairs     = s_fc5_lock_pairs.load();
+            if (pairs != pairs_was && s_fc5_frame_lock.load() < 0 && pairs_was >= 0 && pairs >= 0) {
+                const int n = pairs == 1 && period_ms <= 11.8 ? 2 : 1;
+                frames = over = calm = 0;
+                hold   = 2;
+                back   = {};
+                window = t0;
+                s_fc5_lock_n = n;
+                spdlog::info("[VR] framelock auto: {} now, starting afresh: {} refresh{} per picture ({:.0f} a second)", pairs ? "Stereo pairs" : "one eye a frame (AFW)",
+                             n, n == 1 ? "" : "es", 1000.0 / (n * period_ms));
+            }
+            pairs_was = pairs;
+            const double    work   = std::chrono::duration<double, std::milli>(t0 - last_return).count();
+            if (work < 250.0) {
+                ++frames;
+                if (work > 0.95 * period_ms) ++over;
+            }
+            if (t0 - window >= std::chrono::seconds(2)) {
+                const int mode  = s_fc5_frame_lock.load();
+                const int pct   = frames ? int(100.0 * over / frames + 0.5) : 0;
+                const int was   = s_fc5_lock_n.load();
+                int       n     = was;
+                if (mode >= 0) n = std::clamp(mode, 1, 2);
+                else if (period_ms > 11.8) n = 1;
+                else if (pairs == 1) n = 2;   // Stereo pairs at 85 Hz or more
+                else if (n == 1) {
+                    if (pct > 10) {
+                        n = 2;
+                        if (t0 - back < std::chrono::seconds(20)) hold = std::min(hold * 2, 30u);
+                    } else if (t0 - back > std::chrono::seconds(60)) hold = 2;
+                } else {
+                    calm = pct < 3 ? calm + 1 : 0;
+                    if (calm >= hold) {
+                        n    = 1;
+                        back = t0;
+                    }
+                }
+                if (n != 2) calm = 0;
+                s_fc5_lock_n        = n;
+                s_fc5_lock_over_pct = pct;
+                if (n != was)
+                    spdlog::info("[VR] framelock {}: {} refresh{} per picture ({:.0f} a second); {}% of the last {} pictures took longer than a refresh ({:.2f} ms); "
+                                 "back to one after {} s under 3 %",
+                                 mode < 0 ? "auto" : mode == 0 ? "off" : "fixed", n, n == 1 ? "" : "es", 1000.0 / (n * period_ms), pct, frames, period_ms, 2 * hold);
+                frames = over = 0;
+                window = t0;
+            }
+        }
+        if (s_fc5_lock_n.load() == 2 && period_ms > 5.0 && period_ms < 20.0 && last_return.time_since_epoch().count() != 0) {
             const auto target = last_return + std::chrono::microseconds(int64_t((2.0 * period_ms - 2.0) * 1000.0));
-            const auto t0     = std::chrono::steady_clock::now();
             if (target > t0 && target - t0 < std::chrono::milliseconds(40)) {
                 while (std::chrono::steady_clock::now() + std::chrono::milliseconds(2) < target) std::this_thread::sleep_for(std::chrono::milliseconds(1));
                 while (std::chrono::steady_clock::now() < target) std::this_thread::yield();
@@ -91,9 +156,10 @@ VRRuntime::Error OpenXR::synchronize_frame(int frame) {
         last_display = fs.predictedDisplayTime;
         if (std::chrono::steady_clock::now() - last_log > std::chrono::seconds(5)) {
             last_log = std::chrono::steady_clock::now();
-            spdlog::info("[VR] pacing: {} waits, display period {:.2f} ms, step min {:.2f} max {:.2f} ms, {} steps over 1.5 periods, {} repeated, {} backwards, {} shouldRender=false; CPU ms per XR frame: xrWaitFrame {:.2f}, xrEndFrame {:.2f}, eye copies {:.2f}",
+            spdlog::info("[VR] pacing: {} waits, display period {:.2f} ms, step min {:.2f} max {:.2f} ms, {} steps over 1.5 periods, {} repeated, {} backwards, {} shouldRender=false; CPU ms per XR frame: xrWaitFrame {:.2f}, xrEndFrame {:.2f}, eye copies {:.2f}; framelock {} ({} per picture, {}% over a refresh)",
                          waits, double(fs.predictedDisplayPeriod) / 1e6, min_ms, max_ms, skipped_periods, repeats, backwards, no_render, s_fc5_wait_ms / std::max(1u, waits),
-                         s_fc5_end_ms / std::max(1u, waits), s_fc5_copy_ms / std::max(1u, waits));
+                         s_fc5_end_ms / std::max(1u, waits), s_fc5_copy_ms / std::max(1u, waits), s_fc5_frame_lock.load() < 0 ? "auto" : s_fc5_frame_lock.load() == 0 ? "off" : "fixed",
+                         s_fc5_lock_n.load(), s_fc5_lock_over_pct.load());
             s_fc5_wait_ms = s_fc5_end_ms = s_fc5_copy_ms = 0.0;
             waits = repeats = backwards = no_render = skipped_periods = 0;
             min_ms = 1e9;
@@ -449,6 +515,7 @@ VRRuntime::Error OpenXR::consume_events(std::function<void(void*)> callback) {
             this->session_state = ev->state;
 
             spdlog::info("VR: XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED {}", ev->state);
+            spdlog::default_logger()->flush();   // fc5vr: a quit often follows a focus change; the buffered log keeps its last second
 
             if (ev->state == XR_SESSION_STATE_READY) {
                 spdlog::info("VR: XR_SESSION_STATE_READY");

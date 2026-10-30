@@ -36,6 +36,31 @@ namespace fc5::dlss
         std::atomic<int>      g_preset{ 11 };   // preset K (Homard 13 Oct: preset M smeared the near ground)
         NVSDK_NGX_Handle*     g_feature[2]{};
         UINT                  g_feature_w[2]{}, g_feature_h[2]{}, g_feature_ow[2]{};
+        // The previous size's feature per eye, kept: menus run DLSS at 1920x1080, the world at the eye size, and creating a
+        // feature took 50-80 ms per eye at each switch (Homard's 27 Oct 21:35 log: 10 creations, 86-114 ms frames).
+        NVSDK_NGX_Handle*     g_spare[2]{};
+        UINT                  g_spare_w[2]{}, g_spare_h[2]{}, g_spare_ow[2]{};
+        std::atomic<int>      g_spare_reuses{ 0 };
+
+        // OFXR Bridge's DLSS frame generation (and its FSR / hybrid routes) takes the motion vectors and depth of the DLSS
+        // evaluation whose output reaches an eye image: it tags the output texture (private data) and follows the tag through
+        // full copies. The game's passes after DLSS (SMAA target, HUD) are draws, so no eye image ever carried it and OFXR
+        // skipped every frame ("native_stereo_unavailable", 30 Oct). Each eye's tag is kept here and put on that eye's
+        // swapchain image just before it is released (tag_xr_image). Layout and GUID from OFXR v663 d3d11_dlss_guides.
+        struct OfxrReceipt { uint64_t owner, stream, publication; uint32_t width, height; };
+        constexpr GUID kOfxrReceipt{ 0x62935ac7, 0x5aac, 0x47d9, { 0xaa, 0x59, 0x97, 0x61, 0x46, 0x3f, 0x96, 0x28 } };
+        OfxrReceipt           g_receipt[2]{};
+        std::atomic<bool>     g_ofxr_tags{ true };
+        std::atomic<uint32_t> g_tags_set{ 0 }, g_tags_size{ 0 };
+
+        void keep_ofxr_receipt(int eye, ID3D11Resource* output)
+        {
+            if (eye < 0 || eye > 1 || output == nullptr) return;
+            OfxrReceipt r{};
+            UINT        n = sizeof(r);
+            if (FAILED(output->GetPrivateData(kOfxrReceipt, &n, &r)) || n != sizeof(r) || r.publication == 0) r = {};
+            g_receipt[eye] = r;
+        }
 
         ID3D11ComputeShader* g_decode_cs = nullptr; // encoded R8G8 -> pixel motion R16G16F
         ID3D11ComputeShader* g_cammv_cs = nullptr;  // exact camera motion (kCamMv)
@@ -70,6 +95,11 @@ namespace fc5::dlss
     // while standing still (simulator, 19 Oct); its history then landed beside it. Where the previous depth matches the
     // point staying put and not the game's motion, it is taken as still.
     std::atomic<bool>    g_mv_check{ true };
+    // dlssmvsway (Homard 30 Oct: foliage smeared even standing still, the sign and chains beside it sharp): with dlssmvbest the
+    // game's object motion counted only above 2 px + 15 % of the camera motion, so leaves and grass swaying a pixel or two a
+    // frame were reprojected as still. Their small vectors are precise (the 8-bit code is quartic: ~0.1 px steps at 1 px), so
+    // with this the cut-off is these px + 5 %. 0 = off.
+    std::atomic<float>   g_mv_sway{ 0.0f };
     std::atomic<int>     g_mv_dump{ 0 };   // cmd dlssmvdump (test): the next N evaluations' game, camera and final vectors and depth to probes
         ID3D11ComputeShader* g_depth_cs  = nullptr; // any depth SRV -> R32F
         ID3D11ComputeShader* g_copy_cs   = nullptr; // colour SRV -> typed UAV (output -> target is a copy)
@@ -163,6 +193,7 @@ RWTexture2D<float2> g_camonly : register(u1);
 cbuffer C : register(b0) { float4 inv0, inv1, inv2, inv3; float4 pr0, pr1, pr2, pr3; float4 prm; float4 prm2; float4 rr0, rr1, rr2, rr3; float4 bb0, bb1, bb2, bb3; float4 prm3; };
 // prm3.y: dlssmvbest (each pixel's game vector compared with both the camera motion with and without the move).
 // prm3.z: dlssmvcheck with this eye's previous depth bound at t3.
+// prm3.w > 0: dlssmvsway, the object-motion cut-off in px under dlssmvbest (plus 5 % of the camera motion) instead of prm.z / prm.w.
 // prm2.x: object motion scale (AFW); prm2.y > 0: stencil bits of the weapon pass (gun, hands), never scaled: its
 // vectors come from the weapon camera's own previous view, which already spans this eye's whole history.
 // prm2.z, prm2.w: unused (dlssmvnbr, dlssmvtrans until 18 Oct). rr: this eye's previous camera without its move (rotation only), as the
@@ -248,8 +279,9 @@ void main(uint2 tid : SV_DispatchThreadID)
             const float2 g = mv;
             const float2 ref = (!gun && haveRot && length(g - rot) < length(g - cam)) ? rot : cam;
             const float2 r = g - ref;
-            const float  rel = prm.y > 1.5f ? 0.0f : prm.w;   // mode 1: plus 15 % of the camera motion; mode 3: 1.5 px flat
-            bool moving = length(r) > prm.z + rel * length(ref);
+            const float  rel = prm3.w > 0.0f ? 0.05f : prm.y > 1.5f ? 0.0f : prm.w;   // mode 1: plus 15 % of the camera motion; mode 3: 1.5 px flat
+            const float  thr = prm3.w > 0.0f ? prm3.w : prm.z;                          // dlssmvsway: swaying leaves pass
+            bool moving = length(r) > thr + rel * length(ref);
             // A game vector at its 8-bit code's end (0.1 of the view per frame: a very fast turn) is clipped, not an object's motion.
             if (moving && !gun && any(abs(mv) >= 0.099f * float2(w, h))) moving = false;
             if (moving && !gun) {
@@ -261,8 +293,8 @@ void main(uint2 tid : SV_DispatchThreadID)
                 [loop] for (int i = 0; i < 16; ++i) {
                     const int2 n = b + int2(i & 3, i >> 2);
                     float2 cf, cr;
-                    if (camAt(n, w, h, false, cf) && length(g - cf) <= prm.z + rel * length(cf)) { moving = false; break; }
-                    if (haveRot && camAt(n, w, h, true, cr) && length(g - cr) <= prm.z + rel * length(cr)) { moving = false; break; }
+                    if (camAt(n, w, h, false, cf) && length(g - cf) <= thr + rel * length(cf)) { moving = false; break; }
+                    if (haveRot && camAt(n, w, h, true, cr) && length(g - cr) <= thr + rel * length(cr)) { moving = false; break; }
                 }
             }
             if (moving && !gun && prm3.z > 0.5f) {
@@ -603,6 +635,61 @@ void main(uint2 tid : SV_DispatchThreadID)
     int  preset() { return g_preset.load(); }
     void set_enabled(bool on) { g_enabled = on; if (!on) g_status = "off"; if (on && !g_ready) g_init_tried = false; }
     bool enabled() { return g_enabled.load(); }
+
+    void tag_xr_image(int eye, ID3D11Texture2D* image)
+    {
+        if (!g_ofxr_tags.load() || eye < 0 || eye > 1 || image == nullptr) return;
+        if (g_receipt[eye].publication == 0) {
+            // OFXR knows only DLSS features created after it hooked NGX, which it does once the XR session runs; the
+            // mod's features may be older (the menu). Untagged outputs while the headset gets images: new features,
+            // at most 3 times.
+            static uint32_t untagged = 0, retries = 0;
+            static const bool ofxr = GetModuleHandleW(L"XR_APILAYER_XRFrameBridge_diagnostic.dll") != nullptr;
+            if (ofxr && g_ready && ++untagged >= 600 && retries < 3) {
+                untagged = 0;
+                retries++;
+                g_recreate = true;
+                spdlog::info("[DLSS] ofxrguides: no OFXR tag on the DLSS output after 600 eye images: DLSS features recreated ({} of 3)", retries);
+            }
+            return;
+        }
+        D3D11_TEXTURE2D_DESC d{};
+        image->GetDesc(&d);
+        // OFXR accepts a tag only on an image of the DLSS output's size (a stretched eye image is not that output).
+        if (d.Width != g_receipt[eye].width || d.Height != g_receipt[eye].height) { g_tags_size++; return; }
+        if (SUCCEEDED(image->SetPrivateData(kOfxrReceipt, sizeof(OfxrReceipt), &g_receipt[eye]))) g_tags_set++;
+    }
+    void set_ofxr_tags(bool on) { g_ofxr_tags = on; }
+    bool ofxr_tags() { return g_ofxr_tags.load(); }
+    std::string ofxr_tag_stats()
+    {
+        // Diagnosis (30 Oct): whether OFXR hooked NGX's D3D11 entries (an inline hook starts with a jump) and what its guide
+        // statistics say (OFXR_DlssGuideStatisticsV2, provider API v2 of v663).
+        std::string hooks;
+        for (const wchar_t* m : { L"_nvngx.dll", L"nvngx_dlss.dll" }) {
+            const HMODULE h = GetModuleHandleW(m);
+            for (const char* fn : { "NVSDK_NGX_D3D11_CreateFeature", "NVSDK_NGX_D3D11_CreateFeature1", "NVSDK_NGX_D3D11_EvaluateFeature" }) {
+                const auto* p = h ? reinterpret_cast<const uint8_t*>(GetProcAddress(h, fn)) : nullptr;
+                hooks += fmt::format(" {}{}={}", m[0] == L'_' ? "core:" : "dlss:", fn + 16, p ? fmt::format("{:02x}", *p) : std::string("-"));
+            }
+        }
+        struct Stats { uint32_t size, version; uint64_t published, depth, invalid, copies, copy_failures, resolves, missing, stale, queue_mismatch,
+                       matched, temporal, invalid_rej, used, last_used; uint32_t status; uint64_t fsr_attempts, fsr_used, fsr_failures; uint32_t fsr_status; };
+        std::string stats = " no OFXR stats";
+        if (const HMODULE layer = GetModuleHandleW(L"XR_APILAYER_XRFrameBridge_diagnostic.dll")) {
+            using Fn = int (*)(Stats*);
+            if (auto f = reinterpret_cast<Fn>(GetProcAddress(layer, "OFXR_GetDlssGuideStatisticsV2"))) {
+                Stats s{};
+                s.size = sizeof(s);
+                s.version = 2;
+                const int r = f(&s);
+                stats = fmt::format(" OFXR guides (r {}): published {}, with depth {}, invalid {}, copy failures {}, resolves {}, missing streams {}, used {}, status {}", r,
+                                    s.published, s.depth, s.invalid, s.copy_failures, s.resolves, s.missing, s.used, s.status);
+            }
+        }
+        return fmt::format("{} eye images tagged, {} of another size; last publications L {} R {};{}{}", g_tags_set.exchange(0), g_tags_size.exchange(0),
+                           g_receipt[0].publication, g_receipt[1].publication, hooks, stats);
+    }
     std::string status() { return g_status; }
 
     void set_sharpness(float s) { g_sharpness = std::clamp(s, 0.0f, 1.0f); }
@@ -767,6 +854,8 @@ void main(uint2 tid : SV_DispatchThreadID)
     void set_motion_best(bool on) { g_mv_best = on; }
     void set_motion_check(bool on) { g_mv_check = on; }
     bool motion_check() { return g_mv_check.load(); }
+    void set_motion_sway(float px) { g_mv_sway = std::clamp(px, 0.0f, 2.0f); }
+    float motion_sway() { return g_mv_sway.load(); }
     bool motion_best() { return g_mv_best.load(); }
     std::atomic<int> g_mv_dump_total{ 0 };
     void motion_dump(int n) { g_mv_dump_total = n; g_mv_dump = n; }
@@ -907,6 +996,7 @@ void main(uint2 tid : SV_DispatchThreadID)
                     const int  pe   = eye & 1;
                     const bool pchk = g_mv_check.load() && g_mv_best.load() && !reset && g_prev_depth_ok[pe] && g_prev_depth[pe].w == w && g_prev_depth[pe].h == h;
                     cb[74] = pchk ? 1.0f : 0.0f;                                  // prm3.z
+                    cb[75] = std::max(0.0f, g_mv_sway.load());                    // prm3.w: dlssmvsway
                     ctx->UpdateSubresource(g_cammv_cb, 0, nullptr, cb, 0, 0);
                     ID3D11ComputeShader*       prev_cs = nullptr;
                     ctx->CSGetShader(&prev_cs, nullptr, nullptr);
@@ -1072,14 +1162,30 @@ void main(uint2 tid : SV_DispatchThreadID)
             }
             if (g_recreate.exchange(false)) {
                 for (auto& f : g_feature) { if (f) NVSDK_NGX_D3D11_ReleaseFeature(f); f = nullptr; }
+                for (auto& f : g_spare) { if (f) NVSDK_NGX_D3D11_ReleaseFeature(f); f = nullptr; }
             }
             g_render_w = w;
             const bool up = g_out_w > w && g_out_h > h;
             const UINT ow = up ? g_out_w : w, oh = up ? g_out_h : h;
             if (up && !make_tex(g_hi, ow, oh, work)) { g_status = "upscale texture allocation failed"; break; }
+            if (g_feature[eye] && (g_feature_w[eye] != w || g_feature_h[eye] != h || g_feature_ow[eye] != ow) && g_spare[eye] &&
+                g_spare_w[eye] == w && g_spare_h[eye] == h && g_spare_ow[eye] == ow) {
+                // Back to the kept size: swap the two (its history is old, so it starts again).
+                std::swap(g_feature[eye], g_spare[eye]);
+                std::swap(g_feature_w[eye], g_spare_w[eye]);
+                std::swap(g_feature_h[eye], g_spare_h[eye]);
+                std::swap(g_feature_ow[eye], g_spare_ow[eye]);
+                if (g_spare_reuses.fetch_add(1) < 8)
+                    spdlog::info("[DLSS] feature for eye {} reused: {}x{} -> {}x{} (kept from before; {}x{} kept in its place)", eye, w, h, ow, oh, g_spare_w[eye], g_spare_h[eye]);
+                reset = true;
+            }
             if (!g_feature[eye] || g_feature_w[eye] != w || g_feature_h[eye] != h || g_feature_ow[eye] != ow) {
-                if (g_feature[eye]) NVSDK_NGX_D3D11_ReleaseFeature(g_feature[eye]);
-                g_feature[eye] = nullptr;
+                if (g_spare[eye]) NVSDK_NGX_D3D11_ReleaseFeature(g_spare[eye]);
+                g_spare[eye]    = g_feature[eye];   // kept for a switch back (a menu and the world)
+                g_spare_w[eye]  = g_feature_w[eye];
+                g_spare_h[eye]  = g_feature_h[eye];
+                g_spare_ow[eye] = g_feature_ow[eye];
+                g_feature[eye]  = nullptr;
                 NVSDK_NGX_DLSS_Create_Params cp{};
                 cp.Feature.InWidth = w; cp.Feature.InHeight = h;
                 cp.Feature.InTargetWidth = ow; cp.Feature.InTargetHeight = oh;
@@ -1116,8 +1222,20 @@ void main(uint2 tid : SV_DispatchThreadID)
             ep.InRenderSubrectDimensions = { w, h };
             ep.InReset           = reset ? 1 : 0;
             ep.InMVScaleX = 1.0f; ep.InMVScaleY = 1.0f;
+            {
+                // ofxrguides: OFXR refuses a DLSS evaluation without a frame time as its frame generation's guides
+                // ("invalid publication", 30 Oct); 0 was passed. The time since this eye's last evaluation, 1-100 ms.
+                static LARGE_INTEGER last[2]{}, freq{};
+                LARGE_INTEGER now{};
+                if (!freq.QuadPart) QueryPerformanceFrequency(&freq);
+                QueryPerformanceCounter(&now);
+                const float ms = last[eye].QuadPart ? float(double(now.QuadPart - last[eye].QuadPart) * 1000.0 / double(freq.QuadPart)) : 11.1f;
+                last[eye] = now;
+                ep.InFrameTimeDeltaInMsec = std::clamp(ms, 1.0f, 100.0f);
+            }
             const auto r = NGX_D3D11_EVALUATE_DLSS_EXT(ctx, g_feature[eye], g_params, &ep);
             if (NVSDK_NGX_FAILED(r)) { g_status = fmt::format("evaluation failed 0x{:x}", (uint32_t)r); break; }
+            keep_ofxr_receipt(eye, ep.Feature.pInOutput);
             if (up) {
                 // The game's own low-resolution path goes on (SMAA, then the HUD); the eye image is
                 // composed at present from the DLSS output and the HUD.

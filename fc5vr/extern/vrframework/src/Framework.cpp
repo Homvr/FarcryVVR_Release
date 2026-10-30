@@ -1207,8 +1207,10 @@ void Framework::draw_ui() {
         }
         //m_dinput_hook->acknowledge_input();
         // ImGui::GetIO().MouseDrawCursor = false;
+        m_fc5_notice_on = m_fc5_notice && m_error.empty() && m_game_data_initialized && m_fc5_notice();
         return;
     }
+    m_fc5_notice_on = false;
 
     // UI Specific code:
     m_is_ui_focused = ImGui::IsWindowFocused(ImGuiFocusedFlags_AnyWindow);

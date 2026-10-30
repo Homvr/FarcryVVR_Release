@@ -9,6 +9,8 @@
 #include "ModSettings.h"
 #include "FarCry5/FarCry5Stereo.h"
 #include "FarCry5/FarCry5Probe.h"
+#include "FarCry5/FarCry5Lua.h"
+#include "FarCry5/FarCry5LoadPopup.h"
 
 namespace ModSettings {
     // HudScale g_hudScale;
@@ -119,6 +121,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         return h == m_left_joystick ? pad_sim.lgrip : pad_sim.rgrip;
     };
     if (!is_using_controllers()) {
+        VR::s_fc5_menu_trigger = false;
         return;
     }
     // The VR controllers are the whole pad: whatever a physical or emulated pad in this slot reports
@@ -167,10 +170,16 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     if (g_framework->is_drawing_ui()) {
         // The F11 menu: right stick scrolls / nudges sliders, the right trigger clicks.
         const auto axis = axis_of(right_joystick);
-        FarCry5Stereo::Get()->set_menu_input(axis.x, axis.y, is_action_active(m_action_trigger, right_joystick));
+        const bool trigger = is_action_active(m_action_trigger, right_joystick);
+        FarCry5Stereo::Get()->set_menu_input(axis.x, axis.y, trigger);
+        VR::s_fc5_menu_trigger = trigger;   // clicks through OverlayComponent, with A
         return;
     }
     FarCry5Stereo::Get()->set_menu_input(0.0f, 0.0f, false);
+    VR::s_fc5_menu_trigger = false;
+    // loadpopup (FarCry5LoadPopup.cpp): while "VR mod loading" shows, the player's grips, triggers, buttons and sticks do not reach the game;
+    // the mod's own presses (the look at the sidearm slot) and the camera's steering onto the head still do.
+    const bool load_block = fc5::loadpopup::blocking();
 
     // One button layout (the F11 Layout tab; the "A jump, B reload, X interact, Y switch weapon" choice was removed 24 Oct, Homard).
     if (is_right_a_button_down) {
@@ -184,8 +193,23 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     const auto& b_button_left = !wants_swap ? m_action_b_button_left : m_action_b_button_right;
     const auto& b_button_right = !wants_swap ? m_action_b_button_right : m_action_b_button_left;
 
-    const auto is_right_b_button_down = is_action_active_any_joystick(b_button_right);
+    const auto is_right_b_raw = !load_block && is_action_active_any_joystick(b_button_right);
     const auto is_left_b_button_down = is_action_active_any_joystick(b_button_left);
+    // popupesc (FarCry5Stereo::popup_esc_now): a press that starts while a tutorial pop-up has paused the game sends Esc, the
+    // pop-up's only key, and is not the pad's Y (nor RB with the left grip) until released.
+    // (Atomics: the game's polls and the virtual pad's updates both come here; one of them takes the press.)
+    static std::atomic<bool> right_b_was{ false }, right_b_esc{ false };
+    if (is_right_b_raw) {
+        if (!right_b_was.exchange(true)) {
+            const bool esc = FarCry5Stereo::Get()->popup_esc_now();
+            right_b_esc    = esc;
+            if (esc) FarCry5Stereo::Get()->popup_esc_tap();
+        }
+    } else {
+        right_b_was = false;
+        right_b_esc = false;
+    }
+    const auto is_right_b_button_down = is_right_b_raw && !right_b_esc.load();
 
     if (is_right_b_button_down) {
         pXinputGamepad->wButtons |= XINPUT_GAMEPAD_Y;
@@ -207,12 +231,12 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     }
 
 
-    const auto is_left_trigger_down = is_action_active(m_action_trigger, left_joystick);
-    const auto is_right_trigger_down = is_action_active(m_action_trigger, right_joystick);
+    const auto is_left_trigger_down = !load_block && is_action_active(m_action_trigger, left_joystick);
+    const auto is_right_trigger_down = !load_block && is_action_active(m_action_trigger, right_joystick);
     // Body gestures (FarCry5Gesture.cpp): a grip press that starts in a gesture's zone (the weapon hand at its shoulder:
     // switch weapon) taps the gesture's pad buttons, and that press is not the grip's usual action until released.
-    const auto is_left_grip_raw  = grip_of(left_joystick);
-    const auto is_right_grip_raw = grip_of(right_joystick);
+    const auto is_left_grip_raw  = !load_block && grip_of(left_joystick);
+    const auto is_right_grip_raw = !load_block && grip_of(right_joystick);
     {
         // fingergrip: the index and the thumb follow the real ones (trigger pressed / touched; the thumb on a face button,
         // the thumbrest, or moving or pressing the stick).
@@ -252,6 +276,10 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     const bool grab_attempt     = !pad_sim.old && !FarCry5Stereo::Get()->other_grip_decided() &&
                               input_now - left_grip_pressed_at < std::chrono::milliseconds(150);
     const auto is_left_grip_down = is_left_grip_button_down && !FarCry5Stereo::Get()->two_hand_held() && !grab_attempt;
+    // vehtriggers left (FarCry5VehTransition.cpp): driving, the left hand drives (left trigger throttle, left grip brake) and the right hand
+    // shoots (right trigger = LB); the right grip sends nothing (it holds the weapon). The left grip stays the modifier for the right stick
+    // (D-pad), right B (throw / rockets) and the menu button (map), but the left stick keeps steering while it brakes.
+    const bool veh_left = FarCry5Stereo::Get()->veh_triggers_swapped();
     // A stick already pushed when the grip becomes the modifier (walking or turning while reaching for the gun, or the
     // hold ending while walking) keeps its own use until it comes back to the centre; then it is the D-pad.
     static bool grip_mod_was = false, grip_dpad_left = false, grip_dpad_right = false;
@@ -271,6 +299,9 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         }
         grip_mod_was = is_left_grip_down;
         if (pad_sim.old) grip_dpad_left = grip_dpad_right = is_left_grip_down;
+        // gesturemisswalk: a grip pressed just outside a gesture zone (a missed grab) leaves the left stick walking.
+        if (gesture.miss_press[left_role]) grip_dpad_left = false;
+        if (veh_left) grip_dpad_left = false;   // vehtriggers left: braking with the left grip, the left stick still steers
     }
 
 
@@ -298,23 +329,58 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         pXinputGamepad->wButtons &= ~XINPUT_GAMEPAD_BACK;
     }
 
-    // Right grip: LT in a vehicle (brake / reverse) and on the flat screen. Right trigger: RT (fire, throttle).
+    // Right grip: LT in a vehicle (brake / reverse; with vehtriggers left the left grip, below) and on the flat screen. Right trigger: RT (fire, throttle).
     // On foot LT is aim down sights, which narrows the game camera the game culls with: the grip never sends it there
     // ("Right grip aims down sights", gripads, was removed 24 Oct, Homard).
     // scopelearn: a short aim-down-sights press to read a gun's scope zoom (FarCry5Scope.cpp).
-    if ((is_right_grip_down && FarCry5Stereo::Get()->grip_sends_lt()) || FarCry5Stereo::Get()->debug_lt() || FarCry5Stereo::Get()->scope_probe_lt()) {
+    // vehtriggers left: driving, LT (brake / reverse, throttle down, descend) comes from the left grip instead; a press that is also used
+    // for a combo (right B, the menu button, the right stick as D-pad) stops braking until let go, and one held when the layout changes
+    // waits until let go.
+    bool left_grip_lt = false;
+    {
+        static std::atomic<bool> was_left{ false }, lgrip_wait{ false }, lgrip_combo{ false };
+        if (veh_left != was_left.exchange(veh_left)) lgrip_wait = is_left_grip_button_down;
+        if (!is_left_grip_button_down) lgrip_wait = false;
+        const auto ra    = axis_of(right_joystick);
+        const bool combo = is_right_b_button_down || system_button_down || (grip_dpad_right && (std::abs(ra.x) >= 0.5f || std::abs(ra.y) >= 0.5f));
+        if (!is_left_grip_down) lgrip_combo = false;
+        else if (combo) lgrip_combo = true;
+        left_grip_lt = veh_left && is_left_grip_down && !lgrip_wait.load() && !lgrip_combo.load();
+    }
+    const bool right_grip_lt = is_right_grip_down && FarCry5Stereo::Get()->grip_sends_lt() && !veh_left;
+    if (right_grip_lt || left_grip_lt || FarCry5Stereo::Get()->debug_lt() || FarCry5Stereo::Get()->scope_probe_lt()) {
         pXinputGamepad->bLeftTrigger = 255;
     }
     FarCry5Stereo::Get()->note_lt(pXinputGamepad->bLeftTrigger > 128);
     FarCry5Stereo::Get()->note_grip(FarCry5Stereo::Get()->left_handed() ? is_left_grip_button_down : is_right_grip_down);
 
-    if (is_right_trigger_down) {
-        pXinputGamepad->bRightTrigger = 255;
-    }
-
-    // Left trigger: LB (hold: the weapon wheel on foot; shoot from a vehicle).
-    if (is_left_trigger_down) {
-        pXinputGamepad->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+    // Right trigger: RT (fire; the throttle while driving with vehtriggers right). Left trigger: LB (hold: the weapon wheel on foot; shoot from a vehicle).
+    // vehtriggers left: driving, the two swap: the right trigger is the game's vehicle fire (LB: the sidearm drawn
+    // and fired, or the vehicle's guns) and the left trigger the throttle (RT). A trigger held when the layout changes (getting in or out, a seat
+    // change) sends nothing until it is let go: a held throttle does not open the weapon wheel, a held fire does not accelerate.
+    {
+        static std::atomic<bool> was_swapped{ false }, right_wait{ false }, left_wait{ false }, shot_was{ false };
+        const bool swapped = veh_left;
+        if (swapped != was_swapped.exchange(swapped)) {
+            right_wait = is_right_trigger_down;
+            left_wait  = is_left_trigger_down;
+            FarCry5Stereo::Get()->note_veh_triggers(swapped, is_right_trigger_down, is_left_trigger_down);
+        }
+        if (!is_right_trigger_down) right_wait = false;
+        if (!is_left_trigger_down) left_wait = false;
+        const bool right = is_right_trigger_down && !right_wait.load(), left = is_left_trigger_down && !left_wait.load();
+        if (swapped ? left : right) {
+            pXinputGamepad->bRightTrigger = 255;
+        }
+        if (swapped ? right : left) {
+            pXinputGamepad->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
+        }
+        const bool shot = swapped && right;
+        if (shot && !shot_was.exchange(true)) FarCry5Stereo::Get()->m_vt_shots++;
+        if (!shot) shot_was = false;
+        // vehdrivegun: when the right trigger last sent LB while driving (a weapon view soon after is the driver's sidearm).
+        if (shot) FarCry5Stereo::Get()->m_vt_lb_t = std::chrono::steady_clock::now().time_since_epoch().count();
+        FarCry5Stereo::Get()->m_vt_lb_held = shot;
     }
 
 
@@ -418,6 +484,7 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
 
 
     // walkbasis (FarCry5Walk.cpp): the left stick turned so forward is where the head looks, also with a weapon in hand.
+    if (load_block) std::memset(pXinputGamepad, 0, sizeof(*pXinputGamepad));   // loadpopup: nothing of the player's (the gesture's own presses next)
     FarCry5Stereo::Get()->walk_left_stick(pXinputGamepad->sThumbLX, pXinputGamepad->sThumbLY);
 
     pXinputGamepad->wButtons |= gesture.buttons;
@@ -434,12 +501,16 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
     }
     FarCry5Stereo::Get()->note_rb((pXinputGamepad->wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0);
     FarCry5Stereo::Get()->note_pad_buttons(pXinputGamepad->wButtons);   // gunstill: reload (X), sprint (left stick press)
+    // mapsticky: the presses that close the map (B, Back) or open the pause menu (Start) end its hold on the flat screen.
+    FarCry5Stereo::Get()->note_map_close((pXinputGamepad->wButtons & (XINPUT_GAMEPAD_B | XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_START)) != 0);
+    // binoczoom: D-pad up is the game's binocular toggle on foot.
+    FarCry5Stereo::Get()->note_binoc_press((pXinputGamepad->wButtons & XINPUT_GAMEPAD_DPAD_UP) != 0);
 
     // Motion controls: the right stick turns the mod's body frame instead of the game camera, which
     // follows the gun.
     // On the flat screen (menus, the world map) the controllers are a plain pad: sticks pan and zoom,
     // the trigger selects.
-    // Driving: the right trigger is the throttle, never held back for the aim.
+    // Driving: the throttle (RT, from the right or the left trigger, vehtriggers) is never held back for the aim.
     const bool in_vehicle = FarCry5Stereo::Get()->in_vehicle();
     // Sling: a weapon hanging on the sling does not fire.
     if (gesture.slung) pXinputGamepad->bRightTrigger = 0;
@@ -451,6 +522,8 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         pXinputGamepad->sThumbRX = (int16_t)(wx * 32767.0f);
         pXinputGamepad->sThumbRY = (int16_t)(wy * 32767.0f);
     }
+    // sidearm (sidearmpick wheel, FarCry5Gesture): the hip's pick of the wheel's rightmost slot, LB held with the right stick to the right.
+    if (gesture.wheel) pXinputGamepad->wButtons |= XINPUT_GAMEPAD_LEFT_SHOULDER;
     // Weapon wheel (wheelstick): LB held on foot opens it; the game picks the slot from the right stick.
     FarCry5Stereo::Get()->note_wheel(motion_view && !in_vehicle && (pXinputGamepad->wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0);
     if (motion_view && FarCry5Stereo::Get()->wheel_open()) {
@@ -463,21 +536,61 @@ void VR::on_xinput_get_state(uint32_t* retval, uint32_t user_index, XINPUT_STATE
         if (!in_vehicle) pXinputGamepad->bRightTrigger = FarCry5Stereo::Get()->fire_open() ? 255 : 0;
         FarCry5Stereo::Get()->set_turn_input(float(pXinputGamepad->sThumbRX) / 32767.0f);
         // vehstick: piloting with head look the mouse no longer turns the aircraft: the right stick does (left / right only).
-        const bool veh_stick = FarCry5Stereo::Get()->vehicle_stick_pass();
+        bool veh_stick = FarCry5Stereo::Get()->vehicle_stick_pass();
+        // stickview: in a vehicle the right stick reaches the game only in a helicopter or a plane (vehscript's type; unknown: flying).
+        bool veh_air = true;
+        if (in_vehicle && FarCry5Stereo::Get()->stick_view()) {
+            int drv = -1, type = -1;
+            veh_air = (fc5::lua::vehicle_state(drv, type) == 1 && type >= 0) ? (type == 4 || type == 5) : FarCry5Stereo::Get()->veh_flying();
+            veh_stick = veh_stick && veh_air;
+        }
         // scopezoomstick: on foot the right stick's up / down is not sent to the game; it zooms a scope held with two hands.
         FarCry5Stereo::Get()->note_zoom_stick(in_vehicle ? 0.0f : right_joystick_axis.x, in_vehicle ? 0.0f : right_joystick_axis.y);
         if (!veh_stick) pXinputGamepad->sThumbRX = 0;
+        // helipitch: piloting a helicopter the right stick's up / down goes to the game as its own right stick Y (its look / pitch),
+        // pushed forward = nose down, past a 0.25 dead zone so a turn's sideways push does not pitch. A known other vehicle type
+        // (vehscript) never gets it.
+        const float ry         = float(pXinputGamepad->sThumbRY) / 32767.0f;   // 0 while the left grip makes it the D-pad
+        bool        heli_pitch = FarCry5Stereo::Get()->heli_pitch_pass() && veh_air;
+        if (heli_pitch) {
+            int drv = -1, type = -1;
+            if (fc5::lua::vehicle_state(drv, type) == 1 && type >= 0 && type != 4) heli_pitch = false;
+        }
+        {
+            static bool pitch_was = false;
+            if (heli_pitch != pitch_was) {
+                spdlog::info("[Pad] helipitch: the right stick's up / down {}", heli_pitch ? "goes to the game (pushed forward = nose down)" : "not sent (not piloting a helicopter, or off)");
+                pitch_was = heli_pitch;
+            }
+        }
         pXinputGamepad->sThumbRY = 0;
+        if (heli_pitch && std::abs(ry) > 0.25f) {
+            const float p            = std::copysign((std::abs(ry) - 0.25f) / 0.75f, ry);
+            pXinputGamepad->sThumbRY = (int16_t)std::clamp(-p * 32767.0f, -32767.0f, 32767.0f);
+        }
+        // stickview: the game's camera turned by the stick is not the aircraft's attitude (planelook does not learn its seat meanwhile).
+        if (in_vehicle && (std::abs(pXinputGamepad->sThumbRX) > 3000 || pXinputGamepad->sThumbRY != 0)) FarCry5Stereo::Get()->note_veh_rstick();
         if (FarCry5Stereo::Get()->stick_aim()) {
             // The game camera is steered onto the barrel / head direction through the right stick.
             pXinputGamepad->sThumbRX = (int16_t)std::clamp(FarCry5Stereo::Get()->stick_x() * 32767.0f, -32767.0f, 32767.0f);
             pXinputGamepad->sThumbRY = (int16_t)std::clamp(FarCry5Stereo::Get()->stick_y() * 32767.0f, -32767.0f, 32767.0f);
         }
     }
+    if (gesture.wheel) {   // the sidearm slot's pick: the stick set whatever the wheel setting (after the branches above, which zero it)
+        pXinputGamepad->sThumbRX     = (int16_t)std::clamp(gesture.wheel_x * 32767.0f, -32767.0f, 32767.0f);
+        pXinputGamepad->sThumbRY     = (int16_t)std::clamp(gesture.wheel_y * 32767.0f, -32767.0f, 32767.0f);
+        pXinputGamepad->bRightTrigger = 0;
+    }
     // meleehit (FarCry5Melee.cpp): a hit presses the game's melee (after the fire gate, which would hold RT back) and pulses the weapon hand.
     {
         float melee_buzz = 0.0f;
         FarCry5Stereo::Get()->melee_pad(pXinputGamepad->wButtons, pXinputGamepad->bRightTrigger, melee_buzz);
         if (melee_buzz > 0.0f) trigger_haptic_vibration(0.0f, 0.06f, 1.0f, melee_buzz, lh ? left_joystick : right_joystick);
+    }
+    if (load_block) {
+        // loadpopup: a swing's melee press is the player's too; the gesture's buttons and the wheel's LB stay.
+        pXinputGamepad->wButtons &= gesture.buttons | (gesture.wheel ? XINPUT_GAMEPAD_LEFT_SHOULDER : 0);
+        pXinputGamepad->bRightTrigger = 0;
+        pXinputGamepad->bLeftTrigger  = 0;
     }
 }

@@ -12,6 +12,10 @@
 
 #include "D3D11Component.hpp"
 
+namespace fc5::dlss {
+void tag_xr_image(int eye, ID3D11Texture2D* image);
+}
+
 #ifdef VERBOSE_D3D11
 #define LOG_VERBOSE(...) spdlog::info(__VA_ARGS__)
 #else
@@ -240,7 +244,7 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
         if (is_right_eye_frame) {
             auto fw_rt = g_framework->get_rendertarget_d3d11();
 
-            if (fw_rt != nullptr && g_framework->is_drawing_ui() && !vr->m_fc5_f11_image_active.load()) {
+            if (fw_rt != nullptr && g_framework->is_ui_layer_shown() && !vr->m_fc5_f11_image_active.load()) {
                 m_openxr.copy((uint32_t)runtimes::OpenXR::SwapchainIndex::FRAMEWORK_UI, fw_rt.Get());
             }
         }
@@ -518,7 +522,7 @@ vr::EVRCompositorError D3D11Component::on_frame(VR* vr) {
                 const auto framework_quad = openxr_overlay.generate_framework_ui_quad(false);
 
                 if (framework_quad) {
-                    if (g_framework->is_drawing_ui()) {
+                    if (g_framework->is_ui_layer_shown()) {
                         const auto& q = framework_quad->get();
                         const float v[9]{ q.pose.position.x, q.pose.position.y, q.pose.position.z, q.pose.orientation.x, q.pose.orientation.y,
                                           q.pose.orientation.z, q.pose.orientation.w, q.size.width, q.size.height };
@@ -1194,6 +1198,10 @@ void D3D11Component::OpenXR::copy(uint32_t eye_idx, ID3D11Texture2D* resource) {
                                  checked[1], black[1], busy[0], busy[1]);
                     checked[0] = checked[1] = black[0] = black[1] = busy[0] = busy[1] = 0;
                 }
+            }
+            // Far Cry 5 ofxrguides: this eye's DLSS evaluation tag for OFXR Bridge's DLSS frame generation (FarCry5Dlss.cpp).
+            if (eye_idx <= 1) {
+                fc5::dlss::tag_xr_image((int)eye_idx, (ID3D11Texture2D*)ctx.textures[texture_index].texture);
             }
             XrSwapchainImageReleaseInfo release_info{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 

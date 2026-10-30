@@ -1,13 +1,5 @@
-// FC2 VR motion (24 Oct, Homard 22:10 "progress on all fronts"): the render side of skelhand (FarCry5PoseProbe.cpp does the move in
-// the game's skeleton), its measurement, and the F11 Experimental section "FC2VR motion (test)" with every FC2 VR switch.
-//  - skelhand 0|1|2 (saved, default 0): 1 = the weapon hand (bone 194) on the controller in the game's skeleton, 2 = the same move
-//    given to the whole arm from the shoulder (191). The move is the mod's controller placement without gunstill (the game's own pose
-//    of the hand relative to its camera, put on the controller with the grip calibration), taken into the arms' model space through
-//    their root's object matrix (the one the skin matrices use). While it is on, the weapon pass's camera is the eye's, gunstill and
-//    gunanchor step aside, and the floating left hand works against the identity (the game already holds the gun at the controller).
-//    Stereo only.
-//  - skelhandstat on|off (test): every 300 frames, the drawn gun's pose against the controller (offset, spread, frame-to-frame jitter
-//    per eye), with skelhand on or off; skelhandstatus: the job-thread side's state.
+// Throw arc and melee swing (24 Oct, Homard 22:10 "progress on all fronts"); their switches are in F11 Gestures.
+// The "Research for alternatives" section (skelhand, skinpose, bulletaim) and its code were removed (Homard 30 Oct).
 //  - throwarc on|off (saved, default off): while a throwable is held (the chest gesture, or the pad's RB held), a dotted arc in both
 //    eyes from the left hand where the head looks: throwarcspeed m/s (15) launched throwarcup deg (10) above the head's direction,
 //    gravity 9.81 m/s2, until 2.5 s or 30 m below the hand. The game's own throw speed per throwable is not known to the mod: the
@@ -16,7 +8,6 @@
 //    camera, so walking does not count) with something within reach in front (the barrel ray meets the scene within 1.2 m) logs
 //    "[Melee] ... would press melee". The game's melee is not pressed (the switch is a test of the detection: no attacks on NPCs).
 #include "FarCry5Stereo.h"
-#include "FarCry5BulletSpeed.h"
 #include "FarCry5PoseProbe.h"
 #include "FarCry5Gesture.h"
 #include "FarCry5Aim.h"
@@ -29,268 +20,23 @@
 #include <algorithm>
 #include <cmath>
 
-namespace fc5::skinorder
+bool FarCry5Stereo::throw_arc_command(const std::string& cmd, const std::string& arg, bool& persist)
 {
-    bool install(const std::atomic<int>* frame);
-}
-
-bool FarCry5Stereo::skel_hand_active() const { return fc5::skelhand::mode() > 0 && m_motion.load() && !afw_mode(); }
-// skelhandstill (24 Oct, after Homard's "I had hoped that the model would be a lot steadier in hand"): skelhand 3 gives the game's gun the
-// whole placement with gunstill (the gun at its standing pose against the controller, the game's sway taken out except for reloads and
-// weapon switches); gunstill measures the game's own matrix of the gun (the drawn one is already moved).
-// skelhandarms: with skelhand 3, the game's arms are shown (not hidden by the floating weapon) and moved onto the hands by IK.
-bool FarCry5Stereo::skel_hand_arms() const { return skel_hand_active() && fc5::skelhand::mode() == 3 && fc5::skelhand::arms(); }
-bool FarCry5Stereo::skel_hand_still() const { return skel_hand_active() && fc5::skelhand::mode() == 3 && m_skh_still.load(); }
-
-bool FarCry5Stereo::skel_hand_command(const std::string& cmd, const std::string& arg, bool& persist)
-{
-    if (cmd == "skelhand") {
-        const int m = std::clamp(std::atoi(arg.c_str()), 0, 3);
-        if (m > 0 && !fc5::skinorder::install(&m_frame)) spdlog::info("[SkelHand] the palette writer could not be hooked: no identity check");
-        if (!fc5::skelhand::set_mode(m, &m_frame)) spdlog::info("[SkelHand] the bone getter could not be hooked: skelhand stays off");
-        persist = true;
-        spdlog::info("[SkelHand] skelhand {}{}", fc5::skelhand::mode(), m > 0 && afw_mode() ? " (AFW: not applied, Stereo only)" : "");
-        return true;
-    }
-    if (cmd == "skelhandlate") { m_skh_late = arg == "on" || arg == "1" || arg == "pos"; m_skh_late_pos = arg == "pos"; persist = true; return true; }   // pos: the move only, no turn (test)
-    if (cmd == "skelhandarms") { fc5::skelhand::set_arms(arg == "on" || arg == "1"); persist = true; return true; }
-    if (cmd == "skelhandstill") { m_skh_still = arg == "on" || arg == "1"; persist = true; return true; }
-    if (cmd == "skelhandstat") { m_skh_stat = arg == "on" || arg == "1"; return true; }
     if (cmd == "throwarc") { m_throw_arc = arg == "on" || arg == "1"; persist = true; return true; }
     if (cmd == "meleeswing") { m_melee_swing = arg == "on" || arg == "1"; persist = true; return true; }
-    if (cmd == "meleespeed") { m_melee_speed = std::clamp(float(std::atof(arg.c_str())), 0.5f, 10.0f); persist = true; return true; }    if (cmd == "throwarcspeed") { m_arc_speed = std::clamp(float(std::atof(arg.c_str())), 3.0f, 60.0f); persist = true; return true; }
+    if (cmd == "meleespeed") { m_melee_speed = std::clamp(float(std::atof(arg.c_str())), 0.5f, 10.0f); persist = true; return true; }
+    if (cmd == "throwarcspeed") { m_arc_speed = std::clamp(float(std::atof(arg.c_str())), 3.0f, 60.0f); persist = true; return true; }
     if (cmd == "throwarcsnap") { m_arc_snap = true; return true; }   // test: the next eye image with the arc drawn saved to probes\arc_N.bmp
     if (cmd == "throwarcup") { m_arc_up = std::clamp(float(std::atof(arg.c_str())), -30.0f, 60.0f); persist = true; return true; }
-    if (cmd == "skelhandstatus") { spdlog::info("[SkelHand] status: {}", fc5::skelhand::status()); return true; }
     return false;
 }
 
-// The weapon camera upload (weapon view, motion controls): today's move (w_full, w_off, with gunstill) for the measurement, and
-// skelhand's target: Mw0 (the placement without gunstill) in the arms' model space.
-void FarCry5Stereo::skel_hand_camera(int frame, const glm::mat3& Wc, const glm::vec3& ctrl, const glm::vec3& grip, const glm::mat3& wrot, const glm::vec3& cam,
-                                     const glm::mat3& w_full, const glm::vec3& w_off)
-{
-    auto affine = [&](const glm::mat3& A, const glm::vec3& off) {   // p -> A (p - cam) + off
-        glm::mat4 M{ A };
-        M[3] = glm::vec4{ off - A * cam, 1.0f };
-        return M;
-    };
-    m_skh.frame  = frame;
-    m_skh.Mw     = affine(w_full, w_off);
-    m_skh.Wc     = Wc;
-    m_skh.ctrl   = ctrl;
-    m_skh.active = skel_hand_active();
-    if (fc5::skelhand::mode() == 0) return;
-    const glm::mat4 Mw0  = affine(Wc * wrot, ctrl - Wc * grip);
-    const bool      root = frame - m_skh_root_frame <= 4;
-    fc5::skelhand::set_target(frame, root ? glm::inverse(m_skh_root) * Mw0 * m_skh_root : glm::mat4{ 1.0f }, root && m_skh.active);
-    // skelhand 3: the gun's world matrix; with skelhandstill the whole placement (gunstill's hold in it), the hand moved the same way.
-    const glm::mat4 Mw3 = skel_hand_still() ? m_skh.Mw : Mw0;
-    if (fc5::skelhand::mode() == 3) fc5::skelhand::set_target(frame, root ? glm::inverse(m_skh_root) * Mw3 * m_skh_root : glm::mat4{ 1.0f }, root && m_skh.active);
-    fc5::skelhand::set_world_target(frame, Mw3, m_skh.active && fc5::skelhand::mode() == 3);
-    // skelhandlate: the controller's poses by frame; the move since the one the drawn update was placed with.
-    m_skh_ctrl[frame & 15] = SkhCtrl{ frame, Wc, ctrl };
-    m_skh_late_ok          = false;
-    if (m_skh_late.load() && m_skh.active && fc5::skelhand::mode() == 3) {
-        // The drawn update's placement: as old as the last drawn gun's (matched at its draw, after this camera is set).
-        const int   fu = frame - m_skh_lag;
-        const auto& c0 = m_skh_ctrl[fu & 15];
-        if (c0.frame == fu && frame - fu <= 8 && frame >= fu) {
-            m_skh_late_R    = m_skh_late_pos ? glm::mat3{ 1.0f } : Wc * glm::transpose(c0.Wc);
-            m_skh_late_from = c0.ctrl;
-            m_skh_late_to   = ctrl;
-            m_skh_late_ok   = true;
-            m_skh_late_frame = frame;
-            m_skh_late_n++;
-            m_skh_late_cm = 100.0f * glm::length(ctrl - c0.ctrl);
-        } else {
-            m_skh_late_miss++;
-        }
-    }
-}
-
-// A draw about to be made (weapon_draw): in the weapon pass, the arms' root (a skinned draw whose object matrix is a heading only) and
-// the gun mesh (the weapon's signature draw) for the measurement.
-void FarCry5Stereo::skel_hand_draw(ID3D11DeviceContext* ctx, UINT count)
-{
-    if (!m_vs_cb0 || !is_weapon_cb(m_vs_cb0)) return;
-    ID3D11Buffer* cb[3]{};
-    ctx->VSGetConstantBuffers(1, 3, cb);
-    ObjConsts o1{}, o3{};
-    bool      h1 = false, h3 = false;
-    {
-        std::lock_guard _{ m_obj_mtx };
-        if (cb[0]) if (auto it = m_obj_consts.find(cb[0]); it != m_obj_consts.end()) { o1 = it->second; h1 = true; }
-        if (cb[2]) if (auto it = m_obj_consts.find(cb[2]); it != m_obj_consts.end()) { o3 = it->second; h3 = true; }
-    }
-    for (auto* b : cb) if (b) b->Release();
-    if (!h1 || o1.size < 48) return;
-    glm::mat4 Om{ 1.0f };
-    for (int r = 0; r < 3; ++r) for (int c = 0; c < 4; ++c) Om[c][r] = o1.f[r * 4 + c];
-    const int frame = m_frame.load();
-    const bool heading_only = std::abs(o1.f[8]) < 0.02f && std::abs(o1.f[9]) < 0.02f && std::abs(o1.f[10] - 1.0f) < 0.02f && std::abs(o1.f[2]) < 0.02f && std::abs(o1.f[6]) < 0.02f;
-    if (h3 && o3.size == 12288 && heading_only) {
-        m_skh_root       = Om;
-        m_skh_root_frame = frame;
-    }
-    if (count != 0 && count == m_weapon_sig.load() && fc5::skelhand::mode() == 3) {
-        if (count != m_skh_gun_sig) { m_skh_gun_sig = count; fc5::skelhand::relearn_gun(); }   // another weapon: its entity learned again
-        fc5::skelhand::note_gun(frame, Om);
-    }
-    if (!m_skh_stat.load() || count == 0 || count != m_weapon_sig.load() || m_skh.frame != frame || m_skh_g_frame == frame) return;
-    m_skh_g_frame = frame;
-    // The gun as drawn: with skelhand the game draws it where its skeleton holds it (the pass's camera is the eye's); without, the
-    // weapon camera moves it by today's placement.
-    glm::mat4 late{ 1.0f };   // skelhandlate's turn of the weapon pass, as the eye sees the gun
-    if (m_skh_late_ok && m_skh_late_frame == frame) {
-        late    = glm::mat4{ m_skh_late_R };
-        late[3] = glm::vec4{ m_skh_late_to - m_skh_late_R * m_skh_late_from, 1.0f };
-    }
-    const glm::mat4 drawn = m_skh.active ? late * Om : m_skh.Mw * Om;
-    glm::mat4       W{ m_skh.Wc };
-    W[3]                  = glm::vec4{ m_skh.ctrl, 1.0f };
-    const glm::mat4 rel   = glm::inverse(W) * drawn;
-    const glm::vec3 p     = glm::vec3{ rel[3] };
-    glm::mat3       R{ rel };
-    for (int k = 0; k < 3; ++k) R[k] = glm::normalize(R[k]);
-    const glm::quat q = glm::normalize(glm::quat_cast(R));
-    auto&           s = m_skh_st;
-    const int       e = frame & 1;
-    if (s.prev_frame[e] >= 0 && frame - s.prev_frame[e] <= 4) {
-        const float dc = 100.0f * glm::length(p - s.prev_p[e]);
-        const float dd = glm::degrees(2.0f * std::acos(std::min(1.0f, std::abs(glm::dot(q, s.prev_q[e])))));
-        s.steps++;
-        s.step_cm += dc;
-        s.step_deg += dd;
-        s.step_max_cm  = std::max(s.step_max_cm, dc);
-        s.step_max_deg = std::max(s.step_max_deg, dd);
-    }
-    s.prev_p[e]     = p;
-    s.prev_q[e]     = q;
-    s.prev_frame[e] = frame;
-    s.ps.push_back(p);
-    s.qs.push_back(q);
-}
-
-void FarCry5Stereo::skel_hand_present()
+void FarCry5Stereo::throw_melee_present()
 {
     melee_frame();       // meleeswing (log only)
     throw_arc_result();  // throwarc: a throw measured
-    auto& s = m_skh_st;
-    if (s.ps.size() < 300) return;
-    glm::vec3 mean{ 0.0f };
-    for (const auto& p : s.ps) mean += p;
-    mean /= float(s.ps.size());
-    float sp = 0.0f, sp_max = 0.0f, rd = 0.0f, rd_max = 0.0f;
-    for (size_t i = 0; i < s.ps.size(); ++i) {
-        const float d = 100.0f * glm::length(s.ps[i] - mean);
-        const float a = glm::degrees(2.0f * std::acos(std::min(1.0f, std::abs(glm::dot(s.qs[i], s.qs[0])))));
-        sp += d;
-        sp_max = std::max(sp_max, d);
-        rd += a;
-        rd_max = std::max(rd_max, a);
-    }
-    const float n = float(s.ps.size());
-    spdlog::info("[SkelHand] skelhand {}: the drawn gun against the controller over {} frames: offset ({:.1f}, {:.1f}, {:.1f}) cm; spread {:.2f} cm (max {:.2f}), {:.2f} deg (max {:.2f}) "
-                 "from the first; jitter per eye {:.2f} cm (max {:.2f}), {:.2f} deg (max {:.2f}) per frame | {}",
-                 m_skh.active ? fc5::skelhand::mode() : 0, s.ps.size(), 100.0f * mean.x, 100.0f * mean.y, 100.0f * mean.z, sp / n, sp_max, rd / n, rd_max,
-                 s.steps ? s.step_cm / s.steps : 0.0, s.step_max_cm, s.steps ? s.step_deg / s.steps : 0.0, s.step_max_deg, fc5::skelhand::status() + "; " + fc5::skelhand::gun_status() + fmt::format("; skelhandstill {}, gunstill fed the game's gun {} / not matched {}; skelhandlate {} (applied {}, no pose for the update {}, last {:.1f} cm, placement {}-{} frames old)", skel_hand_still() ? "on" : "off", m_skh_raw_hits.load(), m_skh_raw_miss.load(),
-                                                                                                  m_skh_late.load() ? "on" : "off", m_skh_late_n, m_skh_late_miss, m_skh_late_cm, m_skh_lag_min, m_skh_lag_max));
-    s = SkhStat{};
 }
 
-void FarCry5Stereo::draw_fc2vr_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint,
-                                    const std::function<void(const char*)>& section)
-{
-    // Labelled without the other mod's name (Homard 24 Oct: "Remove all mention of FC2 in the menu").
-    section("Research for alternatives (test)");
-    ImGui::TextDisabled("Other ways of holding the gun and aiming, each off by default. Stereo only. Try one at a time.");
-    {
-        int  sh = fc5::skelhand::mode();
-        ImGui::TextUnformatted("Hand in the game's skeleton");
-        bool ch = ImGui::RadioButton("Off##skelhand", &sh, 0);
-        ImGui::SameLine();
-        ch |= ImGui::RadioButton("Hand##skelhand", &sh, 1);
-        ImGui::SameLine();
-        ch |= ImGui::RadioButton("Whole arm##skelhand", &sh, 2);
-        ImGui::SameLine();
-        ch |= ImGui::RadioButton("Gun and hand##skelhand", &sh, 3);
-        if (ch) {
-            fc5::skinorder::install(&m_frame);
-            fc5::skelhand::set_mode(sh, &m_frame);
-            keep("skelhand", fmt::format("skelhand {}", sh));
-        }
-        hint("The game itself holds the gun at your controller: your weapon hand is moved in the game's own skeleton, so the gun, its muzzle "
-             "flash and its tracers come out of it. Hand: only the hand moves. Whole arm: the arm moves with it from the shoulder. Look for: the gun "
-             "on the controller, steady, the same in both eyes; the muzzle flash and tracers at the gun. Off: as before.");
-        bool v = m_skh_still.load();
-        if (ImGui::Checkbox("Gun and hand: held still (reloads shown)##skelhandstill", &v)) {
-            m_skh_still = v;
-            keep("skelhandstill", v ? "skelhandstill on" : "skelhandstill off");
-        }
-        hint("With Gun and hand: the game's gun is held at its standing pose in your hand (as \"Gun moves only for reloads\"), its sway, bob and "
-             "recoil taken out; reloads and weapon switches still play. Off: the game's own sway of the gun is kept.");
-        bool l = m_skh_late.load();
-        if (ImGui::Checkbox("Gun and hand: no trail when swinging (test)##skelhandlate", &l)) {
-            m_skh_late = l;
-            keep("skelhandlate", l ? "skelhandlate on" : "skelhandlate off");
-        }
-        hint("With Gun and hand: the game places the gun one update before it is drawn; this turns the gun's picture by how far your controller "
-             "moved since, so the gun does not trail your hand in fast swings.");
-        bool a = fc5::skelhand::arms();
-        if (ImGui::Checkbox("Gun and hand: the game's arms shown, bent to the hands##skelhandarms", &a)) {
-            fc5::skelhand::set_arms(a);
-            keep("skelhandarms", a ? "skelhandarms on" : "skelhandarms off");
-        }
-        hint("With Gun and hand: the game's own arms are drawn (not hidden), both hands on the gun where the game holds them, the forearms and "
-             "upper arms bent to reach them from the shoulders (the elbows bend the way the game's do).");
-    }
-    {
-        bool v = m_throw_arc.load();
-        if (ImGui::Checkbox("Throw arc##throwarc", &v)) {
-            m_throw_arc = v;
-            keep("throwarc", v ? "throwarc on" : "throwarc off");
-        }
-        hint("While you hold a throwable (from the chest, or with the throw button held), a dotted arc shows where it would fly if thrown where you look. "
-             "A guide: the game's own throw speed is not known to the mod (throwarcspeed, 15 m/s), and walls do not stop the arc.");
-    }
-    {
-        bool v = m_melee_swing.load();
-        if (ImGui::Checkbox("Melee by swinging (log only)##meleeswing", &v)) {
-            m_melee_swing = v;
-            keep("meleeswing", v ? "meleeswing on" : "meleeswing off");
-        }
-        hint("Test of the detection only: a fast swing of your weapon hand (over meleespeed, 2.5 m/s) with something within reach in front is written "
-             "to the log ([Melee]). The game's melee is not pressed yet.");
-    }
-    draw_melee_menu(keep, hint);   // meleehit (FarCry5Melee.cpp)
-    {
-        bool v = m_skin_pose.load();
-        if (ImGui::Checkbox("Gun and hands moved in their own draws##skinpose", &v)) {
-            m_skin_pose = v;
-            keep("skinpose", v ? "skinpose on" : "skinpose off");
-        }
-        hint("23 Oct test (no gain in Homard's headset): every piece of the gun and hands is moved onto the controller in its own draw instead of turning "
-             "the weapon picture's camera.");
-    }
-    {
-        int  ba = fc5::bullet::aim_mode();
-        ImGui::TextUnformatted("Bullets from the barrel");
-        bool ch = ImGui::RadioButton("Off##bulletaim", &ba, 0);
-        ImGui::SameLine();
-        ch |= ImGui::RadioButton("Along the barrel##bulletaim", &ba, 1);
-        ImGui::SameLine();
-        ch |= ImGui::RadioButton("From the muzzle##bulletaim", &ba, 2);
-        if (ch) {
-            fc5::bullet::set_aim_mode(ba);
-            if (ba > 0) fc5::bullet::install_shot_hook(reinterpret_cast<uint8_t*>(GetModuleHandleA("FC_m64.dll")));
-            keep("bulletaim", fmt::format("bulletaim {}", ba));
-        }
-        hint("Your shots are sent along the gun's barrel when the game fires them (the game's spread is kept), and while you fire the game's aim stays "
-             "where your head looks: no swing of the aim, no trigger delay, nothing culled. From the muzzle: they also start at the gun's muzzle "
-             "(not inside a wall). Off: as before.");
-    }
-}
 
 // throwarc: the predicted throw drawn into this eye's image (as the aim dot: small discs written with ClearView at projected points).
 // The launch of the throwable in hand: measured (its own, else the last measured throw's), else throwarcspeed / throwarcup.
@@ -382,19 +128,16 @@ void FarCry5Stereo::draw_throw_arc(ID3D11DeviceContext* ctx, ID3D11Texture2D* bb
     D3D11_TEXTURE2D_DESC d{};
     bb->GetDesc(&d);
     const float     r = std::max(3.0f, aim_marker_px(d.Width) * 1.0f);   // (0.6 of the aim dot was too small to see in a capture)
-    const float     light[4]{ 1.0f, 0.95f, 0.55f, 1.0f }, dark[4]{ 0.0f, 0.0f, 0.0f, 1.0f };
+    const float     light[4]{ 1.0f, 0.95f, 0.55f, 1.0f }, dark[4]{ 0.0f, 0.0f, 0.0f, 1.0f }, land[4]{ 1.0f, 0.45f, 0.1f, 1.0f };
     int             drawn = 0;
-    for (int i = 1; i <= 60; ++i) {
-        const float     tt = 0.04f * float(i);
-        const glm::vec3 p  = o + v * tt + glm::vec3{ 0.0f, 0.0f, -0.5f * fit.g } * tt * tt;
-        if (p.z < o.z - 30.0f) break;
-        if (i % 2) continue;   // dotted
+    // One dot (a dark rim, then the colour) at a world point in this eye's image; false off the image.
+    auto put = [&](const glm::vec3& p, float scale, const float col[4]) {
         const glm::vec4 cl = m_hist[0].cur_vrp * glm::vec4{ p - m_hist[0].cur_cam, 1.0f };
-        if (cl.w <= 0.05f) continue;
+        if (cl.w <= 0.05f) return false;
         const float x = (cl.x / cl.w * 0.5f + 0.5f) * d.Width, y = (0.5f - cl.y / cl.w * 0.5f) * d.Height;
-        const float rr = std::max(2.5f, r * std::min(1.0f, 6.0f / std::max(0.5f, cl.w)));   // smaller further away
-        if (x < rr + 2 || y < rr + 2 || x > d.Width - rr - 2 || y > d.Height - rr - 2) continue;
-        auto disc = [&](float rad, const float col[4]) {
+        const float rr = scale * std::max(2.5f, r * std::min(1.0f, 6.0f / std::max(0.5f, cl.w)));   // smaller further away
+        if (x < rr + 2 || y < rr + 2 || x > d.Width - rr - 2 || y > d.Height - rr - 2) return false;
+        auto disc = [&](float rad, const float cc[4]) {
             D3D11_RECT rows[64];
             UINT       n  = 0;
             const LONG ry = (LONG)std::floor(rad);
@@ -402,11 +145,39 @@ void FarCry5Stereo::draw_throw_arc(ID3D11DeviceContext* ctx, ID3D11Texture2D* bb
                 const LONG hw = (LONG)std::floor(std::sqrt(std::max(0.0f, (rad + 0.5f) * (rad + 0.5f) - (float)(dy * dy))) - 0.5f);
                 rows[n++]     = { (LONG)x - hw, (LONG)y + dy, (LONG)x + hw + 1, (LONG)y + dy + 1 };
             }
-            ctx1->ClearView(m_arc_view, col, rows, n);
+            ctx1->ClearView(m_arc_view, cc, rows, n);
         };
         disc(rr + 1.5f, dark);
-        disc(rr, light);
-        drawn++;
+        disc(rr, col);
+        return true;
+    };
+    // throwarcstop (Homard 26 Oct: "the path ... goes into the ground so it make it difficult to evaluate distance"): the arc is marched
+    // through the scene depth at present (aim channel 2, from the next frame on); it stops where it meets the scene, with a ring there.
+    m_arc_live_o     = o;
+    m_arc_live_v     = v;
+    m_arc_live_g     = fit.g;
+    m_arc_live_frame = m_frame.load();
+    if (!m_arc_drawn) fc5::aim::mark(2);   // a new trajectory: no hit of an earlier one
+    int         nres  = 0;
+    fc5::aim::hit_since_mark(2, nres);
+    const float t_hit = (m_arc_stop.load() && nres > 0) ? fc5::aim::last_hit(2) : -1.0f;
+    for (int i = 1; i <= 60; ++i) {
+        const float     tt = 0.04f * float(i);
+        if (t_hit > 0.0f && tt > t_hit) break;
+        const glm::vec3 p  = o + v * tt + glm::vec3{ 0.0f, 0.0f, -0.5f * fit.g } * tt * tt;
+        if (p.z < o.z - 30.0f) break;
+        if (i % 2) continue;   // dotted
+        if (put(p, 1.0f, light)) drawn++;
+    }
+    if (t_hit > 0.0f && drawn > 0) {
+        // Where it lands: a ring of dots 1.2 m across (0.8 m was hard to see 18 m away, simulator 26 Oct) on the level there, and its centre.
+        const glm::vec3 c = o + v * t_hit + glm::vec3{ 0.0f, 0.0f, -0.5f * fit.g } * t_hit * t_hit;
+        for (int k = 0; k < 16; ++k) {
+            const float a = glm::two_pi<float>() * float(k) / 16.0f;
+            put(c + glm::vec3{ std::cos(a), std::sin(a), 0.0f } * 0.6f, 1.2f, land);
+        }
+        put(c, 2.0f, land);
+        if (m_arc_hit_said++ % 300 == 0) spdlog::info("[ThrowArc] trajectory stops where it meets the scene: {:.2f} s, {:.1f} m away", t_hit, glm::length(c - o));
     }
     ctx1->Release();
     if (drawn && m_arc_snap.exchange(false)) {
@@ -485,7 +256,7 @@ void FarCry5Stereo::melee_frame()
 // furthest (velocity at launch, gravity) is taken for this throwable: speed, and its angle above the head's direction at the release.
 void FarCry5Stereo::throw_arc_release(const glm::vec3& hand, const glm::vec3& head_dir)
 {
-    fc5::skelhand::throw_probe_arm(hand);
+    fc5::throwprobe::arm(hand);
     m_arc_wait      = true;
     m_arc_rel_t     = std::chrono::steady_clock::now();
     m_arc_rel_sig   = m_arc_sig.load();
@@ -498,7 +269,7 @@ void FarCry5Stereo::throw_arc_result()
 {
     if (!m_arc_wait || std::chrono::steady_clock::now() - m_arc_rel_t < std::chrono::milliseconds(2600)) return;
     m_arc_wait  = false;
-    const auto r = fc5::skelhand::throw_fit(m_arc_rel_head);
+    const auto r = fc5::throwprobe::fit(m_arc_rel_head);
     if (!r.ok) {
         spdlog::info("[ThrowArc] measured throw: no object flew from the hand ({} entities followed, {} not starting at the hand or flying off the look, the furthest kept one moved {:.1f} m){}", r.tracked, r.rejected, r.dist, r.path);
         return;

@@ -11,6 +11,12 @@ runs through Ubisoft Connect too: follow the Ubisoft Connect steps for it.
   (Virtual Desktop Streamer > OpenXR Runtime: VDXR). Quest Link, SteamVR and the others should work but are untested.
 - An NVIDIA RTX graphics card (the mod uses DLSS).
 
+STRONGLY RECOMMENDED (foliage: trees and grass judder at a low frame rate and smear in a compressed stream)
+- OFXR Bridge (frame generation for OpenXR games; the mod works with it, DLSS frame generation included):
+  https://github.com/tig3rmast3r/OFXR-Bridge/releases
+- A high-bitrate codec when streaming (Quest with Virtual Desktop or Quest Link). In Virtual Desktop: H.264+ at
+  300-400 Mbps if your Wi-Fi holds it, or AV1 10-bit at about 200 Mbps, with automatic bitrate turned off.
+
 2. FIND THE GAME FOLDER (the folder that holds the "bin" and "data_final" folders; FarCry5.exe is in bin)
 - Steam: in the Steam library right-click Far Cry 5 > Manage > Browse local files.
   Usually: C:\Program Files (x86)\Steam\steamapps\common\FarCry5

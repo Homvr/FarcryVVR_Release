@@ -94,6 +94,8 @@ struct FarCry5Stereo::GunStillState
         bool      big_said{ false };
         glm::vec3 line{ 0.0f, 1.0f, 0.0f };   // twohandline: the game's weapon hand -> left hand direction, the gun's own axes
         bool      line_ok{ false };
+        bool      temp{ false };   // shoulderdraw: a pose taken for one switch only (a weapon held out of the learning's reach), dropped after it
+        int       ahead{ 0 }, beside{ 0 };    // sidearm: measures with the left hand ahead of the weapon hand along the barrel / not
     };
     // A dropped pose: back to the weapon's first learned one if it has one, else learned again.
     static void drop(Ref& r)
@@ -108,6 +110,7 @@ struct FarCry5Stereo::GunStillState
         }
     }
     std::unordered_map<uint32_t, Ref> refs{};   // by weapon signature (m_weapon_sig)
+    std::set<uint32_t>                unlearned_said{};   // weapons logged as out 5 s and not learned
     bool                              loaded{ false };   // fc5vr_gunposes.txt read
 
     // The player's horizontal speed from the game camera.
@@ -209,6 +212,16 @@ struct FarCry5Stereo::GunStillState
     // meleestill (FarCry5Melee.cpp): a melee weapon's game hand in the weapon's own axes (smoothed), per weapon.
     struct MeleeHand { glm::vec3 h{ 0.0f }; bool ok{ false }, said{ false }; };
     std::unordered_map<uint32_t, MeleeHand> melee{};
+
+    // gunaxes: per weapon, the game's right hand in the gun's own axes (smoothed; "rhand" lines in fc5vr_gunposes.txt) and, standing,
+    // how often the game held the mesh's +Y within 50 deg of the aim's axis (fwd) or not (side: not a gun's barrel).
+    struct Axes { glm::vec3 h{ 0.0f }; int n{ 0 }; uint32_t fwd{ 0 }, side{ 0 }; bool said{ false }, side_said{ false }; };
+    std::unordered_map<uint32_t, Axes> axes{};
+    bool      axes_save{ false };
+    // The pose the gun in hand is drawn at (gunaxes' made one, else the learned one), for sightaim and the two-handed hold.
+    Pose      held{};
+    uint32_t  held_sig{ 0 };
+    bool      held_axes{ false };
 };
 
 void FarCry5Stereo::gun_still_first_draw()
@@ -240,6 +253,17 @@ void FarCry5Stereo::gun_still_note_support(const glm::vec3& F, const glm::vec3& 
     m_gst->hand_frame = m_frame.load();
 }
 
+// sidearm (FarCry5Holster.cpp): is the gun a handgun, by where the game holds its left hand standing (measured above): 1 a handgun (the
+// left hand beside or behind the weapon hand in most measures), 0 not (ahead, along the barrel: a rifle, a shotgun, the bow), -1 not
+// measured yet (fewer than 20).
+int FarCry5Stereo::gun_still_handgun(uint32_t sig) const
+{
+    if (!m_gst || sig == 0) return -1;
+    const auto it = m_gst->refs.find(sig);
+    if (it == m_gst->refs.end() || it->second.ahead + it->second.beside < 20) return -1;
+    return it->second.beside > 3 * it->second.ahead ? 1 : 0;
+}
+
 // twohandline (Homard 21 Oct 14:02: "the second hand of the uzi do not work properly"): the two-handed hold points the gun
 // along the line from the weapon hand to the left hand. The game holds the Uzi's left hand 15 deg off its barrel's line (the
 // rifles about 4), so that gun tilted by as much in a two-handed hold. This is the game's own hand line for the gun in hand,
@@ -249,7 +273,8 @@ bool FarCry5Stereo::gun_still_hand_line(glm::vec3& g)
     if (!m_gst || !m_two_hand_line.load()) return false;
     const auto it = m_gst->refs.find(m_weapon_sig.load());
     if (it == m_gst->refs.end() || !it->second.ok || !it->second.line_ok) return false;
-    g = glm::normalize(glm::mat3_cast(it->second.pose.r) * it->second.line);
+    const bool      made = m_gst->held_axes && m_gst->held_sig == m_weapon_sig.load();   // gunaxes: the gun drawn at the made pose
+    g = glm::normalize(glm::mat3_cast(made ? m_gst->held.r : it->second.pose.r) * it->second.line);
     return g.z < -0.5f;   // forward-ish only (a bad measure is ignored)
 }
 
@@ -574,6 +599,11 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
         }
         if (!big) ref.big_said = false;
         const bool calm = quiet_now && steady && in_hands && !hand_off && !m_mo.slung && !big;
+        // A weapon out 5 s and still not learned: why, once per weapon (Homard 27 Oct: 5694 never learned).
+        if (!ref.ok && out_s > 5.0f && s.unlearned_said.insert(sig).second)
+            spdlog::info("[Motion] gunstill: weapon {} not learned after 5 s: gun at ({:.2f}, {:.2f}, {:.2f}) in the camera's axes (in the hands needs z < -0.10, y > -0.45), "
+                         "game's left hand {}, quiet {}, steady {}, sling {}, speed {:.1f} m/s", sig, qp.t.x, qp.t.y, qp.t.z, hand_fresh ? "drawn" : "not drawn", quiet_now, steady,
+                         m_mo.slung, s.speed);
         if (!(calm && away)) s.away_on = false;
         else if (!s.away_on) {
             s.away_on   = true;
@@ -600,6 +630,7 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
                 // Only a left hand ahead of the weapon hand (a handgun's support hand beside or behind it gives no barrel-like line:
                 // weapon 18912 measured 138 deg off in the simulator).
                 const bool ahead = glm::length(d) > 0.08f && (glm::mat3_cast(ref.pose.r) * glm::normalize(d)).z < -0.7f;
+                (ahead ? ref.ahead : ref.beside)++;   // sidearm: a handgun's support hand is beside or behind its weapon hand
                 if (ahead) {
                     const bool first = !ref.line_ok;
                     ref.line         = first ? glm::normalize(d) : glm::normalize(glm::mix(ref.line, glm::normalize(d), k));
@@ -635,6 +666,19 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
             ref.pose = qp;
             ref.ok   = true;
             spdlog::info("[Motion] gunstill: weapon {}'s pose taken while moving (learned again when you stand still)", sig);
+        } else if (!ref.ok && weapon_switch_needs_pose(sig) && out_s > 0.25f && steady && !s.sprinting && !throwing && !vehicle && qp.t.z < 0.0f) {
+            // shoulderdraw (FarCry5WeaponSwitch.cpp): a weapon a switch brings whose pose is not known (Homard 27 Oct 21:41-21:42: weapon 19308,
+            // never held standing still, showed the end of the game's draw 3 times out of 9): taken once the game's draw has settled, so the
+            // switch holds it from there (learned again when you stand still).
+            // A weapon the game holds out of the learning's reach (a melee weapon, 55-60 cm below the camera: Homard's 5694, a wooden one,
+            // at (0.34, -0.59, -0.31) in the simulator 28 Oct, never learned, so 6 of 6 switches to it showed the draw): held so for this
+            // switch only (temp), then the game's own animation as before (meleestill off).
+            const bool low = melee_weapon(sig) || !(qp.t.z < -0.10f && qp.t.y > -0.45f);
+            ref.pose = qp;
+            ref.ok   = true;
+            ref.temp = low;
+            spdlog::info("[Motion] gunstill: weapon {}'s pose taken at the end of a switch's draw, {:.2f} s after it showed ({})", sig, out_s,
+                         low ? "held low, a melee weapon: for this switch only" : "learned again when you stand still");
         }
         if (s.alpha > 0.0f) s.held_updates++;
         if (m_gun_still_log.load() > 0) {
@@ -683,10 +727,100 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
             }
         }
     }
+    // A pose taken for one switch only (temp) is dropped once that switch's hold is over.
+    if (ref.temp && !weapon_switch_needs_pose(sig) && !weapon_switch_holds(sig)) {
+        ref = GunStillState::Ref{};
+        spdlog::info("[Motion] gunstill: weapon {}'s pose for the switch dropped (the switch is over: the game's own animation again)", sig);
+    }
+    // gunaxes (Homard 29 Oct 13:48: "some weapons still rotate along the wrong axis (especially many pistols)"): the gun's held pose
+    // made from its own axes instead of the game's: its barrel (the mesh's +Y) along the aim's axis (-Z), its top (+Z) up, turned
+    // about the game's right hand on it, which is put at the gun's grip point (so that hand sits on the controller as on every gun).
+    // Known from the first updates a gun is in hand, standing or not; the game's own pose is still what tells a reload.
+    Pose hpose     = ref.pose;
+    bool axes_hold = false;
+    if (!melee_hold && m_gun_axes.load() && sig != 0 && !melee_weapon(sig) && !gun_axes_game(sig)) {
+        auto& ax = s.axes[sig];
+        if (new_update && !m_mo.slung && !s.reload && !throwing && out_s > 0.3f && m_wpn_grip_frame == m_gun_obj_seen) {
+            const glm::vec3 h = glm::vec3{ glm::inverse(Q) * glm::vec4{ m_wpn_grip_cam, 1.0f } };
+            if (glm::length(h) < 0.35f) {
+                ax.h = ax.n == 0 ? h : glm::mix(ax.h, h, 0.05f);   // ~0.5 s at 45 updates a second
+                if (++ax.n == 90) s.axes_save = true;
+                ax.n = std::min(ax.n, 1 << 20);
+            }
+            // Standing, out of the draw and a while after moving, shooting or aiming down sights: is the mesh's +Y held forward (a gun's
+            // barrel)? A bow's or a launcher's mesh may run another way: then the game's own pose stays.
+            if (out_s > 1.0f && !s.sprinting && s.speed < 1.5f && now - s.last_moving > std::chrono::milliseconds(1500) &&
+                now - s.last_fire > std::chrono::milliseconds(800) && now - s.last_ads > std::chrono::milliseconds(800)) {
+                const glm::vec3 b = glm::mat3_cast(qp.r) * glm::vec3{ 0.0f, 1.0f, 0.0f };
+                (b.z < -0.64f ? ax.fwd : ax.side)++;
+            }
+        }
+        if (ax.side > ax.fwd && !ax.side_said) {
+            ax.side_said = true;
+            const glm::vec3 b = glm::mat3_cast(qp.r) * glm::vec3{ 0.0f, 1.0f, 0.0f };
+            spdlog::info("[Motion] gunaxes: weapon {}: the game holds its mesh's +Y {:.0f} deg from the aim's axis standing ({} of {} updates): not a barrel, the game's pose kept",
+                         sig, glm::degrees(std::acos(std::clamp(-b.z, -1.0f, 1.0f))), ax.side, ax.side + ax.fwd);
+        }
+        if (ax.n >= 3 && ax.fwd >= ax.side) {
+            glm::vec3 c{ m_grip_hand_ref[0].load(), m_grip_hand_ref[1].load(), m_grip_hand_ref[2].load() };
+            if (m_grip_by_hand.load()) {
+                std::lock_guard _{ m_weapon_cal_mtx };
+                if (auto it = m_grip_hand.find(sig); it != m_grip_hand.end() && it->second.ok) c = it->second.c;
+            }
+            // The gun's own sight line, once learned from the game's aim down sights, sets the angle (a canted sight: 25110 and 32574
+            // are rolled 10-12 deg in it); else the mesh's axes.
+            const glm::quat R0 = glm::angleAxis(glm::radians(-90.0f), glm::vec3{ 1.0f, 0.0f, 0.0f });   // +Y -> -Z, +Z -> +Y
+            glm::quat       R  = R0;
+            glm::vec3       sd{ 0.0f }, su{ 0.0f };
+            bool            by_sight = false;
+            if (sight_axes(sig, sd, su) && glm::length(sd) > 0.5f) {
+                sd                 = glm::normalize(sd);
+                const glm::vec3 up = su - sd * glm::dot(su, sd);
+                if (sd.y > 0.996f && glm::length(up) > 0.5f && glm::normalize(up).z > 0.9f) {   // within 5 deg of +Y, 25 deg of +Z
+                    const glm::vec3 uz = glm::normalize(up);
+                    const glm::mat3 B{ glm::cross(sd, uz), sd, uz };   // the sight's axes as the mesh's X, Y, Z
+                    R                  = glm::normalize(R0 * glm::quat_cast(glm::transpose(B)));
+                    by_sight           = true;
+                }
+            }
+            hpose = Pose{ R, c - R * ax.h };
+            axes_hold         = true;
+            if (!ax.said) {
+                ax.said = true;
+                auto off = [](const glm::quat& r, float& roll) {
+                    const glm::vec3 b = glm::mat3_cast(r) * glm::vec3{ 0.0f, 1.0f, 0.0f }, u = glm::mat3_cast(r) * glm::vec3{ 0.0f, 0.0f, 1.0f };
+                    roll              = glm::degrees(std::atan2(u.x, u.y));
+                    return glm::degrees(std::acos(std::clamp(-b.z, -1.0f, 1.0f)));
+                };
+                float      rg = 0.0f, rl = 0.0f;
+                const float og = off(qp.r, rg), ol = ref.ok ? off(ref.pose.r, rl) : 0.0f;
+                spdlog::info("[Motion] gunaxes: weapon {} held by its own axes ({}), about the game's right hand at ({:.3f}, {:.3f}, {:.3f}) "
+                             "in its axes; the game holds it {:.0f} deg off the aim's axis, rolled {:.0f} deg{}",
+                             sig, by_sight ? "its sight line along the controller, the sight's top up" : "barrel along the controller, top up", ax.h.x, ax.h.y, ax.h.z, og, rg, ref.ok ? fmt::format("; its learned pose was {:.0f} deg off, rolled {:.0f} deg", ol, rl) : std::string{ "; no learned pose" });
+            }
+        }
+    }
+    m_gun_axes_state = (melee_hold || !m_gun_axes.load() || sig == 0 || melee_weapon(sig)) ? 0
+                     : gun_axes_game(sig)                                                 ? 4
+                     : axes_hold                                                          ? 2
+                     : s.axes[sig].side > s.axes[sig].fwd                                 ? 3
+                                                                                          : 1;
+    if (s.axes_save) {
+        s.axes_save = false;
+        gun_still_save();
+    }
+    s.held      = hpose;
+    s.held_sig  = sig;
+    s.held_axes = axes_hold;
+    const bool known = ref.ok || axes_hold;
     // Held unless a reload or a throw is under way, the pose is unknown, or the gun is far from it (another mesh).
+    // shoulderdraw (FarCry5WeaponSwitch.cpp): a weapon just taken by a switch gesture is held at once and fully, wherever the game's
+    // draw animation has it, and that animation is no reload.
+    const bool switch_hold = !melee_hold && known && !throwing && weapon_switch_holds(sig);
+    if (switch_hold) s.reload = false;
     const bool hold = melee_hold ? !throwing
-                                 : m_gun_still.load() && ref.ok && !s.reload && !throwing && glm::length(qp.t - ref.pose.t) < 0.6f;
-    s.alpha         = std::clamp(s.alpha + (hold ? 1.0f : -1.0f) * da / std::max(0.02f, m_gst_ease.load()), 0.0f, 1.0f);
+                                 : switch_hold || (m_gun_still.load() && known && !s.reload && !throwing && glm::length(qp.t - hpose.t) < 0.6f);
+    s.alpha         = switch_hold ? 1.0f : std::clamp(s.alpha + (hold ? 1.0f : -1.0f) * da / std::max(0.02f, m_gst_ease.load()), 0.0f, 1.0f);
     const int  prev_applied = s.applied_frame;
     const bool prev_full    = s.applied_full;
     s.applied_frame = frame;
@@ -737,7 +871,7 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
         s.pred_frame = frame;
         Qn           = s.pred_q[std::clamp(m_gst_predict.load(), 0, 3)];
     }
-    glm::mat4 Cf = to_mat(ref.pose) * glm::inverse(Qn);
+    glm::mat4 Cf = to_mat(hpose) * glm::inverse(Qn);
     // gunstillfire hold (default) / kick (Homard 20 Oct: "remove all kind of animation except reloading"; 23 Oct 22:17: "there were
     // still involuntary movement when sprinting and shooting"): the gun stays held while firing. The smoothed way below showed the
     // game's pose less its 0.12 s average from the trigger to up to 3 s after it: besides the kick, the fast part of everything the
@@ -751,7 +885,7 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
         s.fire_beta = 1.0f;
         if (fire_now && upd(frame) != upd(m_gun_obj_seen)) {
             Qn = Q;
-            Cf = to_mat(ref.pose) * glm::inverse(Qn);
+            Cf = to_mat(hpose) * glm::inverse(Qn);
         }
         // kick: the game's gun averaged over 0.12 s while firing and while the kick eases out, from the pose firing began with.
         const bool track = fire_now || s.kick_a > 0.0f;
@@ -801,8 +935,8 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
             }
             return out;
         };
-        Pose target = ref.pose;
-        if (fire_mode == 2 && s.kick_a > 0.0f) target = kick_of(ref.pose, Qn, s.kick_a, fresh);
+        Pose target = hpose;
+        if (fire_mode == 2 && s.kick_a > 0.0f) target = kick_of(hpose, Qn, s.kick_a, fresh);
         if (fire_mode == 2) Cf = to_mat(target) * glm::inverse(Qn);
     }
     // gunstillrecoil (Homard 16 Oct 21:29 "keep the recoil animation"): while firing (and 0.4 s after) the correction is
@@ -816,7 +950,8 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
     const bool smooth = fire_mode == 0 && !m_gst_recoil.load();
     // Smoothed firing lasts while the game still holds the gun off its standing pose (2 cm / 3 deg): its shots and its way out of
     // the firing stance outlast the trigger (simulator: kicks 0.75 s after release, then an 8 cm / 15 deg one-frame exit).
-    const bool stance = smooth && s.fire_on && (glm::length(qp.t - ref.pose.t) > 0.02f || angle_deg(qp.r, ref.pose.r) > 3.0f) && now - s.last_fire < std::chrono::seconds(3);
+    const Pose& stand = ref.ok ? ref.pose : hpose;   // where the game holds it standing (gunaxes before it is learned: the made pose)
+    const bool stance = smooth && s.fire_on && (glm::length(qp.t - stand.t) > 0.02f || angle_deg(qp.r, stand.r) > 3.0f) && now - s.last_fire < std::chrono::seconds(3);
     const bool firing = fire_mode == 0 && (m_gst_recoil.load() || smooth) && (now - s.last_fire < std::chrono::milliseconds(400) || stance);
     if (smooth) {
         if (!s.fire_on) {
@@ -830,7 +965,7 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
             s.q_lp_frame  = m_gun_obj_seen;
             s.q_lp_t      = now;
         }
-        if (firing) s.fire_C = to_mat(ref.pose) * glm::inverse(s.q_lp);
+        if (firing) s.fire_C = to_mat(hpose) * glm::inverse(s.q_lp);
     } else if (firing && !s.fire_on) s.fire_C = Cf;
     if (fire_mode == 0) {
         s.fire_on   = firing;
@@ -868,6 +1003,10 @@ glm::mat4 FarCry5Stereo::gun_still(int frame, const glm::vec3& cam)
 bool FarCry5Stereo::gun_still_held(uint32_t sig, glm::mat4& pose)
 {
     if (!m_gst || !m_gun_still.load()) return false;
+    if (m_gst->held_axes && m_gst->held_sig == sig) {   // gunaxes: the made pose
+        pose = to_mat(m_gst->held);
+        return true;
+    }
     const auto it = m_gst->refs.find(sig);
     if (it == m_gst->refs.end() || !it->second.ok) return false;
     pose = to_mat(it->second.pose);
@@ -916,6 +1055,33 @@ bool FarCry5Stereo::gun_still_command(const std::string& cmd, const std::string&
         persist = true;
         return true;
     }
+    if (cmd == "gunaxes") {   // on (default) | off: each gun held by its own model axes (off: the pose learned from the game, before 29 Oct)
+        m_gun_axes = on;
+        persist    = true;
+        spdlog::info("[Motion] gunaxes {}: {}", on ? "on" : "off",
+                     on ? "each gun's barrel along the controller, its top up, about the game's right hand on it" : "each gun at the pose learned from the game standing still (before 29 Oct)");
+        return true;
+    }
+    if (cmd == "gunaxesgame") {   // gunaxesgame <sig> <sig> ... | none: guns kept on the game's pose with gunaxes on
+        std::set<uint32_t> s;
+        auto               add = [&](const std::string& w) { if (const unsigned long v = std::strtoul(w.c_str(), nullptr, 10); v != 0) s.insert(uint32_t(v)); };
+        add(arg);
+        for (std::string w; rest >> w;) add(w);
+        {
+            std::lock_guard _{ m_weapon_cal_mtx };
+            m_gun_axes_game = std::move(s);
+        }
+        persist = true;
+        return true;
+    }
+    if (cmd == "adsprobe") {   // off | optic (default) | all: which guns sightlearn and scopelearn read by pressing aim down sights
+        m_ads_probe = arg == "off" ? 0 : arg == "all" ? 2 : 1;
+        persist     = true;
+        spdlog::info("[Sight] adsprobe {}: {}", arg == "off" ? "off" : arg == "all" ? "all" : "optic",
+                     arg == "off" ? "the game's aim down sights is never pressed for you" : arg == "all" ? "every gun is read once near the eye (before 29 Oct)" : "only a gun drawing sight glass (a scope, a red dot) is read near the eye");
+        return true;
+    }
+    if (cmd == "weaponidsplit") { m_weapon_id_split = on; persist = true; return true; }   // a gun split in 65535-index pieces told apart by its next largest piece
     if (cmd == "twohandline") { m_two_hand_line = on; persist = true; return true; }   // the two-handed hold lines the gun's hand line up with your hands
     if (cmd == "fireready") { m_fire_ready = on; persist = true; return true; }   // the game's aim kept on the barrel with the weapon in hand (motion_post_present)
     if (cmd == "snapready") { m_snap_ready = on; persist = true; return true; }   // snap turns synced with the culled camera with the weapon in hand too
@@ -1039,6 +1205,17 @@ void FarCry5Stereo::gun_still_load()
     int           grips = 0;
     while (std::getline(f, line)) {
         std::istringstream ls{ line };
+        if (line.rfind("rhand ", 0) == 0) {   // gunaxes: the game's right hand in the gun's axes
+            std::string tag;
+            uint32_t    hsig = 0;
+            glm::vec3   h{ 0.0f };
+            if ((ls >> tag >> hsig >> h.x >> h.y >> h.z) && hsig != 0 && glm::length(h) < 0.35f) {
+                auto& ax = m_gst->axes[hsig];
+                ax.h     = h;
+                ax.n     = 90;
+            }
+            continue;
+        }
         if (line.rfind("grip ", 0) == 0) {
             std::string tag;
             uint32_t    gsig = 0;
@@ -1095,7 +1272,37 @@ void FarCry5Stereo::gun_still_save()
             ++g;
         }
     }
+    // gunaxes: each gun's right hand in its own axes, once measured over 90 updates.
+    for (const auto& [sig, ax] : m_gst->axes)
+        if (ax.n >= 90) f << "rhand " << sig << ' ' << ax.h.x << ' ' << ax.h.y << ' ' << ax.h.z << '\n';
     spdlog::info("[Motion] gunstill: {} weapons' poses and {} grip points saved to fc5vr_gunposes.txt", n, g);
+}
+
+// gunaxesgame: guns kept on the game's pose with gunaxes on (F11, the weapon in hand). Saved as "gunaxesgame <sig> <sig> ...".
+bool FarCry5Stereo::gun_axes_game(uint32_t sig)
+{
+    std::lock_guard _{ m_weapon_cal_mtx };
+    return m_gun_axes_game.contains(sig);
+}
+
+std::string FarCry5Stereo::gun_axes_game_line()
+{
+    std::lock_guard _{ m_weapon_cal_mtx };
+    std::string     s = "gunaxesgame";
+    if (m_gun_axes_game.empty()) s += " none";
+    for (uint32_t v : m_gun_axes_game) s += " " + std::to_string(v);
+    return s;
+}
+
+const char* FarCry5Stereo::gun_axes_status() const
+{
+    switch (m_gun_axes_state.load()) {
+    case 1: return "measuring the game's hand on it (about a second in hand)";
+    case 2: return "held by its own axes";
+    case 3: return "the game's pose (its model does not point forward: a bow or a launcher?)";
+    case 4: return "the game's pose (unticked below)";
+    default: return "not a gun (or gunaxes off)";
+    }
 }
 
 // twohandblock: weapons never held with two hands (Homard 21 Oct 17:52, the Uzi: its two-handed hold stayed wrong with

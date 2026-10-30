@@ -124,8 +124,10 @@ void FarCry5Stereo::empty_hands_frame()
     const bool  on_foot     = m_motion.load() && !m_in_vehicle.load() && !m_menu_screen_on;
     const bool  slung       = m_mo.slung && !m_unarmed;
     const bool  align_sw    = m_empty_align.load();
-    const bool  active      = (mode != 0 || align_sw) && (m_unarmed || slung) && on_foot && !throwing;
-    const bool  bones       = active && m_unarmed;
+    // shoulderdraw (FarCry5WeaponSwitch.cpp): while a weapon switch hides the weapon, the right hand is an empty hand.
+    const bool  switching   = weapon_switch_hiding() && !slung;
+    const bool  active      = (mode != 0 || align_sw) && (m_unarmed || slung || switching) && on_foot && !throwing;
+    const bool  bones       = active && (m_unarmed || switching);
     if (bones != e.bones && (bones || e.said_bones)) {
         e.said_bones = true;
         spdlog::info("[Motion] emptyhandstill: {}", bones ? "no weapon, on foot: the right glove moved onto its controller by its bones"

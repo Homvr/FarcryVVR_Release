@@ -257,7 +257,7 @@ namespace fc5::bullet
         std::unordered_map<uint8_t*, float> g_recs;   // record -> the game's speed
         std::atomic<uint64_t>              g_shots{ 0 };
         std::atomic<uint64_t>              g_player_fire_ms{ 0 };   // GetTickCount64 of the player's last trigger (the mod's fire gate)
-        std::atomic<uint64_t>              g_press_ms{ 0 };         // bulletaim: GetTickCount64 of the trigger press (first frame down after 500 ms up)
+        std::atomic<uint64_t>              g_press_ms{ 0 };         // shotbuzz: GetTickCount64 of the trigger press (first frame down after 500 ms up)
         // [Shot] timing (Homard 21 Oct "two guns that have a high delay when shooting"): the mod's last release, waiting for the
         // game's next shot code call.
         std::atomic<bool>                  g_rel_armed{ false };
@@ -350,7 +350,7 @@ namespace fc5::bullet
     void  note_player_fire()
     {
         const uint64_t now = GetTickCount64();
-        if (now - g_player_fire_ms.load() > 500) g_press_ms = now;   // bulletaim: a new press
+        if (now - g_player_fire_ms.load() > 500) g_press_ms = now;   // shotbuzz: a new press
         g_player_fire_ms = now;
     }
     void  note_shot_release(uint64_t press_ms, uint64_t weapon)
@@ -386,15 +386,12 @@ namespace fc5::bullet
     {
         safetyhook::MidHook   g_shot_hook{};
         std::atomic<int>      g_probe_left{ 0 };
-        std::atomic<int>      g_aim_mode{ 0 };
-        std::atomic<bool>     g_origin_muzzle{ false };
         std::atomic<uint64_t> g_player_weapon{ 0 };   // the weapon (rsi) of the last player shot
         std::mutex            g_view_mtx;
         struct View { float cam[3]{}, fwd[3]{ 0, 1, 0 }, aim[3]{ 0, 1, 0 }, muzzle[3]{}; bool aim_ok{ false }, wall{ false }; uint64_t ms{ 0 }; };
         View                  g_view{};
 
         bool read3(uintptr_t p, float* v) { __try { std::memcpy(v, reinterpret_cast<const void*>(p), 12); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
-        bool write3(uintptr_t p, const float* v) { __try { std::memcpy(reinterpret_cast<void*>(p), v, 12); return true; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; } }
         float len3(const float* v) { return std::sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2]); }
         float angle_deg(const float* a, const float* b)
         {
@@ -406,9 +403,8 @@ namespace fc5::bullet
 
         void shot_call(safetyhook::Context& c)
         {
-            const int mode  = g_aim_mode.load();
             const int probe = g_probe_left.load();
-            if (mode == 0 && probe <= 0) return;
+            if (probe <= 0) return;
             const uintptr_t po = c.rbp - 0x58, pd = c.rbp - 0x68;
             float           o[3]{}, d[3]{};
             if (!read3(po, o) || !read3(pd, d)) return;
@@ -425,27 +421,13 @@ namespace fc5::bullet
             const bool     same    = c.rsi != 0 && c.rsi == g_player_weapon.load();
             const bool     player  = window && (at_cam || same);
             if (player && at_cam) g_player_weapon = c.rsi;
-            if (probe > 0) {
+            {
                 g_probe_left--;
                 spdlog::info("[ShotProbe] weapon (rsi) {:x} arg (r14) {:x} | origin ({:.3f}, {:.3f}, {:.3f}), {:.3f} m from the game camera | direction ({:.4f}, {:.4f}, {:.4f}) "
                              "length {:.4f}, {:.2f} deg from the game camera's forward, {:.2f} deg from the barrel{} | trigger window {} ({} ms) -> {}",
                              c.rsi, c.r14, o[0], o[1], o[2], dist, d[0], d[1], d[2], len3(d), angle_deg(d, v.fwd), angle_deg(d, v.aim), v.aim_ok ? "" : " (no barrel)",
                              window ? "open" : "shut", now - g_player_fire_ms.load(), player ? "the player's" : "not the player's");
             }
-            if (mode == 0 || !player || !v.aim_ok || now - v.ms > 200) return;
-            // bulletaim: the barrel ray, the game's length kept (a unit vector).
-            const float la = len3(v.aim), ld = len3(d);
-            if (la < 1e-4f || ld < 1e-4f) return;
-            float nd[3]{ v.aim[0] / la * ld, v.aim[1] / la * ld, v.aim[2] / la * ld };
-            const float turned = angle_deg(d, nd);
-            write3(pd, nd);
-            // bulletaim 2 (or bulletorigin muzzle): from the drawn muzzle, unless the barrel ray meets the scene within 10 cm of it (the muzzle at or in a wall).
-            const bool from_muzzle = (mode == 2 || g_origin_muzzle.load()) && !v.wall;
-            if (from_muzzle) write3(po, v.muzzle);
-            spdlog::info("[BulletAim] player shot (weapon {:x}): direction turned {:.2f} deg onto the barrel{}; {} ms after the trigger press", c.rsi, turned,
-                         from_muzzle ? fmt::format(", origin moved {:.3f} m to the muzzle", std::sqrt((v.muzzle[0] - o[0]) * (v.muzzle[0] - o[0]) + (v.muzzle[1] - o[1]) * (v.muzzle[1] - o[1]) + (v.muzzle[2] - o[2]) * (v.muzzle[2] - o[2]))) : std::string{},
-                         now - g_press_ms.load());
-            if ((mode == 2 || g_origin_muzzle.load()) && v.wall) spdlog::info("[BulletAim] the muzzle is at a wall (the barrel ray meets the scene within 10 cm): the game's origin kept");
         }
 
         bool shot_code_matches(const uint8_t* at)
@@ -459,19 +441,14 @@ namespace fc5::bullet
     {
         if (g_shot_hook) return true;
         if (!base || !shot_code_matches(base + 0x1e375fa)) {
-            spdlog::info("[BulletAim] the fire function's code differs at FC_m64+0x1e375fa (other game build): no shot hook");
+            spdlog::info("[ShotProbe] the fire function's code differs at FC_m64+0x1e375fa (other game build): no shot hook");
             return false;
         }
         g_shot_hook = safetyhook::create_mid(base + 0x1e375fa, shot_call);
-        spdlog::info("[BulletAim] shot hook at FC_m64+0x1e375fa {}", g_shot_hook ? "installed" : "failed");
+        spdlog::info("[ShotProbe] shot hook at FC_m64+0x1e375fa {}", g_shot_hook ? "installed" : "failed");
         return (bool)g_shot_hook;
     }
     void shot_probe(int n) { g_probe_left = std::max(0, n); }
-    void set_aim_mode(int mode) { g_aim_mode = std::clamp(mode, 0, 2); }
-    int  aim_mode() { return g_aim_mode.load(); }
-    bool shot_hook_ok() { return (bool)g_shot_hook; }
-    void set_origin_muzzle(bool on) { g_origin_muzzle = on; }
-    bool origin_muzzle() { return g_origin_muzzle.load(); }
     void set_view(const float cam[3], const float fwd[3], const float aim[3], const float muzzle[3], bool aim_valid, bool muzzle_at_wall)
     {
         std::lock_guard _{ g_view_mtx };

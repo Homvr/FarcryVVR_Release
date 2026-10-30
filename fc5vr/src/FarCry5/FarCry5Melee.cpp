@@ -17,9 +17,16 @@
 //    (40 deg), right by meleeyaw, rolled by meleeroll, about the game's hand on it, so none of the game's idle, run or swing
 //    animation shows. With it meleehit's weapon is the blade: 8 cm behind the hand to meleeblade (0.70 m) along it, and meleebutton
 //    auto (the default until release 0.12.1, r3 since) sends RT (the weapon's own swing) instead of the stick click.
+//  - meleeearly ms (default 100, 0 = off; Homard 26 Oct 12:44 "too big of a delay between the gesture and the hitting"): with meleehit 2
+//    the game's melee is pressed once the swing, moving on as it moves, will reach a body within that time (its blow lands ~0.2 s after the
+//    press); the pulse (and meleedamage) wait for the contact.
+//  - meleedamage 0|1|2|3 (default 2): at the contact the NPC at the body's root is found among the entities the game
+//    looks up by id and (2, 3) given meleedamagehp (200; the player has 250) of the game's damage from the player at once (FarCry5Lua.cpp); 1 only finds and
+//    logs it; 3 sends no game melee at all. meleedamagestatus logs its counters.
 //  - Tests: meleetest x y z [s] (a body standing at x right, y ahead, z up from the game camera, for s seconds, default 20), meleepress
 //    (the press now, straight ahead), meleelog N (N seconds of the bodies seen, one line a second).
 #include "FarCry5Stereo.h"
+#include "FarCry5Lua.h"
 
 #include <glm/gtc/matrix_access.hpp>
 #include <spdlog/spdlog.h>
@@ -103,6 +110,27 @@ bool FarCry5Stereo::melee_command(const std::string& cmd, const std::string& arg
     if (cmd == "meleebuzz") { m_mel_buzz_amp = num(0.0f, 1.0f, 1.0f); persist = true; return true; }
     if (cmd == "meleeaim") { m_mel_aim_on = arg != "off" && arg != "0"; persist = true; return true; }
     if (cmd == "meleeslew") { m_mel_slew = num(1.0f, 90.0f, 60.0f); persist = true; return true; }
+    if (cmd == "meleeearly") { m_mel_early_ms = int(num(0.0f, 400.0f, 100.0f)); persist = true; return true; }
+    if (cmd == "meleedamage") {
+        const int d = std::clamp(std::atoi(arg.c_str()), 0, 3);
+        m_mel_dmg   = d;
+        persist     = true;
+        const bool ok = fc5::lua::damage_watch(d > 0);
+        m_mel_dmg_watching = d > 0 && ok;
+        spdlog::info("[Melee] meleedamage {} ({}){}", d, d == 0 ? "off" : d == 1 ? "the NPC hit found, no damage" : d == 2 ? "damage at contact and the game's melee" : "damage at contact only",
+                     d > 0 && !ok ? ": the game's code is not ready yet (tried again in play)" : "");
+        return true;
+    }
+    if (cmd == "meleedamagehp") { m_mel_dmg_hp = num(1.0f, 100000.0f, 200.0f); persist = true; return true; }
+    if (cmd == "meleedamageself") {   // test: the damage stim sent to the player from itself (meleedamage on)
+        fc5::lua::damage_self(num(1.0f, 1000.0f, 10.0f));
+        return true;
+    }
+    if (cmd == "meleedamageprobe") {   // test: the recorded entities nearest the game camera (meleedamage on)
+        fc5::lua::probe_entities(m_world_cam_pos.x, m_world_cam_pos.y, m_world_cam_pos.z);
+        return true;
+    }
+    if (cmd == "meleedamagestatus") { spdlog::info("[Melee] meleedamage {}: {}", m_mel_dmg.load(), fc5::lua::damage_status()); return true; }
     if (cmd == "meleelog") { m_mel_log = int(num(0.0f, 600.0f, 10.0f)); return true; }
     if (cmd == "meleetest") {
         // meleetest x y z [s]: a test body; meleetest off: none.
@@ -217,6 +245,7 @@ void FarCry5Stereo::melee_hit_frame()
         m_mel_state = 0;
     }
     const int e = m_frame.load() & 1;   // this present's eye
+    if (m_mel_dmg.load() > 0 && mode > 0 && !m_mel_dmg_watching && m_player_views_last_frame != 0) m_mel_dmg_watching = fc5::lua::damage_watch(true);
     if (mode == 0 || !m_motion.load() || !m_mo.valid || !m_mo.ctrl_valid || m_menu_screen_on || m_cine_on || in_vehicle()) {
         m_mel_have[0] = m_mel_have[1] = false;
         if (mode == 0) m_mel_state = 0;
@@ -271,27 +300,65 @@ void FarCry5Stereo::melee_hit_frame()
         m_mel_inside[i] = in ? 1 : 0;
     }
     const float speed = std::max(v, m_mel_v);
+    const int   dmg   = m_mel_dmg.load();
+    // The game's melee pressed at a hit (or, with meleeearly, before it): the aim turned onto the point hit first.
+    auto press = [&](const MeleeBody& b, float h) {
+        m_mel_target = m_world_cam_pos + b.rel + glm::vec3{ 0.0f, 0.0f, std::clamp(h, 0.9f, 1.6f) };
+        if (mode != 2 || dmg == 3) return;   // meleedamage 3: the damage alone, no game melee
+        m_mel_state   = 1;
+        m_mel_state_t = now;
+        m_mel_aimed   = false;
+    };
+    // meleeearly (26 Oct, Homard 12:44 "too big of a delay between the gesture and the hitting"): the game's swing lands about 0.2 s
+    // after the press (simulator 25 Oct: the punch out 0.2 s after it), so the press goes when the weapon, moving on as it moves now,
+    // will enter a body within meleeearly ms; the pulse and meleedamage still wait for the contact itself.
+    const int early_ms = m_mel_early_ms.load();
+    if (mode == 2 && dmg != 3 && early_ms > 0 && have && speed > m_melee_speed.load() && now - m_mel_last_hit > std::chrono::milliseconds(m_mel_cool_ms.load())) {
+        const glm::vec3 v0 = (p0 - m_mel_p0[e]) / dt, v1 = (p1 - m_mel_p1[e]) / dt;
+        int   eb = -1;
+        float et = 0.0f, eh = 0.0f;
+        for (size_t i = 0; i < bodies.size() && eb < 0; ++i) {
+            if (m_mel_inside[i]) continue;
+            const glm::vec3 q0 = bodies[i].rel + glm::vec3{ 0.0f, 0.0f, kCapLow }, q1 = bodies[i].rel + glm::vec3{ 0.0f, 0.0f, kCapHigh };
+            for (int k = 1; k <= 5; ++k) {
+                const float t = 0.001f * float(early_ms) * float(k) / 5.0f;
+                float       ss = 0.0f, tt = 0.0f;
+                if (seg_seg(p0 + v0 * t, p1 + v1 * t, q0, q1, ss, tt) < r) { eb = int(i); et = t; eh = kCapLow + tt * (kCapHigh - kCapLow); break; }
+            }
+        }
+        if (eb >= 0) {
+            m_mel_last_hit = now;
+            m_mel_early_t  = now;
+            m_mel_swings++;
+            const auto& b = bodies[eb];
+            spdlog::info("[Melee] early press: {} {:.1f} m/s will reach the body at ({:.2f}, {:.2f}, {:.2f}) in about {:.0f} ms (meleeearly {}){}", armed ? "the weapon" : "the hand", speed,
+                         b.rel.x, b.rel.y, b.rel.z, 1000.0f * et, early_ms, b.test ? " (test body)" : "");
+            press(b, eh);
+        }
+    }
     if (best >= 0 && have && speed > m_melee_speed.load()) {
         m_mel_swings++;
-        const bool cool = now - m_mel_last_hit > std::chrono::milliseconds(m_mel_cool_ms.load());
-        const auto& b   = bodies[best];
-        const float h   = kCapLow + best_t * (kCapHigh - kCapLow);
-        if (cool) {
+        const bool  cool  = now - m_mel_last_hit > std::chrono::milliseconds(m_mel_cool_ms.load());
+        const bool  after = now - m_mel_early_t < std::chrono::milliseconds(early_ms + 250);   // the contact of an early press
+        const auto& b     = bodies[best];
+        const float h     = kCapLow + best_t * (kCapHigh - kCapLow);
+        if (cool || after) {
             m_mel_hits++;
             m_mel_last_hit = now;
-            // The point hit on the body's axis, between the hips and the head (the game's melee aims at the body, not the feet).
-            m_mel_target   = m_world_cam_pos + b.rel + glm::vec3{ 0.0f, 0.0f, std::clamp(h, 0.9f, 1.6f) };
+            const int64_t since = std::chrono::duration_cast<std::chrono::milliseconds>(now - m_mel_early_t).count();
             spdlog::info("[Melee] hit{}: {}{} {:.1f} m/s into the body at ({:.2f}, {:.2f}, {:.2f}) from the camera ({:.2f} m across the ground), {:.2f} m above its root, "
                          "{:.2f} m from its axis, {} of the {} ({} {:.2f} m); {} bodies near; {}",
                          b.test ? " (test body)" : "", armed ? "the weapon" : "the hand", blade ? fmt::format(" ({}, the blade)", m_weapon_sig.load()) : std::string{}, speed, b.rel.x, b.rel.y, b.rel.z, glm::length(glm::vec2{ b.rel }), h, best_d,
                          best_s > 0.8f ? "the tip" : best_s < 0.35f && armed ? "the stock end" : "the middle", armed ? "weapon" : "hand", armed ? "reach" : "fist", armed ? reach : r, bodies.size(),
-                         mode == 2 ? "the game's melee next" : "log only (meleehit 1)");
-            m_mel_buzz = m_mel_buzz_amp.load();   // (also in log only: the detection can be felt in the headset)
-            if (mode == 2) {
-                m_mel_state   = 1;
-                m_mel_state_t = now;
-                m_mel_aimed   = false;
+                         after ? fmt::format("{} ms after the early press", since) : mode == 2 && dmg != 3 ? std::string{ "the game's melee next" } : mode == 2 ? std::string{ "damage only (meleedamage 3)" } : std::string{ "log only (meleehit 1)" });
+            m_mel_early_t = {};
+            m_mel_buzz    = m_mel_buzz_amp.load();   // (also in log only: the detection can be felt in the headset)
+            // meleedamage: the NPC at this body's root found by the game's own entity positions, and (2, 3) the damage sent now.
+            if (dmg > 0 && (!b.test || dmg == 1)) {   // (a test body: found only, never sent)
+                const glm::vec3 root = m_world_cam_pos + b.rel;
+                fc5::lua::queue_damage(root.x, root.y, root.z, m_mel_dmg_hp.load(), dmg >= 2 && mode == 2 && !b.test);
             }
+            if (!after) press(b, h);
         }
     }
     if (const int left = m_mel_log.load(); left > 0 && now - m_mel_log_t > std::chrono::seconds(1)) {
@@ -430,4 +497,35 @@ void FarCry5Stereo::draw_melee_menu(const std::function<void(const char*, std::s
         keep("meleespeed", fmt::format("meleespeed {:.1f}", sp));
     }
     hint("A hit needs the weapon to move at least this fast (your real swings are 3 to 16 m/s); slower contact, like walking into someone, does nothing.");
+    int early = m_mel_early_ms.load();
+    if (ImGui::SliderInt("Press the game's melee before contact##meleeearly", &early, 0, 300, "%d ms")) {
+        m_mel_early_ms = early;
+        keep("meleeearly", fmt::format("meleeearly {}", early));
+    }
+    hint("The game's own melee lands about 0.2 s after it is pressed: it is pressed this long before your swing will reach the body, so its blow lands "
+         "closer to your contact. 0: pressed at the contact. Too long: a swing you stop short still makes the game hit.");
+    int d = m_mel_dmg.load();
+    ImGui::TextUnformatted("Damage at the moment of contact (test)");
+    bool dc = ImGui::RadioButton("Off##meleedamage", &d, 0);
+    ImGui::SameLine();
+    dc |= ImGui::RadioButton("Find the NPC only##meleedamage", &d, 1);
+    ImGui::SameLine();
+    dc |= ImGui::RadioButton("Damage + game melee##meleedamage", &d, 2);
+    ImGui::SameLine();
+    dc |= ImGui::RadioButton("Damage only##meleedamage", &d, 3);
+    if (dc) {
+        m_mel_dmg          = d;
+        m_mel_dmg_watching = fc5::lua::damage_watch(d > 0) && d > 0;
+        keep("meleedamage", fmt::format("meleedamage {}", d));
+    }
+    hint("At the contact the mod finds the NPC you hit among the game's own entities and sends it the game's damage at once, from you, as a "
+         "bullet would (the game's SendPierceStimWithOrigin). Find the NPC only: written to the log, no damage. Damage + game melee: the game's "
+         "blow follows too. Damage only: no game animation at all. Simulator 26 Oct: the damage works (sent to the player itself: 250 -> 240 -> 200) and the game's entities sit where the mod sees the bodies; not yet tried on an NPC.");
+    if (d >= 2) {
+        float hp = m_mel_dmg_hp.load();
+        if (ImGui::SliderFloat("Damage per hit##meleedamagehp", &hp, 10.0f, 2000.0f, "%.0f")) {
+            m_mel_dmg_hp = hp;
+            keep("meleedamagehp", fmt::format("meleedamagehp {:.0f}", hp));
+        }
+    }
 }

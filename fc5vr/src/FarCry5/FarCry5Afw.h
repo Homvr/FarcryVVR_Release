@@ -116,7 +116,9 @@ namespace fc5::afw
     // both images are carried with it (the cab is fixed there), so the held eye's own cab is used again. 0 = off.
     void set_vehicle_body(float metres);
     // Experiments from the BioShock VR mod's rebuild (24 Oct; F11 Experimental > AFW), bits: 1 afwfoot (a refined point whose
-    // remaining step crosses a depth break is refused), 2 afwrail (thin near things retried from the nearest texel beside the seed).
+    // remaining step crosses a depth break is refused), 2 afwrail (thin near things retried from the nearest texel beside the seed);
+    // 4 afwfoliage (29 Oct): a held point in a porous patch (needles, leaves, grass) is not taken for moved while the fresh eye
+    // has a speck of the plant within 6 texels.
     void set_experiments(int bits);
     void set_enabled(bool on);
     bool enabled();

@@ -1,5 +1,22 @@
 # Changelog
 
+## alpha 0.15 (30 October 2026): the gesture update
+Full notes: [release/RELEASE_NOTES_alpha_0_15.md](release/RELEASE_NOTES_alpha_0_15.md).
+- **Gestures:** weapon slots on both shoulders (slots 1 and 2 by default), the sling refilled after a load, a
+  holster on the hip and a cloth pouch for throwables (both experimental), faster weapon switching.
+- **Vehicles and falls:** the right stick steers helicopters and planes and never moves the view in a vehicle,
+  helicopter nose pitch, left hand drives and right hand shoots, planes face the nose on entry, boats accelerate,
+  parachute and wingsuit views fixed, no bounce after a knockdown, 3D cutscenes follow cuts.
+- **View and HUD:** body-based view, smooth walking and running, small detection chevrons placed in the world,
+  big world markers limited, a "VR mod loading" popup after each load (the launcher can skip it), map and
+  binoculars, B closes tutorial pop-ups, a tidier F11 menu.
+- **Picture:** OFXR Bridge's DLSS frame generation works, AFW foliage steady, lamps placed per eye, a foliage test
+  option for DLSS.
+- **Fixes:** no more lasting FPS drop from the 5-minute weapon scan, shots no longer held back, no automatic aim down
+  sights on iron sights, the weapon angle on the controller is saved.
+- **Defaults:** weapon pitch on the controller -5 degrees, even frame pacing off.
+- **Recommended:** OFXR Bridge and a high-bitrate codec (H.264+ 300-400 Mbps or AV1 10-bit about 200 Mbps).
+
 ## alpha 0.12.1 (25 October 2026): hotfix
 - **Stereo:** no more left-eye tremor for players whose VR Framework setting had VR_AsyncAER on (it is now always
   off).

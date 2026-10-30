@@ -187,8 +187,8 @@ void FarCry5Stereo::walk_left_stick(int16_t& lx, int16_t& ly)
 void FarCry5Stereo::draw_walk_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint,
                                    const std::function<void(const char*)>& section)
 {
-    section("Walking");
-    {
+    (void)section;
+    if (ImGui::CollapsingHeader("Walking")) {
         int         wb = m_walk_basis.load();
         const char* kBasis[]{ "Where the game aims (as before 22 Oct)", "Where you look", "Where your off hand points" };
         if (ImGui::Combo("Walk direction", &wb, kBasis, 3)) {

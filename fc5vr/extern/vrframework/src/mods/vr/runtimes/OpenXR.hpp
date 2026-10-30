@@ -24,9 +24,12 @@ struct OpenXR final : public VRRuntime {
     inline static double s_fc5_wait_ms{0.0}, s_fc5_end_ms{0.0}, s_fc5_copy_ms{0.0};   // Far Cry 5 submit timing (pacing log)
     // Far Cry 5 hitchlog: the same times as running totals in microseconds (never reset), read before and after each game call.
     inline static std::atomic<int64_t> s_fc5_wait_us{0}, s_fc5_begin_us{0}, s_fc5_end_us{0}, s_fc5_copy_us{0};
-    // Far Cry 5 xrhalf (research 15 Oct, off): before xrWaitFrame, wait until two display periods after the previous wait returned,
-    // less 2 ms, so every stereo pair spans exactly two refreshes (a steady 45 pairs/s at 90 Hz). Set by the mod in Stereo only.
-    inline static std::atomic<bool> s_fc5_xr_half{false};
+    // Far Cry 5 framelock (29 Oct, replaces xrhalf): every picture is shown for the same number of refreshes. -1 auto, 0 off,
+    // 1 or 2 fixed. With two, xrWaitFrame is entered two display periods after the previous one returned, less 2 ms.
+    inline static std::atomic<int> s_fc5_frame_lock{0};   // off by default (30 Oct)
+    inline static std::atomic<int> s_fc5_lock_n{1};             // refreshes per picture in use
+    inline static std::atomic<int> s_fc5_lock_over_pct{0};      // share of the last 2 s of pictures that took over a refresh (%)
+    inline static std::atomic<int> s_fc5_lock_pairs{-1};        // the mod's rendering: 1 Stereo pairs (two game calls a frame), 0 one call (AFW), -1 not said
     inline static std::atomic<uint64_t> s_fc5_half_waits{0};
     inline static double s_fc5_half_ms{0.0};
     // posetime (FC5 log): each update_poses locates the views and the hands together; its count and display time, to tell

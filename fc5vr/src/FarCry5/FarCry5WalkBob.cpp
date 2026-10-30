@@ -27,11 +27,9 @@
 bool FarCry5Stereo::bob_command(const std::string& cmd, const std::string& arg, bool& persist)
 {
     const bool on = arg == "on" || arg == "1" || arg == "true";
-    if (cmd == "walkbob") { m_no_bob = !on; persist = true; return true; }   // walkbob off|on (saved): off = the game's bob taken out
-    if (cmd == "bobjump") { m_bob_jump = std::clamp(float(std::atof(arg.c_str())), 0.02f, 1.0f); return true; }       // test (m)
-    if (cmd == "bobease") { m_bob_ease = std::clamp(float(std::atof(arg.c_str())), 0.02f, 2.0f); return true; }       // test (s)
-    if (cmd == "bobrootlead") { m_bob_rlead = std::clamp(float(std::atof(arg.c_str())), 0.0f, 20.0f); return true; } // test (m/s)
-    if (cmd == "bobrootcut") { m_bob_rcut = std::clamp(float(std::atof(arg.c_str())), 0.1f, 100.0f); return true; }  // test (Hz)
+    // walkbob off|on: part of bodyview since 29 Oct (FarCry5ViewPivot.cpp), a test command, no longer saved; off = the game's bob taken out.
+    // The test knobs bobjump, bobease, bobrootlead and bobrootcut are retired (their defaults kept).
+    if (cmd == "walkbob") { m_no_bob = !on; return true; }
     if (cmd == "boblog") { m_bob_log = arg.empty() ? 600 : std::max(0, std::atoi(arg.c_str())); return true; }         // test
     return false;
 }
@@ -41,6 +39,22 @@ bool FarCry5Stereo::bob_command(const std::string& cmd, const std::string& arg, 
 void FarCry5Stereo::bob_note_root(int frame, const glm::vec3& root, const glm::vec3& camoff)
 {
     const auto now  = std::chrono::steady_clock::now();
+    // bobsnapguard (downedfoot): a sample 1 m off the last kept one is held back for 0.5 s (no new root meanwhile: the bob eases off once
+    // it is 6 frames old), dropped if the root comes back (13:30:42-13:31:04 under the chute: the root 0.2-0.7 m and 1.85 m under the
+    // camera in turn, ~30 snaps of 1.6 m), kept if it stays (knocked down, getting up).
+    if (now - m_bob_root_t > std::chrono::seconds(1)) m_bsg_h_kept_ok = false;   // no root for a while: the next one starts afresh
+    if (m_downed_foot.load() && m_bsg_h_kept_ok && std::abs(camoff.z - m_bsg_h_kept) > 1.0f) {
+        if (!m_bsg_pend) { m_bsg_pend = true; m_bsg_pend_t0 = now; }
+        if (now - m_bsg_pend_t0 < std::chrono::milliseconds(500)) return;
+        m_bsg_pend = false;   // stayed for 0.5 s: a real change
+    } else if (m_bsg_pend) {
+        m_bsg_pend = false;   // back within 0.5 s: a flip
+        m_bsg_flips++;
+        m_bsg_last_t = now;
+        if (m_bsg_episode == 0) m_bsg_episode = 1;
+    }
+    m_bsg_h_kept    = camoff.z;
+    m_bsg_h_kept_ok = true;
     m_bob_h         = camoff.z;
     m_bob_h_frame   = frame;
     m_bob_root_z    = root.z;
@@ -118,13 +132,53 @@ float FarCry5Stereo::walk_bob_shift(int frame, const glm::vec3& cam)
                     if (t - m_bob_chg_t >= 0.25f && range >= 0.0f && range < m_bob_jump.load()) { m_bob_mode = 1; m_bob_target = med; }
                 }
             }
+            // downedfoot: the camera over 0.5 m from the eyes' level (knocked down, getting up; the game animates a crouch, so the level keeps up with it): the eyes follow at once.
+            // bobsnapguard: never under a chute, in a fall, in a vehicle or with downview easing the view itself; one snap, then none until
+            // the level has stayed within 0.5 m for 1 s (the rest eased as usual). One line per episode, its counts when it ends.
+            if (ok && m_downed_foot.load() && std::abs(m_bob_h - m_bob_lvl) > 0.5f) {
+                const bool held = m_dv_active || m_falling || m_co_suit || m_chute_vehicle || m_in_vehicle.load();
+                if (held || !m_bsg_armed) {
+                    if (m_bsg_episode == 0)
+                        spdlog::info("[Bob] downedfoot: the camera {} {:.2f} m over the body: eased, not snapped ({})", m_bob_h < m_bob_lvl ? "dropped" : "rose",
+                                     std::abs(m_bob_h - m_bob_lvl), held ? (m_dv_active ? "downview" : m_in_vehicle.load() ? "in a vehicle" : "a fall or a parachute") : "a snap under 1 s ago");
+                    m_bsg_blocked++;
+                    m_bsg_episode = std::max(m_bsg_episode, 1);
+                } else {
+                    if (m_bsg_episode == 0 && m_bob_drop_snaps++ < 50)
+                        spdlog::info("[Bob] downedfoot: the camera {} {:.2f} m over the body: the eyes follow at once (not eased)", m_bob_h < m_bob_lvl ? "dropped" : "rose",
+                                     std::abs(m_bob_h - m_bob_lvl));
+                    m_bob_mode   = 0;
+                    m_bob_target = m_bob_lvl = m_bob_h;
+                    m_bob_lvl_v  = 0.0f;
+                    m_bsg_armed  = false;
+                    m_bsg_ref_lvl  = m_bob_h;
+                    m_bsg_quiet_t0 = now;
+                    m_bsg_snaps++;
+                    m_bsg_episode = 1;
+                }
+                m_bsg_last_t = now;
+            }
+            if (!m_bsg_armed) {
+                if (std::abs(m_bob_h - m_bsg_ref_lvl) > 0.5f) { m_bsg_ref_lvl = m_bob_h; m_bsg_quiet_t0 = now; }
+                else if (now - m_bsg_quiet_t0 >= std::chrono::seconds(1)) m_bsg_armed = true;
+            }
+            if (m_bsg_episode > 0 && m_bsg_armed && now - m_bsg_last_t >= std::chrono::seconds(1)) {
+                if (m_bsg_snaps > 1 || m_bsg_blocked > 0 || m_bsg_flips > 0)
+                    spdlog::info("[Bob] downedfoot: bobsnapguard episode over: {} snap(s), {} more eased, {} root sample(s) 1 m off held back and dropped",
+                                 m_bsg_snaps, m_bsg_blocked, m_bsg_flips);
+                m_bsg_episode = m_bsg_blocked = m_bsg_flips = m_bsg_snaps = 0;
+            }
         }
         // The root now: the last one seen, plus the camera's rise or fall since its update past what the bob can do in that
         // time (a jump, a fall: at once); not in a stance change (that is h moving).
         const float age = std::max(0.0f, std::chrono::duration<float>(now - m_bob_root_t).count());
         const float x = cam.z - m_bob_rootcam_z, lim = m_bob_rlead.load() * age;
         m_bob_rl      = m_bob_mode == 2 || m_bob_rlead.load() <= 0.0f ? 0.0f : std::clamp(x - std::clamp(x, -lim, lim), -2.0f, 2.0f);
-        const float rt = m_bob_root_z + m_bob_rl;
+        // rootsteady: that root's height from the last three roots (uphill, samples with long and short steps in turn made the
+        // eyes' height step long and short in turn too).
+        glm::vec3   rs{ 0.0f, 0.0f, m_bob_root_z };
+        if (!root_steady_at(float(m_bob_h_frame), rs)) rs.z = m_bob_root_z;
+        const float rt = rs.z + m_bob_rl;
         // One-euro smoothing of the root's height (the cutoff rises with its rate: little lag in jumps and falls).
         const float h  = std::max(dt, 1e-4f);
         auto alpha     = [h](float hz) { return 1.0f / (1.0f + 1.0f / (6.2831853f * hz * h)); };
@@ -157,15 +211,4 @@ void FarCry5Stereo::bob_note_base(int frame, float z)
     auto& b = m_bob_base_at[frame & 7];
     b.frame = frame;
     b.z     = z;
-}
-
-void FarCry5Stereo::draw_bob_menu(const std::function<void(const char*, std::string)>& keep, const std::function<void(const char*)>& hint)
-{
-    bool v = m_no_bob.load();
-    if (ImGui::Checkbox("No up-and-down bob while walking", &v)) {
-        m_no_bob = v;
-        keep("walkbob", v ? "walkbob off" : "walkbob on");
-    }
-    hint("The game's camera rises and falls with each step. On (default): the eyes keep a steady height while walking, running or sprinting; "
-         "crouching, standing up, jumps, stairs and slopes still move them. Off: the game's bob, as before 23 Oct.");
 }

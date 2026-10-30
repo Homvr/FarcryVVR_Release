@@ -1298,14 +1298,15 @@ void FarCry5Stereo::scope_frame(int frame, const glm::vec3& eye_cam, const glm::
         }
     }
     // The weapon id (largest mesh of the weapon pass) changes for a moment while a rifle cycles its bolt or aims down
-    // sights: the last magnifying entry stays in effect for 1.5 s through a change to an id without one.
+    // sights: the last magnifying entry stays in effect for 1.5 s through a change to an id without one (scopesticky: only while
+    // the dominant eye was behind the scope, not for a gun taken next).
     {
         const auto tnow = std::chrono::steady_clock::now();
         if (have_cal && cal.mag > 1.01f) {
             m_scope_sticky     = cal;
             m_scope_sticky_sig = st.sig;
             m_scope_sticky_at  = tnow;
-        } else if (!have_cal && m_scope_sticky_sig != 0 && tnow - m_scope_sticky_at < std::chrono::milliseconds(1500)) {
+        } else if (!have_cal && m_scope_sticky_sig != 0 && tnow - m_scope_sticky_at < std::chrono::milliseconds(1500) && (!m_scope_sticky_eye.load() || m_scope_dom_was)) {
             cal      = m_scope_sticky;
             have_cal = true;
         }
@@ -1525,7 +1526,7 @@ void FarCry5Stereo::scope_learn_tick(bool on_foot, bool at_scope, UINT sig, bool
         // A read that saw no zoom (the press landed while the game ignored it) is tried again 3 s later, three tries per weapon.
         const auto tried = m_scope_probed.find(sig);
         const bool again = tried == m_scope_probed.end() || (tried->second.n < 3 && now - tried->second.last > std::chrono::seconds(3));
-        const bool probe = !known && at_scope && !lt && again && now - m_scope_sig_since > std::chrono::seconds(1);
+        const bool probe = !known && at_scope && !lt && again && now - m_scope_sig_since > std::chrono::seconds(1) && ads_probe_ok(sig);   // adsprobe
         if (!probe && !lt) return;
         a         = {};
         a.state   = 1;
@@ -2144,6 +2145,7 @@ bool FarCry5Stereo::scope_command(const std::string& cmd, const std::string& arg
         }
     }
     else if (cmd == "scopeauto") { m_scope_auto = on; persist(cmd, on ? "scopeauto on" : "scopeauto off"); }
+    else if (cmd == "scopesticky") { m_scope_sticky_eye = on; persist(cmd, on ? "scopesticky on" : "scopesticky off"); }
     else if (cmd == "scopelearn") {
         m_scope_learn = on;
         persist(cmd, on ? "scopelearn on" : "scopelearn off");

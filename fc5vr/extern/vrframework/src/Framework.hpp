@@ -119,6 +119,10 @@ public:
     // 2: after End); framework_items draws the framework's own options and every mod's panel.
     using CustomMenu = std::function<void(int phase, bool* open, const std::function<void()>& framework_items)>;
     void set_custom_menu(CustomMenu f) { m_custom_menu = std::move(f); }
+    // Far Cry 5 (loadpopup): a notice drawn while the menu is closed; true while it shows, and the menu's layer then carries it.
+    using Fc5Notice = std::function<bool()>;
+    void set_fc5_notice(Fc5Notice f) { m_fc5_notice = std::move(f); }
+    bool is_ui_layer_shown() const { return m_draw_ui || m_fc5_notice_on.load(); }
     auto get_last_window_pos() const { return m_last_window_pos; } // GOW imgui window
     auto get_last_window_size() const { return m_last_window_size; } // GOW imgui window
 
@@ -238,6 +242,8 @@ private:
     bool m_ui_passthrough{false};
 
     CustomMenu m_custom_menu{};
+    Fc5Notice m_fc5_notice{};
+    std::atomic<bool> m_fc5_notice_on{false};
     ImVec2 m_last_window_pos{};
     ImVec2 m_last_window_size{};
     Vector2f m_last_rt_size{1920, 1080};

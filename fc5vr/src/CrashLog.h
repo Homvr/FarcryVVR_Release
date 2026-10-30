@@ -17,4 +17,6 @@ void log_boot_header();
 // Until the success line: a note with stacks when no new start step comes for 30 s (again at 120 s).
 void start_boot_watchdog();
 void step(const char* name);
+// DllMain DLL_PROCESS_DETACH: a "[Boot] process exit" line straight into the log (normal: lpReserved set, the process is ending).
+void process_exit(bool normal);
 }

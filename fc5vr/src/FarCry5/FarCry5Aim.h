@@ -16,10 +16,13 @@ namespace fc5::aim
         float     depth_a{ 1e-5f }, depth_b{ 0.1f };  // metres = b / (z + a); z = 0 is the sky
         float     near_skip{ 0.0f };   // scene depths nearer than this (m) are the held gun, not the scene (sightaim: the sight line runs through the sight)
         float     start{ 0.3f }, stop{ 400.0f };   // the distances marched (m)
+        // A throw's arc (gravity > 0): dir is the launch velocity (m/s), start / stop are times (s) marched in steps of tstep s, and the
+        // result is the time the arc meets the scene. World z is up.
+        float     gravity{ 0.0f }, tstep{ 0.015f };
     };
 
     // PRESENT thread. depth: the scene depth snapshot (typeless 32-bit depth with an SRV binding).
-    // chan: 0 the barrel ray, 1 meleeswing's hand-motion ray (each with its own result).
+    // chan: 0 the barrel ray, 1 meleeswing's hand-motion ray, 2 throwv2's trajectory (each with its own result).
     void  march(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* depth, const Ray& ray, int chan = 0);
     // The newest result: distance along the ray in metres, or < 0 when nothing was hit (sky) or none yet.
     float last_hit(int chan = 0);

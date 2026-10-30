@@ -1,3 +1,7 @@
+#include "FarCry5MemScan.h"
+#include "FarCry5SwitchSpeed.h"
+#include "FarCry5LoadPopup.h"
+#include "FarCry5LodFov.h"
 #include "FarCry5Stereo.h"
 #include "FarCry5Lua.h"
 #include "FarCry5Aim.h"
@@ -23,6 +27,8 @@ namespace fc5::skinorder
 #include <glm/gtc/packing.hpp>
 #include <set>
 #include <map>
+
+namespace fc5::scope { void hist_prune(); }   // FarCry5Scope.cpp: once a second from probe_tick
 
 // The title of a window without sending it a message (GetWindowText sends WM_GETTEXT to windows of
 // this process, which deadlocks when their thread waits on the render thread).
@@ -370,8 +376,8 @@ namespace
     std::vector<void*>                    g_skin_src;    // the first 4 distinct source matrices
     std::vector<DWORD>                    g_skin_tids;
     std::chrono::steady_clock::time_point g_skin_watch_t{};
-    // skinposelog (FarCry5SkinPose.cpp): the palette writer's calls numbered in one sequence with the weapon camera upload and the
-    // weapon pass's draws, per frame (the mod's frame count when called).
+    // poseprobe (FarCry5PoseProbe.cpp): the palette writer's calls numbered in one sequence with the bone getter's reads, per frame
+    // (the mod's frame count when called).
     std::atomic<bool>                     g_skin_order{ false };
     std::atomic<uint64_t>                 g_skin_seq{ 0 };
     std::atomic<const std::atomic<int>*>  g_skin_frame_src{ nullptr };
@@ -396,7 +402,6 @@ namespace
     void skin_probe(safetyhook::Context& c)
     {
         if (fc5::poseprobe::armed()) fc5::poseprobe::note_skin(c.rcx, c.rdx);   // poseprobe: the arms meshes' bone remaps
-        if (fc5::skelhand::mode() > 0) fc5::skelhand::note_skin(c.rcx, c.rdx);   // skelhand: the player's pose checked against the arms' skin
         if (g_skin_order.load(std::memory_order_relaxed)) {
             if (const auto* fs = g_skin_frame_src.load()) {
                 const uint64_t  q = ++g_skin_seq;
@@ -422,7 +427,7 @@ namespace
         if (g_skin_tids.size() < 16 && std::find(g_skin_tids.begin(), g_skin_tids.end(), e.tid) == g_skin_tids.end()) g_skin_tids.push_back(e.tid);
     }
 
-    // The palette writer hooked once (skinsrc, skinposelog): its entry bytes checked.
+    // The palette writer hooked once (skinsrc, poseprobe): its entry bytes checked.
     bool skin_hook_install()
     {
         if (g_skin_hook) return true;
@@ -900,6 +905,9 @@ namespace
     constexpr uint32_t kCameraDistances = 124;   // c31; .y = the linear depth texture's value -> metres
     constexpr uint32_t kMinBytes      = 896;
 
+    // lodfov: the game's draws on the render thread ([LOD] line every 5 s)
+    uint64_t g_lod_draws = 0, g_lod_idraws = 0, g_lod_inst = 0, g_lod_tris = 0;
+
     const std::string kCommandFile = fc5::mod_file("fc5vr_cmd.txt");
     const std::string kSettingsFile = fc5::mod_file("fc5vr_settings.txt");
 
@@ -1012,6 +1020,7 @@ std::optional<std::string> FarCry5Stereo::on_initialize_d3d_thread()
     if (!m_menu_registered) {
         m_menu_registered = true;
         g_framework->set_custom_menu([](int phase, bool* open, const std::function<void()>& framework_items) { Get()->draw_menu(phase, open, framework_items); });
+        g_framework->set_fc5_notice([] { return fc5::loadpopup::draw(); });   // loadpopup: on the menu's layer while F11 is closed
     }
     auto device = g_framework->get_d3d11_hook()->get_device();
     if (device == nullptr) {
@@ -1587,6 +1596,7 @@ void FarCry5Stereo::log_start_notes()
 
 void FarCry5Stereo::install_early_hooks()
 {
+    fc5::lodfov::install_early();   // before the game reads its render config
     install_resolution_hooks();
     auto d3d11 = LoadLibraryA("d3d11.dll");
     if (!d3d11) {
@@ -2112,6 +2122,10 @@ uint8_t FarCry5Stereo::hk_frame(uintptr_t a, uintptr_t b, uintptr_t c, uintptr_t
     static auto& self = Get();
     // Game Lua (commands lua / luastatus): one queued line, on the game's own script thread, in play only.
     fc5::lua::frame_tick(self->m_player_views_last_frame != 0 && !self->m_menu_screen_on);
+    fc5::lua::vehicle_query(self->m_veh_script.load());   // vehscript
+    fc5::lua::down_query(self->m_down_view.load());       // downview (FarCry5DownView.cpp)
+    fc5::lua::gamestate_query(self->m_gamestate.load());   // gamestate (log only)
+    fc5::lua::gamestate_frame(self->m_menu_screen_on, self->m_cine_on, self->m_in_vehicle.load());
     // The extra call is the right eye: the game's call must be the left one (even frame). When a
     // Present outside this function shifted the parity, this frame runs once to get back in step.
     const bool double_it = self->m_frame_double.load() && self->m_stereo2.load() && (self->m_frame.load() & 1) == 0;
@@ -3240,7 +3254,7 @@ void FarCry5Stereo::note_compute_shader(ID3D11ComputeShader* cs, const void* cod
     std::vector<std::pair<bool, UINT>> hist;
     bool ssbc = false;
     std::vector<std::pair<std::string, UINT>> cbs;
-    std::vector<std::tuple<std::string, int, UINT>> res; // name, 0 texture / 1 UAV, slot
+    std::vector<std::tuple<std::string, int, UINT>> res; // name, 0 texture / 1 UAV / 2 structured buffer, slot
     for (UINT i = 0; i < sd.BoundResources; ++i) {
         D3D11_SHADER_INPUT_BIND_DESC b{};
         if (FAILED(refl->GetResourceBindingDesc(i, &b)) || !b.Name) continue;
@@ -3250,6 +3264,7 @@ void FarCry5Stereo::note_compute_shader(ID3D11ComputeShader* cs, const void* cod
         if (b.Type == D3D_SIT_CBUFFER) cbs.emplace_back(n, b.BindPoint);
         if (b.Type == D3D_SIT_TEXTURE) res.emplace_back(n, 0, b.BindPoint);
         if (uav) res.emplace_back(n, 1, b.BindPoint);
+        if (b.Type == D3D_SIT_STRUCTURED) res.emplace_back(n, 2, b.BindPoint);   // 2: structured buffer (lampeye)
         if (~crc == 0x47C5C6CDu && b.Type == D3D_SIT_TEXTURE && n == "DepthTexture") m_mv_depth_slot = b.BindPoint;
         if (~crc == 0x47C5C6CDu && uav && n == "outMotionVectorTexture") m_mv_out_slot = b.BindPoint;
         if (b.Type == D3D_SIT_CBUFFER && n == "CSSBCProvider") {
@@ -3268,7 +3283,6 @@ void FarCry5Stereo::note_compute_shader(ID3D11ComputeShader* cs, const void* cod
         // other eye's (switch ssrinput). 0x200 = SSLRInputTexture, 0x400 = PrevReflectionMotionBuffer.
         if (b.Type == D3D_SIT_TEXTURE && n == "SSLRInputTexture") hist.emplace_back(false, b.BindPoint | 0x200u);
         if (b.Type == D3D_SIT_TEXTURE && n == "PrevReflectionMotionBuffer") hist.emplace_back(false, b.BindPoint | 0x400u);
-        if (b.Type == D3D_SIT_TEXTURE && n == "WaterTessellatedUVTexture") shore_note_cs(cs, b.BindPoint);   // shoreblur: the water's edge
     }
     if (names.find("ASMDepthAtlasTexture") != std::string::npos && names.find("u:HalfScreenEffectsBuffer") != std::string::npos && g_asm_resolve_n.load() < 64) {
         g_asm_resolve_cs[g_asm_resolve_n.load()] = cs;   // asmlog: the sun shadow resolves
@@ -3458,6 +3472,55 @@ void WINAPI FarCry5Stereo::hk_update_subresource(ID3D11DeviceContext* ctx, ID3D1
     call_orig<void>(self->m_update_sub_hook, 48, ctx, dst, sub, box, src, row, depth);
 }
 
+// lampeye: the tiled lighting passes' lamps and lamp shadows (LightsLightingData, ShadowData) moved to this eye's camera.
+fc5::locallights::Saved FarCry5Stereo::lamp_swap(ID3D11DeviceContext* ctx)
+{
+    if (!fc5::locallights::enabled()) return {};
+    std::pair<UINT, UINT> slots{ 255, 255 };
+    {
+        std::lock_guard _{ m_ps_mtx };
+        auto it = m_lamp_cs.find(m_cur_cs);
+        if (it == m_lamp_cs.end()) {
+            if (auto r = m_cs_res.find(m_cur_cs); r != m_cs_res.end())
+                for (const auto& [n, t, s] : r->second) {
+                    if (t != 2) continue;
+                    if (n == "LightsLightingData") slots.first = s;
+                    else if (n.find("Shadow") != std::string::npos) slots.second = s;   // the lamp shadow projections (96 B each)
+                }
+            // A pass that writes the lamp data on (#B88F234F, LightsLightingDataOut: the lamps with their bounce light) keeps
+            // the game's: the lighting moves its output, which would otherwise be moved twice.
+            if (auto r = m_cs_res.find(m_cur_cs); r != m_cs_res.end())
+                for (const auto& [n, t, s] : r->second)
+                    if (t == 1 && n.find("LightsLightingData") != std::string::npos) slots = { 255, 255 };
+            it = m_lamp_cs.emplace(m_cur_cs, slots).first;
+            if (slots.first != 255) spdlog::info("[LampEye] t{} LightsLightingData, t{} shadows: {}", slots.first, (int)slots.second, m_cs_names[m_cur_cs]);
+        }
+        slots = it->second;
+    }
+    if (slots.first == 255) return {};
+    const glm::vec3 cg{ glm::inverse(load_rows(mats().orig[3]))[3] }, ce{ glm::inverse(load_rows(mats().repl[3]))[3] };
+    const glm::vec3 d = ce - cg;
+    if (!(glm::dot(d, d) > 1e-10f) || !(glm::dot(d, d) < 1e4f)) return {};
+    static const fc5::locallights::Raw raw{
+        [](ID3D11DeviceContext* c, ID3D11ComputeShader* cs) { call_orig<void>(Get()->m_cs_set_hook, 69, c, cs, static_cast<ID3D11ClassInstance* const*>(nullptr), 0u); },
+        [](ID3D11DeviceContext* c, UINT x, UINT y, UINT z) { call_orig<void>(Get()->m_dispatch_hook, 41, c, x, y, z); },
+        [](ID3D11DeviceContext* c, ID3D11Resource* r, const void* p) {
+            call_orig<void>(Get()->m_update_sub_hook, 48, c, r, 0u, static_cast<const D3D11_BOX*>(nullptr), p, 0u, 0u);
+        },
+    };
+    const float  delta[3]{ d.x, d.y, d.z };
+    const int64_t key = (int64_t)m_frame.load() * 2 + (m_scope_call ? 1 : 0);
+    static int64_t last_log = -100000;
+    if (key - last_log > 2000) {
+        last_log = key;
+        uint64_t sw = 0, bu = 0, re = 0;
+        fc5::locallights::stats(sw, bu, re);
+        spdlog::info("[LampEye] eye set {} offset from the game camera ({:.3f}, {:.3f}, {:.3f}) m; since last line {} swaps, {} copies, {} refused", m_frame.load() & 1, d.x, d.y,
+                     d.z, sw, bu, re);
+    }
+    return fc5::locallights::swap(ctx, raw, slots.first, slots.second, delta, key);
+}
+
 // CImpostorDataProvider (1360 B): QuadAxisU_VS c27-35, QuadAxisV_VS c45-53, QuadTopLeft_VS c63-71 are
 // the billboard quads in the game camera's view space: rotated into the eye's view space.
 bool FarCry5Stereo::fix_impostors(float* d)
@@ -3601,7 +3664,6 @@ void WINAPI FarCry5Stereo::hk_dispatch(ID3D11DeviceContext* ctx, UINT x, UINT y,
     static auto& self = Get();
     if (foreign_thread()) { call_orig<void>(self->m_dispatch_hook, 41, ctx, x, y, z); return; }
     if (self->m_scope_call && self->m_scope_skip.load() && self->m_cur_cs && self->scope_skip_cs(self->m_cur_cs)) { self->m_scope_skipped_cs++; return; }   // scopeskip
-    if (self->m_cur_cs && self->m_shore_blur.load()) self->shore_capture(ctx, self->m_cur_cs);   // shoreblur
     if (self->m_cur_cs && g_asm_log.load() > 0) self->asm_note_dispatch(ctx);   // asmlog
     if (self->m_cur_cs && self->m_skip_cs_any.load()) {   // review P4: no lock while the list is empty
         std::lock_guard _{ self->m_skip_cs_mtx };
@@ -3724,8 +3786,10 @@ void WINAPI FarCry5Stereo::hk_dispatch(ID3D11DeviceContext* ctx, UINT x, UINT y,
     if (!self->m_fog_late_list.empty() && self->m_cur_cs) self->fog_late_check();
     if (self->m_cur_cs && (self->m_ssr_marker.load() || self->m_ssr_ptr_log.load() > 0)) self->ssr_debug(ctx);
     SsrSymSaved sedge = (self->m_ssr_edge_log.load() > 0 && self->m_cur_cs) ? self->ssr_edge_bind(ctx) : SsrSymSaved{};   // ssredgelog
+    fc5::locallights::Saved lamp = self->m_cur_cs ? self->lamp_swap(ctx) : fc5::locallights::Saved{};   // lampeye
     if (!(self->m_ao_exact.load() && self->m_cur_cs && self->m_cur_cs == self->m_ssbc_temporal_cs && self->ao_exact_dispatch(ctx, x, y, z)))
         call_orig<void>(self->m_dispatch_hook, 41, ctx, x, y, z);
+    fc5::locallights::restore(ctx, lamp);
     if (self->m_smv_trace.load() > 0 && self->m_cur_cs) self->smv_trace(ctx, true);
     if (sedge.on) self->ssr_sym_restore(ctx, sedge);
     if (smv.on) self->smv_unbind(ctx, smv);
@@ -3806,7 +3870,9 @@ void WINAPI FarCry5Stereo::hk_dispatch_indirect(ID3D11DeviceContext* ctx, ID3D11
     if (!self->m_fog_late_list.empty() && self->m_cur_cs) self->fog_late_check();
     if (self->m_cur_cs && (self->m_ssr_marker.load() || self->m_ssr_ptr_log.load() > 0)) self->ssr_debug(ctx);
     SsrSymSaved sedge = (self->m_ssr_edge_log.load() > 0 && self->m_cur_cs) ? self->ssr_edge_bind(ctx) : SsrSymSaved{};   // ssredgelog
+    fc5::locallights::Saved lamp = self->m_cur_cs ? self->lamp_swap(ctx) : fc5::locallights::Saved{};   // lampeye
     call_orig<void>(self->m_dispatch_ind_hook, 42, ctx, args, offset);
+    fc5::locallights::restore(ctx, lamp);
     if (self->m_smv_trace.load() > 0 && self->m_cur_cs) self->smv_trace(ctx, true);
     if (sedge.on) self->ssr_sym_restore(ctx, sedge);
     if (smv.on) self->smv_unbind(ctx, smv);
@@ -5673,8 +5739,23 @@ bool FarCry5Stereo::fix_shadow_resolve(float* d)
     // TextureSpaceProjectionMatrix (c21-24) = the GAME projection taken to texture space (u = 0.5 x/w +
     // 0.5, v = 0.5 - 0.5 y/w), applied to view-space positions (the resolve's screen-space shadow rays):
     // the eye's projection, off-centre part included.
-    (void)cam_g;
-    (void)cam_e;
+    if (fc5::locallights::enabled()) {
+        // lampeye: LocalLightsShadowMapsParameters (c0-c14), up to 3 lamp shadow maps of 5 rows (NumLocalLightsShadowMaps c18.w, an
+        // int). Row 4.w < 0: a spot, rows 0-3 the projection's columns for x, y, z, 1 of a position relative to the game camera;
+        // else a point light, row 0.xyz its position relative to the game camera. The resolve's pixels are relative to the eye.
+        int n = 0;
+        std::memcpy(&n, d + 18 * 4 + 3, 4);
+        const glm::vec3 dl = cam_e - cam_g;
+        if (glm::dot(dl, dl) < 1e4f)
+            for (int k = 0; k < std::clamp(n, 0, 3); ++k) {
+                float* r = d + k * 5 * 4;
+                if (r[4 * 4 + 3] < 0.0f) {
+                    for (int c = 0; c < 4; ++c) r[3 * 4 + c] += dl.x * r[c] + dl.y * r[4 + c] + dl.z * r[8 + c];
+                } else {
+                    r[0] -= dl.x; r[1] -= dl.y; r[2] -= dl.z;
+                }
+            }
+    }
     if (m_shadow_shape.load()) {
         // Clip -> texture: rows (0.5 0 0 0.5) (0 -0.5 0 0.5) (0 0 1 0) (0 0 0 1) (offsets on the w column).
         static const float kToTex[16]{ 0.5f, 0, 0, 0.5f, 0, -0.5f, 0, 0.5f, 0, 0, 1, 0, 0, 0, 0, 1 };
@@ -5965,6 +6046,94 @@ static bool ps_texture_is(ID3D11DeviceContext* ctx, UINT w, UINT h)
     return sd.Width == w && sd.Height == h;
 }
 
+// hudprim: the draw's target is an image of the HUD image's size (the picture the HUD goes over), so the draw can be taken into
+// the HUD like the HUD's own (hud_begin would otherwise remake the HUD image at another size).
+bool FarCry5Stereo::hud_prim_fits(ID3D11DeviceContext* ctx)
+{
+    if (!m_hud_tex) return false;
+    ID3D11RenderTargetView* rtv = nullptr;
+    ctx->OMGetRenderTargets(1, &rtv, nullptr);
+    if (!rtv) return false;
+    ID3D11Resource* res = nullptr;
+    rtv->GetResource(&res);
+    rtv->Release();
+    if (!res) return false;
+    D3D11_RESOURCE_DIMENSION dim{};
+    res->GetType(&dim);
+    D3D11_TEXTURE2D_DESC td{}, hd{};
+    if (dim == D3D11_RESOURCE_DIMENSION_TEXTURE2D) static_cast<ID3D11Texture2D*>(res)->GetDesc(&td);
+    res->Release();
+    m_hud_tex->GetDesc(&hd);
+    return td.Width == hd.Width && td.Height == hd.Height && td.SampleDesc.Count == 1;
+}
+
+// hudprimcam: a hudprim draw taken into the HUD reads the world camera's buffer at b0, which holds this eye's camera: it is given
+// a copy of the game's own upload of this call instead, so it lands in the HUD image where the game puts it for its camera (as
+// the CSceneFireUi markers do). Its vertex shader's buffers are logged once (what it reads).
+bool FarCry5Stereo::hud_prim_cb_swap(ID3D11DeviceContext* ctx)
+{
+    ID3D11VertexShader* vs = nullptr;
+    ctx->VSGetShader(&vs, nullptr, nullptr);
+    if (vs) {
+        std::lock_guard _{ m_ps_mtx };
+        if (m_hud_prim_vs_seen.insert(vs).second) {
+            auto it = m_vs_info.find(vs);
+            spdlog::info("[HUD] hudprim draw: PS {} VS {} {} | b0 {} world camera buffer", (void*)m_cur_ps, (void*)vs, it != m_vs_info.end() ? it->second : std::string{ "(not reflected)" },
+                         m_vs_cb0 && is_world_cb(m_vs_cb0) ? "is the" : "is not a");
+        }
+    }
+    if (vs) vs->Release();
+    const int frame = m_frame.load();
+    if (!m_vs_cb0 || !is_world_cb(m_vs_cb0) || m_hud_game_cb_frame != frame || m_hud_game_cb.empty()) { m_hud_prim_cam_miss++; return false; }
+    ID3D11Buffer* orig = nullptr;
+    ctx->VSGetConstantBuffers(0, 1, &orig);
+    if (!orig) { m_hud_prim_cam_miss++; return false; }
+    D3D11_BUFFER_DESC bd{};
+    orig->GetDesc(&bd);
+    if (bd.ByteWidth > m_hud_game_cb.size() * 4) {
+        orig->Release();
+        m_hud_prim_cam_miss++;
+        return false;
+    }
+    if (!m_hud_prim_standin || m_hud_prim_standin_size != bd.ByteWidth) {
+        if (m_hud_prim_standin) m_hud_prim_standin->Release();
+        m_hud_prim_standin = nullptr;
+        D3D11_BUFFER_DESC sd{};
+        sd.ByteWidth = bd.ByteWidth;
+        sd.Usage     = D3D11_USAGE_DEFAULT;
+        sd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        ID3D11Device* dev = nullptr;
+        ctx->GetDevice(&dev);
+        if (dev) {
+            dev->CreateBuffer(&sd, nullptr, &m_hud_prim_standin);
+            dev->Release();
+        }
+        m_hud_prim_standin_size = bd.ByteWidth;
+    }
+    if (!m_hud_prim_standin) {
+        orig->Release();
+        m_hud_prim_cam_miss++;
+        return false;
+    }
+    // Past the mod's own UpdateSubresource hook (it would put the eye's camera back into a camera buffer it recognises).
+    call_orig<void>(m_update_sub_hook, 48, ctx, static_cast<ID3D11Resource*>(m_hud_prim_standin), 0u, static_cast<const D3D11_BOX*>(nullptr),
+                    static_cast<const void*>(m_hud_game_cb.data()), 0u, 0u);
+    ID3D11Buffer* b = m_hud_prim_standin;
+    call_orig<void>(m_vs_cb_hook, 7, ctx, 0u, 1u, static_cast<ID3D11Buffer* const*>(&b));
+    m_hud_prim_cb_orig    = orig;   // released at the restore
+    m_hud_prim_cb_swapped = true;
+    m_hud_prim_cam_n++;
+    return true;
+}
+
+void FarCry5Stereo::hud_prim_cb_restore(ID3D11DeviceContext* ctx)
+{
+    m_hud_prim_cb_swapped = false;
+    ID3D11Buffer* b       = std::exchange(m_hud_prim_cb_orig, nullptr);
+    call_orig<void>(m_vs_cb_hook, 7, ctx, 0u, 1u, static_cast<ID3D11Buffer* const*>(&b));
+    if (b) b->Release();
+}
+
 bool FarCry5Stereo::hud_begin(ID3D11DeviceContext* ctx)
 {
     FC5_TRACE("hud_begin");
@@ -6135,6 +6304,7 @@ bool FarCry5Stereo::hud_begin(ID3D11DeviceContext* ctx)
         if (dd.Width == hd.Width && dd.Height == hd.Height && dd.SampleDesc.Count == hd.SampleDesc.Count) { hud_dsv = dsv; g_hud_mask_dsv++; }
         else g_hud_mask_nodsv++;
     }
+    if (m_hud_prim_now) (target == m_hud_rtv ? m_hud_prim_panel_n : m_hud_prim_mark_n)[m_frame.load() & 1]++;   // hudprim: where it went, per eye
     ctx->OMSetRenderTargets(1, &target, hud_dsv);
     if (hud_blend) ctx->OMSetBlendState(hud_blend, m_hud_blend_factor, m_hud_sample_mask);
     m_hud_redirected = true;
@@ -6420,6 +6590,8 @@ bool FarCry5Stereo::world_character_draw(ID3D11DeviceContext* ctx, UINT count, U
         // frame, each its own game update.
         const int bf = m_frame.load();
         if (((bf & 1) == 0 || (afw_mode() && m_afw_root_every.load())) && m_body_root_frame != bf) {
+            m_body_root_prev2       = m_body_root_prev;   // rootsteady
+            m_body_root_prev2_frame = m_body_root_prev_frame;
             m_body_root_prev       = m_body_root;
             m_body_root_prev_frame = m_body_root_frame;
             m_body_root            = origin;
@@ -6490,17 +6662,20 @@ bool FarCry5Stereo::weapon_draw(ID3D11DeviceContext* ctx, UINT count, UINT start
     }
     if (m_hud_redirected) hud_end(ctx);
     m_hud_pending   = false;
+    m_hud_prim_now  = false;
     const bool skip = weapon_draw_impl(ctx, count, start, base, instances);
-    if (!skip && m_skin_pose.load()) skin_pose_draw(ctx, count);   // skinpose: this weapon-pass draw's object constants moved (restored after it)
     if (!skip && m_flame_world.load() && m_vs_cb0 && is_weapon_cb(m_vs_cb0) && !m_flame_cb_swapped) flame_cb_swap(ctx);   // flameworld: a weapon-pass particle draw in the world
-    if (!skip && (fc5::skelhand::mode() > 0 || m_skh_stat.load())) skel_hand_draw(ctx, count);   // skelhand: the arms' root, the drawn gun's measure
     // asmfloor: a far-shadow tile copied into the atlas keeps its depth off the light's near plane (restored after the draw).
     if (!skip && m_asm_dsv_atlas && m_asm_floor.load() && !m_asm_floor_swapped) asm_floor_swap(ctx);
     if (!skip && m_hud_pending) {
         m_hud_draw_count = count; m_hud_draw_start = start; m_hud_draw_base = base;   // hudscan
+        // hudprimcam: placed with the game's camera before its box is measured and it is drawn (restored after the draw).
+        if (m_hud_prim_now && m_hud_prim_cam.load() && !m_hud_prim_cb_swapped) hud_prim_cb_swap(ctx);
         hud_begin(ctx);
     }
-    m_hud_pending = false;
+    m_hud_pending  = false;
+    m_hud_prim_now = false;
+    if (!skip) hud_tex_probe(ctx);   // hudtexprobe (test)
     // vrpost: the post pass draws with its vignette and grain at 0 (put back after the draw, next to reddot_end).
     if (!skip && m_cur_ps && !m_postfx_swapped && m_postfx_vr.load() && !m_menu_screen_on) postfx_swap(ctx);
     // decaleye: a projected decal places itself through the game camera's view: given the eye-to-game-view inverse projection.
@@ -6619,8 +6794,6 @@ namespace
 // placed again before it is drawn.
 void FarCry5Stereo::gun_still_late_part(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base)
 {
-    if (skin_pose_active()) return;   // skinpose moves each weapon-pass draw itself (Stereo only: saved on, it is idle in AFW, where the camera places the pass)
-    if (skel_hand_active()) return;   // skelhand: the game holds the gun itself, the pass's camera is the eye's (FC2 VR thread, fc2-headset)
     const int fr = m_frame.load();
     float     obj[12]{};
     bool      have = false;
@@ -6668,8 +6841,6 @@ void FarCry5Stereo::gun_still_late_part(ID3D11DeviceContext* ctx, UINT count, UI
 // with the gun's own pose (exact from here on), and a guess from a part is checked against it.
 void FarCry5Stereo::gun_still_late(ID3D11DeviceContext* ctx)
 {
-    if (skin_pose_active()) return;   // skinpose moves each weapon-pass draw itself (Stereo only: saved on, it is idle in AFW, where the camera places the pass)
-    if (skel_hand_active()) return;   // skelhand: the game holds the gun itself, the pass's camera is the eye's (FC2 VR thread, fc2-headset)
     auto&     lc = m_gst_late_cam;
     const int fr = m_frame.load();
     if (lc.frame != fr || lc.redone || !lc.buf || lc.orig.empty()) return;
@@ -6730,7 +6901,7 @@ void FarCry5Stereo::bonesrc_draw(ID3D11DeviceContext* ctx, UINT count)
 {
     ID3D11Buffer* cb[4]{};
     ctx->VSGetConstantBuffers(0, 4, cb);
-    if (g_gunscan_state.load() != 0 && m_vs_cb0 && is_weapon_cb(m_vs_cb0) && cb[1] && count != 0 && count == m_weapon_sig.load()) {
+    if (g_gunscan_state.load() != 0 && m_vs_cb0 && is_weapon_cb(m_vs_cb0) && cb[1] && count != 0 && count == sig_mesh(m_weapon_sig.load())) {
         // gunscan: the gun mesh's object matrix row 0, picked at its first draw, then tracked once per frame.
         float obj[12]{};
         bool  have = false;
@@ -6878,6 +7049,10 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
                 const auto&     hm  = m_hand_map;
                 glm::mat4 Om{ 1.0f };
                 for (int r = 0; r < 3; ++r) for (int col = 0; col < 4; ++col) Om[col][r] = obj[r * 4 + col];
+                // holsterglove (FarCry5Holster.cpp): the weapon hand as the game holds the weapon, recorded with the weapon's copy.
+                const int wside_by_glove_now = left_handed() ? 1 : 0;
+                // (Also with the weapon slung: these are still the game's bones, its hand on the weapon, before the hand is moved to the controller.)
+                holster_glove_note(gm, count, start, base, Om, bones, m_glove_cent, wside_by_glove_now);
                 // Each hand's place now: its bones' rest-pose vertex centroids, skinned (position scale from
                 // CSceneGeometry, else the value measured on the gloves), in the game camera's space.
                 float scale = 1.13f / 32767.0f;
@@ -6917,6 +7092,11 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
                     // under it, barehands) moves by the same transform, or they would part by the difference of their centres.
                     if (m_hand_pivot_frame[s] == m_frame.load()) hand_c[s] = m_hand_pivot[s];
                     else { m_hand_pivot[s] = hand_c[s]; m_hand_pivot_frame[s] = m_frame.load(); }
+                }
+                // gunaxes: the weapon hand's centre, with or without the game's left hand (one-handed pistols draw only the right glove).
+                if (const int ws = left_handed() ? 1 : 0; hand_w[ws] > 0.0f && !move_weapon) {
+                    m_wpn_grip_cam   = hand_c[ws];
+                    m_wpn_grip_frame = m_frame.load();
                 }
                 // The weapon hand's own controller: on the sling the real controller (the pass sits at the sling), else the
                 // controller the pass is placed on (emptyhandstill).
@@ -7005,6 +7185,12 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
                     // 21-23 deg lower than the left's in the simulator, more on some weapons: Homard saw into its cuff).
                     // The turn is the smallest one between the two directions, eased so the game's animation does not jerk it.
                     // (Not while emptyhandstill holds the hands: the game's swinging pose would turn it; it keeps the standing one.)
+                    // holsterglove (FarCry5Holster.cpp): a weapon copy in this hand during a switch: the hand as it held that weapon, on it.
+                    if (wside == wside_by_glove_now && holster_glove(gm, count, start, base, Om, bones)) {
+                        drawn_rot[wside] = wh_rot;
+                        own_rot[wside]   = wh_rot;
+                        return;
+                    }
                     if (hand_w[0] > 0.0f && hand_w[1] > 0.0f && !empty_hands_holding()) {   // (holding: also emptyhandalign)
                         const glm::vec3 ar = glove_axis(wside);
                         glm::vec3       al = glove_axis(1 - wside);
@@ -7641,18 +7827,38 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
         {
             std::lock_guard _{ m_ps_mtx };
             if (m_hud_shaders.contains(m_cur_ps)) return true;
+            if (m_hud_prim.load() && m_hud_prim_ps.contains(m_cur_ps)) return true;   // hudprim: part of the HUD
         }
         if (m_scope_skip.load() && scope_skip_ps(m_cur_ps)) {
             m_scope_skipped_draws++;
             return true;
         }
     }
-    const bool hud_layer = m_hud_mode.load() == 0 && m_hud_layer.load() && fc5::dlss::upscaling();
-    if ((m_hud_mode.load() != 0 || hud_layer) && m_cur_ps && !m_menu_screen_on && m_player_views_this_frame > 0 && m_hud_steady_frames > 90) {
+    // sidearm (sidearmpick wheel): while the mod picks the sidearm slot the game's HUD draws (its weapon wheel) are not drawn (Homard 27 Oct: "the
+    // weapon wheel seems to have opened").
+    if (m_cur_ps && fc5::gesture::wheel_pick_now()) {
         bool hud = false;
         {
             std::lock_guard _{ m_ps_mtx };
             hud = m_hud_shaders.contains(m_cur_ps);
+        }
+        if (hud) return true;
+    }
+    const bool hud_layer = m_hud_mode.load() == 0 && m_hud_layer.load() && fc5::dlss::upscaling();
+    if ((m_hud_mode.load() != 0 || hud_layer) && m_cur_ps && !m_menu_screen_on && m_player_views_this_frame > 0 && m_hud_steady_frames > 90) {
+        bool hud = false, prim = false;
+        {
+            std::lock_guard _{ m_ps_mtx };
+            hud  = m_hud_shaders.contains(m_cur_ps);
+            prim = !hud && m_hud_prim.load() && m_hud_prim_ps.contains(m_cur_ps);
+        }
+        // hudprim: a screen indicator drawn with the plain primitive shader joins the HUD (as a marker before the compass bar, on
+        // the panel after it), unless its target is not the HUD image's size (left in the picture, counted).
+        if (prim) {
+            hud = hud_prim_fits(ctx);
+            if (hud) { m_hud_prim_draws++; m_hud_prim_eye[m_frame.load() & 1]++; }
+            else m_hud_prim_left++;
+            m_hud_prim_now = hud;
         }
         if (hud) {
             if (m_hud_mode.load() == 2) return true;
@@ -7842,6 +8048,7 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
         }
     }
     if (m_vs_cb0 != nullptr && is_world_cb(m_vs_cb0)) {
+        chute_probe(ctx, count);   // chuteprobe (log only, while falling or under a wingsuit / parachute)
         vehicle_probe(ctx, count);
         return world_character_draw(ctx, count, instances);
     }
@@ -7913,7 +8120,7 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
         return true;
     }
     bool glove = false;
-    if (m_hide_arms.load() && m_motion.load() && !skel_hand_arms()) {   // skelhandarms: the game's arms shown
+    if (m_hide_arms.load() && m_motion.load()) {
         ID3D11PixelShader* ps = nullptr;
         ctx->PSGetShader(&ps, nullptr, nullptr);
         bool arm = false;
@@ -7960,21 +8167,34 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
             const GloveMesh* gm = glove_mesh(ctx, count, start, base);
             if (gm && gm->ok && !is_hand_mesh(gm)) {
                 m_glove_clothes_hidden++;
+                if (count > 0 && m_motion.load()) throwable_pouch_cloth(ctx, count, start, base);   // throwpouchmat cloth: the pouch in the shirt's draw
                 return true;
             }
         }
         // throwable: the game draws its throwables other than the knife with the arms' material (simulator 25 Oct, Homard's save: a weapon-pass
         // draw of 2334 indices, pixel shader #D31033ED, from RB's 13th frame), so an arm draw is looked at too (recorded only: it stays hidden).
         if (arm && count > 0 && m_motion.load()) throwable_draw(ctx, count, start, base, true);
+        // throwpouchmat cloth (30 Oct): the pouch drawn in the first-person clothing draw (Character_Clothing, hidden here), not in a skin.
+        if (arm && count > 0 && m_motion.load()) {
+            const GloveMesh* gm = m_hands_float.load() ? glove_mesh(ctx, count, start, base) : nullptr;
+            if (!gm || gm->arm_side < 0) throwable_pouch_cloth(ctx, count, start, base);
+        }
         if (arm) return true;
         if (glove) m_glove_seen_this_frame = true;   // unarmedhand
+        if (glove && m_motion.load()) holster_show(ctx);      // sidearm: the recorded weapons drawn where they are carried first
         if (glove && m_motion.load()) throwable_chest(ctx);   // throwable: the recorded throwable drawn on the chest first
     }
     // throwable (FarCry5Throwable.cpp): the game's throwable, drawn while the throw button is held, moved to the left hand.
-    if (!glove && count > 0 && m_motion.load()) throwable_draw(ctx, count, start, base);
+    if (!glove && count > 0 && m_motion.load() && throwable_draw(ctx, count, start, base)) return true;
+    // sidearm (FarCry5Holster.cpp): the weapon's draws recorded, once per hold.
+    if (!glove && count > 0 && m_motion.load()) holster_draw(ctx, count, start, base, instances);
     // The weapon id: the largest weapon mesh of the pass. The gloves (kept with hand models on) are larger than a
     // small gun, so counting them gave every pistol the gloves' id and one shared calibration.
-    if (!glove || !m_sig_skip_gloves.load()) m_weapon_sig_frame = std::max(m_weapon_sig_frame, count);
+    if (!glove || !m_sig_skip_gloves.load()) {
+        m_weapon_sig_frame = std::max(m_weapon_sig_frame, count);
+        if (count != 65535u) m_weapon_sig2_frame = std::max(m_weapon_sig2_frame, count);   // weaponidsplit
+        if (m_sig_counts_n < kSigCounts) m_sig_counts[m_sig_counts_n++] = count;
+    }
     bool gun_mesh = false;   // gunstilllate: this draw is the weapon id's mesh, its transform this pass's own
     if (!glove && count > 0 && m_gun_still.load() && m_motion.load()) {
         // gunstill: the gun mesh's world transform (the weapon id's mesh), read back from its object constants.
@@ -7985,25 +8205,12 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
             if (c1) {
                 std::lock_guard _{ m_obj_mtx };
                 if (auto it = m_obj_consts.find(c1); it != m_obj_consts.end() && it->second.size >= 48) {
-                    // skelhand 3 with skelhandstill: the gun is drawn already moved; gunstill measures the game's own matrix of it (a
-                    // draw not matched to one of our moves is not measured: it would feed the move back into the hold).
-                    float raw[12];
-                    const bool still = skel_hand_still();
-                    const bool got   = still && fc5::skelhand::raw_gun(it->second.f, raw);
-                    if (still) (got ? m_skh_raw_hits : m_skh_raw_miss)++;
-                    if (got) {   // skelhandlate: how many frames old the drawn gun's placement is
-                        m_skh_lag     = std::clamp(m_frame.load() - fc5::skelhand::drawn_target_frame(), 0, 8);
-                        m_skh_lag_min = std::min(m_skh_lag_min, m_skh_lag);
-                        m_skh_lag_max = std::max(m_skh_lag_max, m_skh_lag);
-                    }
-                    if (!still || got) {
-                        std::memcpy(m_gun_obj_now, got ? raw : it->second.f, sizeof(m_gun_obj_now));
-                        m_gun_obj_count = count;
-                        m_gun_obj_seen  = m_frame.load();
-                        gun_still_gun_cb(c1);   // probe (a key only, no reference kept)
-                        gun_mesh = count == m_weapon_sig.load();
-                        if (gun_mesh) m_gun_world[m_frame.load() & 3] = { m_frame.load(), obj_mat(m_gun_obj_now) };   // afwgunpose, afwgunmvpose
-                    }
+                    std::memcpy(m_gun_obj_now, it->second.f, sizeof(m_gun_obj_now));
+                    m_gun_obj_count = count;
+                    m_gun_obj_seen  = m_frame.load();
+                    gun_still_gun_cb(c1);   // probe (a key only, no reference kept)
+                    gun_mesh = count == sig_mesh(m_weapon_sig.load());
+                    if (gun_mesh) m_gun_world[m_frame.load() & 3] = { m_frame.load(), obj_mat(m_gun_obj_now) };   // afwgunpose, afwgunmvpose
                 }
                 c1->Release();
             }
@@ -8025,6 +8232,14 @@ bool FarCry5Stereo::weapon_draw_impl(ID3D11DeviceContext* ctx, UINT count, UINT 
             if (glove) m_gst_late_pre_gloves++;
         }
     }
+    // shoulderdraw (FarCry5WeaponSwitch.cpp): while a weapon switch puts the old weapon away and draws the new one, only the gloves
+    // are drawn (the weapon's pose and id above are still read).
+    if (!glove && weapon_switch_hiding()) {
+        weapon_switch_note_hidden();
+        return true;
+    }
+    // sidearm (FarCry5Holster.cpp): while a sling or hip grab's switch is pending, the game's switch animation is not shown (the copies are).
+    if (!glove && holster_hides_game()) return true;
     // Scope (scopehidegun): the eye behind the scope does not draw the weapon pass (it would fill the lens).
     if (scope_hides_gun()) {
         m_scope_gun_skips++;
@@ -8087,9 +8302,9 @@ void WINAPI FarCry5Stereo::hk_draw_idx_inst_indirect(ID3D11DeviceContext* ctx, I
     FC5_FP_AGAIN(call_orig<void>(self->m_dii_hook, 39, ctx, args, offset));
     if (self->m_gimp_swapped) self->impostor_up_restore(ctx);
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
-    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
     if (self->m_postfx_swapped) self->postfx_restore(ctx);
     if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8114,9 +8329,9 @@ void WINAPI FarCry5Stereo::hk_draw_inst_indirect(ID3D11DeviceContext* ctx, ID3D1
     FC5_FP_AGAIN(call_orig<void>(self->m_di_hook, 40, ctx, args, offset));
     if (self->m_gimp_swapped) self->impostor_up_restore(ctx);
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
-    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
     if (self->m_postfx_swapped) self->postfx_restore(ctx);
     if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8134,9 +8349,9 @@ void WINAPI FarCry5Stereo::hk_draw_auto(ID3D11DeviceContext* ctx)
     call_orig<void>(self->m_dauto_hook, 38, ctx);
     FC5_FP_AGAIN(call_orig<void>(self->m_dauto_hook, 38, ctx));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
-    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
     if (self->m_postfx_swapped) self->postfx_restore(ctx);
     if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8166,6 +8381,8 @@ void WINAPI FarCry5Stereo::hk_draw_indexed(ID3D11DeviceContext* ctx, UINT count,
     FC5_TRACE("hk_draw_indexed");
     static auto& self = Get();
     if (foreign_thread()) { call_orig<void>(self->m_draw_idx_hook, 12, ctx, count, start, base); return; }
+    g_lod_draws++;
+    g_lod_tris += count;
     self->throw_all_probe(ctx, count, start, base, 1);   // throwallprobe (test)
     if (self->m_cd_state.load() == 2) self->cd_draw();
     MenuViewportRestore restore_vp{ ctx };
@@ -8180,9 +8397,9 @@ void WINAPI FarCry5Stereo::hk_draw_indexed(ID3D11DeviceContext* ctx, UINT count,
         FC5_FP_AGAIN(call_orig<void>(self->m_draw_idx_hook, 12, ctx, count, start, base));
         self->restore_textures(ctx);
         if (self->m_hud_redirected) self->hud_end(ctx);
-        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
         if (self->m_menu_blit_pending) self->menu_blit(ctx);
-        if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+        if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
         if (self->m_reddot_swapped) self->reddot_end(ctx);
         if (self->m_postfx_swapped) self->postfx_restore(ctx);
         if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8192,9 +8409,9 @@ void WINAPI FarCry5Stereo::hk_draw_indexed(ID3D11DeviceContext* ctx, UINT count,
     call_orig<void>(self->m_draw_idx_hook, 12, ctx, count, start, base);
     FC5_FP_AGAIN(call_orig<void>(self->m_draw_idx_hook, 12, ctx, count, start, base));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
-    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
     if (self->m_postfx_swapped) self->postfx_restore(ctx);
     if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8440,9 +8657,9 @@ void WINAPI FarCry5Stereo::hk_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
         FC5_FP_AGAIN(call_orig<void>(self->m_draw_hook, 13, ctx, count, start));
         self->restore_textures(ctx);
         if (self->m_hud_redirected) self->hud_end(ctx);
-        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
         if (self->m_menu_blit_pending) self->menu_blit(ctx);
-        if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+        if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
         if (self->m_reddot_swapped) self->reddot_end(ctx);
         if (self->m_postfx_swapped) self->postfx_restore(ctx);
         if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8452,9 +8669,9 @@ void WINAPI FarCry5Stereo::hk_draw(ID3D11DeviceContext* ctx, UINT count, UINT st
     call_orig<void>(self->m_draw_hook, 13, ctx, count, start);
     FC5_FP_AGAIN(call_orig<void>(self->m_draw_hook, 13, ctx, count, start));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
-    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
     if (self->m_postfx_swapped) self->postfx_restore(ctx);
     if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8475,6 +8692,9 @@ void WINAPI FarCry5Stereo::hk_draw_indexed_instanced(ID3D11DeviceContext* ctx, U
     FC5_TRACE("hk_draw_indexed_instanced");
     static auto& self = Get();
     if (foreign_thread()) { call_orig<void>(self->m_draw_idx_i_hook, 20, ctx, count, inst, start, base, start_inst); return; }
+    g_lod_idraws++;
+    g_lod_inst += inst;
+    g_lod_tris += uint64_t(count) * inst;
     self->throw_all_probe(ctx, count, start, base, inst);   // throwallprobe (test)
     if (self->m_cd_state.load() == 2) self->cd_draw();
     MenuViewportRestore restore_vp{ ctx };
@@ -8491,9 +8711,9 @@ void WINAPI FarCry5Stereo::hk_draw_indexed_instanced(ID3D11DeviceContext* ctx, U
         FC5_FP_AGAIN(call_orig<void>(self->m_draw_idx_i_hook, 20, ctx, count, inst, start, base, start_inst));
         self->restore_textures(ctx);
         if (self->m_hud_redirected) self->hud_end(ctx);
-        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
         if (self->m_menu_blit_pending) self->menu_blit(ctx);
-        if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+        if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
         if (self->m_reddot_swapped) self->reddot_end(ctx);
         if (self->m_postfx_swapped) self->postfx_restore(ctx);
         if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8503,9 +8723,9 @@ void WINAPI FarCry5Stereo::hk_draw_indexed_instanced(ID3D11DeviceContext* ctx, U
     call_orig<void>(self->m_draw_idx_i_hook, 20, ctx, count, inst, start, base, start_inst);
     FC5_FP_AGAIN(call_orig<void>(self->m_draw_idx_i_hook, 20, ctx, count, inst, start, base, start_inst));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
-    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
     if (self->m_postfx_swapped) self->postfx_restore(ctx);
     if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8541,9 +8761,9 @@ void WINAPI FarCry5Stereo::hk_draw_instanced(ID3D11DeviceContext* ctx, UINT coun
         FC5_FP_AGAIN(call_orig<void>(self->m_draw_i_hook, 21, ctx, count, inst, start, start_inst));
         self->restore_textures(ctx);
         if (self->m_hud_redirected) self->hud_end(ctx);
-        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+        if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
         if (self->m_menu_blit_pending) self->menu_blit(ctx);
-        if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+        if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
         if (self->m_reddot_swapped) self->reddot_end(ctx);
         if (self->m_postfx_swapped) self->postfx_restore(ctx);
         if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -8553,9 +8773,9 @@ void WINAPI FarCry5Stereo::hk_draw_instanced(ID3D11DeviceContext* ctx, UINT coun
     call_orig<void>(self->m_draw_i_hook, 21, ctx, count, inst, start, start_inst);
     FC5_FP_AGAIN(call_orig<void>(self->m_draw_i_hook, 21, ctx, count, inst, start, start_inst));
     if (self->m_hud_redirected) self->hud_end(ctx);
-    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx);
+    if (self->m_streak_cb_swapped) self->streak_cb_restore(ctx); if (self->m_flame_cb_swapped) self->flame_cb_restore(ctx); if (self->m_hud_prim_cb_swapped) self->hud_prim_cb_restore(ctx);
     if (self->m_menu_blit_pending) self->menu_blit(ctx);
-    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx); if (self->m_skp_swapped) self->skin_pose_restore(ctx);
+    if (self->m_hand_cb_swapped) self->hands_cb_restore(ctx);
     if (self->m_reddot_swapped) self->reddot_end(ctx);
     if (self->m_postfx_swapped) self->postfx_restore(ctx);
     if (self->m_decal_swapped) self->decal_restore(ctx);
@@ -9291,7 +9511,7 @@ void FarCry5Stereo::afw_present(ID3D11DeviceContext* ctx)
     }
     const int frame = m_frame.load();
     afw_veh_own_stamp(frame);   // afwvehown
-    fc5::afw::set_experiments((m_afw_foot.load() ? 1 : 0) | (m_afw_rail.load() ? 2 : 0));   // afwfoot, afwrail
+    fc5::afw::set_experiments((m_afw_foot.load() ? 1 : 0) | (m_afw_rail.load() ? 2 : 0) | (m_afw_foliage.load() ? 4 : 0));   // afwfoot, afwrail, afwfoliage
     const auto& rec = m_afw_cams[frame & 3];
     if (rec.frame != frame || !rec.cam[frame & 1].valid) {
         afw_record(frame, frame & 1, 3, -1, -1, 0.0f, rec.frame != frame ? "no camera record for this frame" : "camera not valid");
@@ -9552,14 +9772,13 @@ void FarCry5Stereo::on_present()
     fc5::poseprobe::present(m_frame.load(), g_wd_render_tid.load(), m_hand_map.cam + glm::transpose(m_hand_map.rot) * m_wpn_hand_cam, m_frame.load() - m_wpn_hand_frame <= 3,
                             m_hand_map.cam + glm::transpose(m_hand_map.rot) * m_hand_map.grip0, m_frame.load() - m_hand_map.frame <= 3 && !m_hand_map.empty);   // poseprobe
     {
-        // shotprobe, bulletaim (FarCry5BulletSpeed.cpp): the game camera and the barrel for the fire function's hook (game thread).
+        // shotprobe (FarCry5BulletSpeed.cpp): the game camera and the barrel for the fire function's hook (game thread).
         const float cam[3]{ g_fire_cam[0].load(), g_fire_cam[1].load(), g_fire_cam[2].load() }, fwd[3]{ g_fire_cam[3].load(), g_fire_cam[4].load(), g_fire_cam[5].load() };
         const float aim[3]{ m_mo.aim_world.x, m_mo.aim_world.y, m_mo.aim_world.z }, muz[3]{ m_mo.muzzle_drawn.x, m_mo.muzzle_drawn.y, m_mo.muzzle_drawn.z };
         const float hit = fc5::aim::last_hit();
         fc5::bullet::set_view(cam, fwd, aim, muz, m_motion.load() && m_mo.valid && m_mo.ctrl_valid && !m_mo.slung, hit >= 0.0f && hit < 0.1f);
     }
-    skin_pose_present();                                   // skinpose, skinposelog
-    skel_hand_present();                                   // skelhandstat
+    throw_melee_present();                                 // meleeswing, throwarc's measured throws
     if (g_gunscan_state.load() == 3) {
         // gunscan: the scan for the gun's object matrix row, inside Present.
         fc5::camscan::clear_excludes();
@@ -9602,7 +9821,7 @@ void FarCry5Stereo::on_present()
         }
         if (dctx) dctx->Release();
     }
-    if ((m_aim_dot.load() || m_scope.load() || m_reddot.load() || m_fade_level > 0.001f || m_shore_blur.load() || fc5::gesture::zone_show()) && !fc5::dlss::upscaling()) {
+    if ((m_aim_dot.load() || m_scope.load() || m_reddot.load() || m_fade_level > 0.001f || m_throw_arc.load() || fc5::gesture::throw_v2() || fc5::gesture::zone_show()) && !fc5::dlss::upscaling()) {
         ID3D11DeviceContext* dctx = nullptr;
         g_framework->get_d3d11_hook()->get_device()->GetImmediateContext(&dctx);
         auto dswap = g_framework->get_d3d11_hook()->get_swap_chain();
@@ -9610,7 +9829,6 @@ void FarCry5Stereo::on_present()
         if (dctx && dswap && SUCCEEDED(dswap->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&dbb))) && dbb) {
             // No upscaling (DLAA at the eye's size): the eye image is the back buffer; the lens goes in before the dot.
             fc5::hitch::Timer ht{ fc5::hitch::kOverlays };
-            shore_draw(dctx, dbb);   // shoreblur
             scope_keep_clean(dctx, dbb);   // AFW: the image before the lens and the dots, for the other eye's scope picture
             if (m_scope.load() && !scope_draw_model(dctx, dbb)) scope_draw(dctx, dbb);
             if (m_reddot.load()) reddot_draw(dctx, dbb);
@@ -9691,7 +9909,6 @@ void FarCry5Stereo::on_present()
             bb->Release();
             if (vrm->m_fc5_eye_override) { fc5::hitch::Timer ht{ fc5::hitch::kHudWorld }; hud_world_draw(uctx, vrm->m_fc5_eye_override); }   // hudmul, hudmarkers
             fc5::hitch::Timer ht_overlays{ fc5::hitch::kOverlays };
-            if (vrm->m_fc5_eye_override) shore_draw(uctx, vrm->m_fc5_eye_override);   // shoreblur
             if (vrm->m_fc5_eye_override) scope_keep_clean(uctx, vrm->m_fc5_eye_override);
             if (m_scope.load() && vrm->m_fc5_eye_override && !scope_draw_model(uctx, vrm->m_fc5_eye_override)) scope_draw(uctx, vrm->m_fc5_eye_override);
             if (m_reddot.load() && vrm->m_fc5_eye_override) reddot_draw(uctx, vrm->m_fc5_eye_override);
@@ -9699,8 +9916,8 @@ void FarCry5Stereo::on_present()
             if (vrm->m_fc5_eye_override) draw_throw_arc(uctx, vrm->m_fc5_eye_override);   // throwarc
             if (vrm->m_fc5_eye_override) gesture_zones_draw(uctx, vrm->m_fc5_eye_override);   // gesturezones
             if (vrm->m_fc5_eye_override) fade_draw(uctx, vrm->m_fc5_eye_override);   // vehfade
-            if (vrm->m_fc5_eye_override && vrm->m_fc5_f11_image_active.load() && vrm->m_fc5_f11_quad_valid && g_framework->is_drawing_ui()) {
-                // The F11 menu where its panel would hang (the quad of the last end-frame), seen from this eye.
+            if (vrm->m_fc5_eye_override && vrm->m_fc5_f11_image_active.load() && vrm->m_fc5_f11_quad_valid && g_framework->is_ui_layer_shown()) {
+                // The F11 menu (or the loading popup) where its panel would hang (the quad of the last end-frame), seen from this eye.
                 const int   fr = m_frame.load();
                 const auto& v  = m_xr_views[fr & 7];
                 const int   e  = fr & 1;
@@ -9766,6 +9983,19 @@ void FarCry5Stereo::on_present()
                     mr.stop          = 0.8f + m_melee_travel;
                     mr.near_skip     = std::max(glm::length(mr.origin_rel), glm::length(m_mo.ctrl_pos_world - m_hist[0].cur_cam)) + 0.12f;
                     fc5::aim::march(g_framework->get_d3d11_hook()->get_device(), ctx, clean ? m_aim_depth : m_scene_snapshot, mr, 1);
+                }
+                if (m_arc_stop.load() && m_frame.load() - m_arc_live_frame <= 1) {
+                    // throwarcstop: the drawn trajectory, from 0.06 s (past the hand) to 2.4 s, in 15 ms steps; depths no farther than the hand
+                    // (+0.3 m) are the hands and the throwable.
+                    fc5::aim::Ray ar = ray;
+                    ar.origin_rel    = m_arc_live_o - m_hist[0].cur_cam;
+                    ar.dir           = m_arc_live_v;
+                    ar.gravity       = m_arc_live_g;
+                    ar.tstep         = 0.015f;
+                    ar.start         = 0.06f;
+                    ar.stop          = 2.4f;
+                    ar.near_skip     = glm::length(ar.origin_rel) + 0.3f;
+                    fc5::aim::march(g_framework->get_d3d11_hook()->get_device(), ctx, clean ? m_aim_depth : m_scene_snapshot, ar, 2);
                 }
                 fc5::gputime::end(ctx, fc5::gputime::kAim);
             }
@@ -10112,6 +10342,11 @@ void FarCry5Stereo::note_pixel_shader(ID3D11PixelShader* ps, const void* code, s
             spdlog::info("[HUD] shape shader (no texture) {} {}", (void*)ps, names);
         }
     }
+    // hudprim: the game's other 2D primitive shader, with a picture (the same samplers as the HUD's: Homard's 30 Oct 12:29 chevrons).
+    if (names.find("CScenePrimitiveParameterProvider") != std::string::npos && names.find("DiffuseSampler0") != std::string::npos) {
+        m_hud_prim_ps.insert(ps);
+        spdlog::info("[HUD] screen primitive shader (hudprim) {} {}", (void*)ps, names);
+    }
     if (names.find("CSSLRContextProvider") != std::string::npos) {
         m_sslr_shaders.insert(ps);
         // The bind point of the SSLR constant buffer.
@@ -10455,7 +10690,7 @@ void FarCry5Stereo::streak_cb_restore(ID3D11DeviceContext* ctx)
 void FarCry5Stereo::flame_upload(const float* d, uint32_t size, int frame, const glm::mat3& eye_rot, const glm::vec3& eye_cam, const glm::vec3& cam,
                                  const glm::mat3& w_full, const glm::vec3& w_off, const glm::mat4& proj)
 {
-    if (!m_flame_world.load() || afw_mode() || skin_pose_active() || skel_hand_active() || m_mo.slung || m_scope_call || size < 4 * (kTanHalfFov + 1) || size > 8192) return;
+    if (!m_flame_world.load() || afw_mode() || m_mo.slung || m_scope_call || size < 4 * (kTanHalfFov + 1) || size > 8192) return;
     // The drawn muzzle D and the game's own point p that the pass's move puts there: p = cam + A^-1 (D - off).
     const glm::vec3 D     = m_mo.ctrl_pos_world + m_mo.ctrl_rot_world * glm::vec3{ m_barrel_off[0].load(), m_barrel_off[1].load(), m_barrel_off[2].load() };
     const glm::vec3 p     = cam + glm::inverse(w_full) * (D - w_off);
@@ -10520,7 +10755,7 @@ void FarCry5Stereo::flame_upload(const float* d, uint32_t size, int frame, const
 // flameworld, at a weapon-pass draw: a particle shader's draw is given the particle camera made at this buffer's upload.
 bool FarCry5Stereo::flame_cb_swap(ID3D11DeviceContext* ctx)
 {
-    if (!m_cur_ps || m_scope_call || m_menu_screen_on || m_hand_cb_swapped || m_skp_swapped || m_streak_cb_swapped) return false;
+    if (!m_cur_ps || m_scope_call || m_menu_screen_on || m_hand_cb_swapped || m_streak_cb_swapped) return false;
     {
         std::lock_guard _{ m_ps_mtx };
         if (!m_particle_ps.contains(m_cur_ps) || m_tracer_shaders.contains(m_cur_ps)) return false;   // the bullet streak keeps its own placing
@@ -10871,6 +11106,19 @@ void FarCry5Stereo::fp_eye_end(ID3D11DeviceContext* ctx)
     m_fp_draws++;
     m_fp_frame_draws++;
     m_fp_drawn_frame = m_frame.load();
+}
+
+// afwcopies (Homard 29 Oct: "in AFW the pouch, and the weapon in sling/holster that was not the last weapon pickup were transparent"):
+// the mod's own weapon-pass draws (FarCry5Holster.cpp's copies, FarCry5Throwable.cpp's throwable and pouch) go through call_orig, not
+// the draw hooks, so FC5_FP_AGAIN never drew them for the held eye. Its weapon depth had nothing there, the rebuild (worldOnly) took
+// neither eye's marked weapon pixels and showed the world behind: seen in one eye only, they looked see-through. The game's own weapon,
+// the last one taken, went through the hooks and stayed solid. Called right after such a draw, with its state still bound.
+void FarCry5Stereo::fp_eye_again(ID3D11DeviceContext* ctx, UINT count, UINT start, INT base)
+{
+    if (!m_afw_copies.load() || !m_fp_armed || !fp_eye_begin(ctx)) return;
+    call_orig<void>(m_draw_idx_hook, 12, ctx, count, start, base);
+    fp_eye_end(ctx);
+    m_fp_copy_draws++;
 }
 
 // Before this present's rebuild: the held eye's weapon pass of this frame for the compose (off when it did not draw).
@@ -11730,6 +11978,11 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
     const glm::mat4 game_vrp_o  = load_rows(d + kViewRotProj);
     const glm::vec3 game_pcam_o = load3(d + kCameraPosPv);
     const bool      d_orig_ok   = d[kWorldZOffset] == 0.0f;
+    // hudprimcam: the game's own world camera upload of this call, for the screen indicators taken into the HUD.
+    if (d_orig_ok && !late && m_hud_game_cb_frame != frame && size >= 4 * (kTanHalfFov + 1) && size <= 8192) {
+        m_hud_game_cb.assign(d, d + size / 4);
+        m_hud_game_cb_frame = frame;
+    }
 
     // The first-person pass (weapon, hands) has its own upload, before the world's: WorldSpaceZOffset
     // is set on it and its projection is the viewmodel FOV.
@@ -11757,10 +12010,13 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
         m_game_hfov      = hfov;
         if (std::abs(hfov - m_game_fov_logged) > 1.0f) {
             // Aiming down sights narrows the game camera (and so what the game culls): log each change.
-            spdlog::info("[Motion] game camera horizontal FOV {:.1f} deg (was {:.1f}, FOV field {:.1f}); aim-down-sights button {}", hfov, m_game_fov_logged, m_game_fov_deg,
-                         m_lt_sent.load() ? "held" : "up");
+            // P11 too: the vertical FOV tells which scale the game's on-screen LOD sizes see (lodfov).
+            const float vfov = d[kProj + 5] > 1e-3f ? glm::degrees(2.0f * std::atan(1.0f / d[kProj + 5])) : 0.0f;
+            spdlog::info("[Motion] game camera horizontal FOV {:.1f} deg (was {:.1f}, FOV field {:.1f}, vertical {:.1f}, P00 {:.4f} P11 {:.4f}); aim-down-sights button {}", hfov,
+                         m_game_fov_logged, m_game_fov_deg, vfov, d[kProj], d[kProj + 5], m_lt_sent.load() ? "held" : "up");
             m_game_fov_logged = hfov;
         }
+        update_binoculars(d[kProj] > 1e-3f ? 1.0f / d[kProj] : 0.0f);
     }
 
     // Motion controls: the view hangs on a body frame the mod owns (the game camera follows the gun).
@@ -11781,11 +12037,50 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
         // step ahead of the left's: the two eyes apart by the camera's motion while a cutscene camera travels).
         const bool per_pair = m_cine_pair.load() && m_frame_double.load();
         if (!weapon_view && (per_pair ? (m_cine_cam_frame >> 1) != (frame >> 1) : m_cine_cam_frame != frame)) {
-            const bool fresh = m_cine_cam_frame < frame - 4;
-            float      dy    = m_cine_game_yaw - m_cine_yaw;
-            dy               = std::atan2(std::sin(dy), std::cos(dy));
-            if (fresh || std::abs(dy) > glm::radians(45.0f)) m_cine_yaw = m_cine_game_yaw;
-            if (fresh || glm::length(cam - m_cine_cam) > 1.5f) m_cine_cam = cam;
+            const bool  fresh = m_cine_cam_frame < frame - 4;
+            auto        wrap  = [](float a) { return std::atan2(std::sin(a), std::cos(a)); };
+            const float dy    = wrap(m_cine_game_yaw - m_cine_yaw);
+            const float jump  = glm::length(cam - m_cine_cam);
+            if (m_cine_steer.load()) {
+                // cinesteer: a cut (the camera 1.5 m away or turned over 30 deg in one step; its heading is not trusted looking
+                // nearly straight up or down) takes the new heading at once; a pan past cinesteerstart is eased round.
+                const auto  now  = std::chrono::steady_clock::now();
+                const float dt   = fresh ? 0.0f : std::clamp(std::chrono::duration<float>(now - m_cine_steer_t).count(), 0.0f, 0.1f);
+                const float turn = wrap(m_cine_game_yaw - m_cine_prev_game_yaw);
+                const bool  cut  = !fresh && (jump > 1.5f || (std::abs(m_cine_pitch) < 75.0f && std::abs(turn) > glm::radians(30.0f)));
+                m_cine_steer_t   = now;
+                if (fresh) m_cine_steer_logs = 0;
+                auto note = [&](const std::string& s) {
+                    if (m_cine_steer_logs < 40) spdlog::info("[Cinematic] cinesteer: {}", s);
+                    else if (m_cine_steer_logs == 40) spdlog::info("[Cinematic] cinesteer: further cuts and steers in this cutscene not logged");
+                    m_cine_steer_logs++;
+                };
+                if (fresh || cut) {
+                    if (cut) note(fmt::format("cut, heading {:.0f} -> {:.0f} deg at once (camera moved {:.1f} m, turned {:.0f} deg in one step){}", glm::degrees(m_cine_yaw),
+                                              glm::degrees(m_cine_game_yaw), jump, glm::degrees(turn), m_cine_steering ? ", steer dropped" : ""));
+                    m_cine_yaw      = m_cine_game_yaw;
+                    m_cine_steering = false;
+                } else {
+                    if (!m_cine_steering && std::abs(dy) > glm::radians(std::clamp(m_cine_steer_start.load(), 10.0f, 90.0f))) {
+                        m_cine_steering   = true;
+                        m_cine_steer_from = m_cine_yaw;
+                        m_cine_steer_t0   = now;
+                    }
+                    if (m_cine_steering) {
+                        // Exponential: exp(-3) = 5% left after cinesteertime; the step capped at 90 deg/s.
+                        const float k   = 1.0f - std::exp(-3.0f * dt / std::clamp(m_cine_steer_time.load(), 0.3f, 3.0f));
+                        const float cap = glm::radians(90.0f) * dt;
+                        m_cine_yaw      = wrap(m_cine_yaw + std::clamp(dy * k, -cap, cap));
+                        if (std::abs(wrap(m_cine_game_yaw - m_cine_yaw)) < glm::radians(3.0f)) {
+                            m_cine_steering = false;
+                            note(fmt::format("steered {:.0f} -> {:.0f} deg in {:.2f} s", glm::degrees(m_cine_steer_from), glm::degrees(m_cine_yaw),
+                                             std::chrono::duration<float>(now - m_cine_steer_t0).count()));
+                        }
+                    }
+                }
+            } else if (fresh || std::abs(dy) > glm::radians(45.0f)) m_cine_yaw = m_cine_game_yaw;
+            m_cine_prev_game_yaw = m_cine_game_yaw;
+            if (fresh || jump > 1.5f) m_cine_cam = cam;
             else m_cine_cam += (cam - m_cine_cam) * (per_pair ? 0.0975f : 0.05f); // ~0.25 s to settle at 90 frames/s (0.0975 = two 0.05 steps)
             m_cine_cam_frame = frame;
         }
@@ -11797,7 +12092,7 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
             base[col][2] = -f[col];
         }
         base_cam = m_cine_cam;
-        if (m_cine_follow.load()) {
+        if (m_cine_follow.load() && !m_cine_steer.load()) {
             // cinefollow (default on): the head looks around the scene camera's own direction, heading and pitch, its roll
             // taken out, from its own position. The game draws only what its camera sees (and cutscene cameras are
             // narrow, 50-80 deg): a held heading left the eyes looking at undrawn ground (benchmark 13 Oct).
@@ -11821,7 +12116,7 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
     m_pivot_applied = false;
     // viewpivot: the eyes off the game camera's neck pivot, which turns with the aim (the gun); not where another base is used.
     const bool own_base = base_cam == cam;
-    if (motion && own_base) base_cam += view_pivot_shift(frame);
+    if (motion && own_base) base_cam += view_pivot_shift(frame, cam);
     if (motion) {
         // walkbob: the eyes' height without the step-rate bob (the filter runs every pair; applied where viewpivot may be).
         const float bob = walk_bob_shift(frame, cam);
@@ -11829,7 +12124,9 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
         else m_bob_applied = false;
         if (!weapon_view) bob_note_base(frame, base_cam.z);
     }
-    if (motion && !skel_hand_active()) gun_anchor_apply(frame, cam, base_cam, weapon_view);   // gunanchor, gunqlog (not with skelhand: the game holds the gun)
+    if (motion && own_base) base_cam = motion_smooth(frame, base_cam);   // smoothmotion (FarCry5ViewPivot.cpp)
+    if (motion && own_base) base_cam = down_view_base(frame, cam, base_cam);   // downview: knocked down, eased to the game camera (FarCry5DownView.cpp)
+    if (motion) gun_anchor_apply(frame, cam, base_cam, weapon_view);   // gunanchor, gunqlog
 
     // The eye: rotation rel_r and offset rel_t in the base frame (view space convention).
     const glm::mat3 rel_r{ rel };
@@ -11838,6 +12135,7 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
     const glm::vec3 eye_cam = base_cam + glm::transpose(base) * rel_t; // eye position, world
     if (!weapon_view) { m_sight_eye_cam[frame & 1] = eye_cam; m_sight_eye_rot[frame & 1] = eye_rot; }   // sightaim: sightlearn's eye test, sighteye
     if (!weapon_view && motion) view_log_line(frame, eye_rot, eye_cam, cam, base_cam);                    // viewlog (test)
+    if (!weapon_view && motion && !m_menu_screen_on) view_jump_note(frame, base, base_cam);                 // viewjump (log only)
     if (m_scope.load()) scope_frame(frame, eye_cam, eye_rot);
     if (!weapon_view && headset_fov) cull_coverage(frame, eye_rot, tan, rot, game_proj);
     if (!weapon_view && headset_fov) {
@@ -12019,33 +12317,14 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
         m_hand_map.corr  = corr;
         m_hand_map.grip0 = grip;         // sightaim: the drawn gun = controller + Wc (held pose - grip0)
         m_hand_map.empty = empty_hand;
+        m_hand_map.cr    = Cr;           // sidearm: a recording's steadied gun axes (FarCry5Holster.cpp)
+        m_hand_map.ct    = Ct;
         view_rot          = M;
         view_cam          = cam - glm::transpose(M) * t;
         w_floating        = true;
         w_full            = Wc * Cr * wrot;
         w_axes            = wrot;
         w_off             = m_mo.ctrl_pos_world + Wc * (Ct - grip);
-        if (skin_pose_active()) {
-            // skinpose (FarCry5SkinPose.cpp): the same move is given to each weapon-pass draw; the pass's camera stays the eye's.
-            skin_pose_camera(frame, w_full, cam, w_off, proj * glm::mat4{ view_rot }, view_cam);   // with the floating camera (motion vectors)
-            view_rot = eye_rot;
-            view_cam = eye_cam;
-        }
-        if (skel_hand_active() || m_skh_stat.load()) skel_hand_camera(frame, Wc, m_mo.ctrl_pos_world, grip, wrot, cam, w_full, w_off);   // skelhand (FarCry5Fc2Vr.cpp)
-        if (skel_hand_active()) {
-            // skelhand: the game holds the hand and the gun at the controller itself; the pass's camera is the eye's, and the hands' map is
-            // the identity (the floating left hand moves from where the game draws it).
-            view_rot         = eye_rot;
-            view_cam         = eye_cam;
-            if (m_skh_late_ok && m_skh_late_frame == frame) {
-                // skelhandlate: the pass's geometry seen moved by p -> R (p - from) + to (the controller's move since the update's placement).
-                view_rot = eye_rot * m_skh_late_R;
-                view_cam = glm::transpose(m_skh_late_R) * (eye_cam - m_skh_late_to) + m_skh_late_from;
-            }
-            m_hand_map.w_rot = glm::transpose(wrot);
-            m_hand_map.w_pos = cam;
-            m_hand_map.grip  = glm::vec3{ 0.0f };
-        }
     }
     if (!weapon_view && headset_fov && m_scope.load() && scope_src_eye() && m_scope_st.frame == frame && m_scope_st.dominant) {
         // scopesrc 1: while the dominant eye is behind a magnifying scope, its own world view is the scope camera's
@@ -12184,7 +12463,6 @@ void FarCry5Stereo::on_viewport_constants(float* d, uint32_t size)
     if (weapon_view && first_view) m_wgame[frame & 3] = { frame, w_axes, cam };   // afwgunmv: this frame's gun axes and game camera
     store_rows(prev_vrp, d + kViewRotProjPv);
     store3(prev_cam, d + kCameraPosPv);
-    if (weapon_view && w_floating && skin_pose_active()) skin_pose_prev(frame, d + kViewRotProjPv, d + kCameraPosPv);   // skinpose: the floating camera's previous frame, mapped
     store3(view_cam, d + kCameraPos);
     store3(view_cam, d + kViewPoint);
     apply_pair_lock(d, frame, view_index, weapon_view);
@@ -12681,11 +12959,11 @@ void FarCry5Stereo::cull_coverage(int frame, const glm::mat3& eye_rot, const glm
     }
     const auto now = std::chrono::steady_clock::now();
     if (now - m_cov_t0 >= std::chrono::seconds(1)) {
-        if (m_cov_out > 0 || m_cov_snaps > 0 || m_cov_trace.load() < 0)
+        if (m_cov_out > 0 || m_cov_snaps > 0 || m_cov_trace.load() < 0 || m_dv_active)   // downview: every second while active
             spdlog::info("[Cull] last second: an eye reached past the game's view in {} of {} frames ({} by over 2 deg), worst {:.1f} deg (eye vs game camera yaw {:+.1f} "
                          "pitch {:+.1f} roll {:+.1f}); eye vs game camera {:.1f} deg on average; game view {:.0f} deg wide, {}; snap turns {} (eyes waited {:.1f} frames on average, {} without the camera){}",
                          m_cov_out, m_cov_frames, m_cov_out2, m_cov_worst, m_cov_worst_yaw, m_cov_worst_pitch, m_cov_worst_roll, m_cov_frames ? m_cov_abs_sum / float(m_cov_frames) : 0.0f, glm::degrees(xmax - xmin),
-                         m_in_vehicle.load() ? (m_veh_driving.load() ? "driving" : "riding") : "on foot", m_cov_snaps,
+                         m_in_vehicle.load() ? (m_veh_driving.load() ? "driving" : "riding") : m_dv_active ? (m_dv_down ? "on foot, down (downview)" : "on foot, getting up (downview)") : "on foot", m_cov_snaps,
                          m_cov_snaps ? float(m_cov_snap_frames) / float(m_cov_snaps) : 0.0f, m_cov_snap_timeouts, m_cov_worst_where);
         m_cov_worst_where.clear();
         m_cov_t0     = now;
@@ -12808,7 +13086,8 @@ bool FarCry5Stereo::update_motion(int frame, const glm::mat3& game_rot, const gl
         std::lock_guard _{ m_ref_mtx };
         if (m_have_ref) {
             m_hand_ref = k;
-            glm::mat4 s = m_ref_inv * fc5::gesture::sling_pose(vr->get_transform(0), m_left_handed.load());
+            // sidearm: a sidearm in the game's hands hangs on the hip instead (rest_pose).
+            glm::mat4 s = m_ref_inv * fc5::gesture::rest_pose(vr->get_transform(0), m_left_handed.load());
             s[3]        = glm::vec4{ glm::vec3{ s[3] } * m_world_scale.load(), 1.0f };
             k           = s;
             m_mo.slung  = true;
@@ -12935,7 +13214,10 @@ bool FarCry5Stereo::update_motion(int frame, const glm::mat3& game_rot, const gl
         const glm::mat3 ry    = glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, -m_mo.ev_oy, glm::vec3{ 0, 1, 0 }) };
         const glm::mat3 rx    = glm::mat3{ glm::rotate(glm::mat4{ 1.0f }, -m_mo.ev_op, glm::vec3{ 1, 0, 0 }) };
         glm::mat3       v2w_a = v2w_g * rx * ry;
-        if (m_veh_pitch_guard.load() && !m_veh_aircraft) {
+        // planelook (FarCry5PlaneLook.cpp): in a flying vehicle, what the game held back of the head look is put right from the
+        // vehicle's own model (looking down no longer reads as the nose going up).
+        v2w_a = glm::transpose(plane_look_fix(frame, glm::transpose(v2w_a)));
+        if (m_veh_pitch_guard.load() && !m_veh_aircraft && !(m_plane_blend > 0.0f)) {
             // vehpitchguard (Homard 23 Oct: "when looking down while driving the camera was kind of stopping me and getting back up"):
             // if the game holds its vehicle camera at a pitch limit, the camera minus the offset handed reads as the car nosing up
             // while the head looks down, and the view (which follows the car's attitude) is pushed up. With the head look's pitch
@@ -13020,6 +13302,21 @@ bool FarCry5Stereo::update_motion(int frame, const glm::mat3& game_rot, const gl
             m_mo.hand_rot_world = body_to_world * glm::mat3{ m_hand_ref };
             m_mo.hand_pos_world = cam + body_to_world * glm::vec3{ m_hand_ref[3] };
         }
+        // sidearm (FarCry5Holster.cpp): the sling's and the hip's places, for the recorded copies (placed as the slung weapon is).
+        m_mo.carry_valid = false;
+        if (fc5::gesture::side_on() && vr->is_hmd_active()) {
+            std::lock_guard _{ m_ref_mtx };
+            if (m_have_ref) {
+                const glm::mat4 head = vr->get_transform(0);
+                const glm::mat4 sp   = m_ref_inv * fc5::gesture::sling_pose(head, m_left_handed.load());
+                const glm::mat4 hp   = m_ref_inv * fc5::gesture::hip_pose(head, m_left_handed.load());
+                m_mo.sling_rot_world = body_to_world * glm::mat3{ sp };
+                m_mo.sling_pos_world = cam + body_to_world * (glm::vec3{ sp[3] } * m_world_scale.load());
+                m_mo.hip_rot_world   = body_to_world * glm::mat3{ hp };
+                m_mo.hip_pos_world   = cam + body_to_world * (glm::vec3{ hp[3] } * m_world_scale.load());
+                m_mo.carry_valid     = true;
+            }
+        }
         // Where the shots must go: from the game camera (where the game fires from) through the point
         // the barrel points at, converge_m along the barrel.
         glm::vec3       barrel_dir    = glm::normalize(m_mo.ctrl_rot_world * glm::vec3{ 0, 0, -1 });
@@ -13080,6 +13377,16 @@ bool FarCry5Stereo::update_motion(int frame, const glm::mat3& game_rot, const gl
     return true;
 }
 
+// The stick aim switched on or off by hand: logged, as nothing else in the log shows it (Homard 28 Oct 21:21:07: ticked in F11,
+// the rest of the session aimed by the stick and the [Probe] motion line was the only trace).
+void FarCry5Stereo::note_stick_by_hand(const char* where)
+{
+    spdlog::info("[Motion] stick aim {} by hand ({}){}", m_stick_aim.load() ? "on" : "off", where,
+                 m_stick_aim.load() ? fmt::format(": the game camera follows the head through the pad's right stick; snap turns {}",
+                                                  m_snap_stick.load() ? "still go through the mouse (snapstick)" : "turn the view at once (snapstick off)")
+                                    : std::string{});
+}
+
 // Once per present: the game camera is steered to the controller's aim with relative mouse motion
 // (the game fires along its camera), and the right stick turns the body.
 void FarCry5Stereo::motion_post_present(float dt)
@@ -13104,9 +13411,14 @@ void FarCry5Stereo::motion_post_present(float dt)
                 // snaps went the old way (eyes first, culled camera ~3 updates later: 16 deg behind on a run of snaps); synced too
                 // now while the trigger is up: the aim and the Extended View offset hold still until the camera has turned.
                 const bool ready_only = m_snap_ready.load() && m_fire_ready_was && !m_trigger.load() && !m_dbg_trigger.load();
-                const bool sync = m_snap_sync.load() && m_snap_sync_pend == 0.0f && (!m_split_on || ready_only) && !m_stick_aim.load() && m_mo.valid &&
+                // snapstick (Homard 28 Oct 21:21-21:37 log: the stick aim box ticked in F11, 356 snaps went unsynced and the game camera
+                // trailed the eyes by 7-19 deg on average): with the stick aim picked by hand the game still hears the mouse, so the snap
+                // goes to the game camera through it and the eyes wait as above. The automatic fallback (the mouse ignored) still turns
+                // the eyes at once.
+                const bool stick_ok = !m_stick_aim.load() || (m_snap_stick.load() && !m_stick_auto.load());
+                const bool sync = m_snap_sync.load() && m_snap_sync_pend == 0.0f && (!m_split_on || ready_only) && stick_ok && m_mo.valid &&
                                   m_player_views_last_frame != 0 && foreground_is_game() && std::chrono::steady_clock::now() >= m_aim_paused_until &&
-                                  !(m_aim_pause.load()) && !headlook_active();
+                                  !(m_aim_pause.load()) && !headlook_active() && !(m_pop_hold.load() && m_pop_frozen.load());
                 if (sync) {
                     const int counts   = int(std::lround(-glm::degrees(d) / std::max(1e-4f, m_deg_per_count)));
                     m_snap_sync_pend   = d;
@@ -13124,9 +13436,10 @@ void FarCry5Stereo::motion_post_present(float dt)
                     m_body_yaw_pending += d;
                     request_jump_reset();   // the view jumped: each eye's DLSS history starts over
                     if (m_snap_sync.load())
-                        spdlog::info("[Motion] snap turn {:+.0f} deg not synced: firesplit {}, weapon ready {} (snapready {}), trigger {}, stick aim {}, motion {}, player views {}, game in front {}, "
+                        spdlog::info("[Motion] snap turn {:+.0f} deg not synced: firesplit {}, weapon ready {} (snapready {}), trigger {}, stick aim {}{}, motion {}, player views {}, game in front {}, "
                                      "aim paused {}, head look {}",
-                                     glm::degrees(d), m_split_on, m_fire_ready_was, m_snap_ready.load(), m_trigger.load() || m_dbg_trigger.load(), m_stick_aim.load(), m_mo.valid,
+                                     glm::degrees(d), m_split_on, m_fire_ready_was, m_snap_ready.load(), m_trigger.load() || m_dbg_trigger.load(), m_stick_aim.load(),
+                                     m_stick_aim.load() ? (m_stick_auto.load() ? " (automatic)" : " (by hand)") : "", m_mo.valid,
                                      m_player_views_last_frame, foreground_is_game(), std::chrono::steady_clock::now() < m_aim_paused_until || m_aim_pause.load(), headlook_active());
                 }
             } else if (std::abs(turn) < 0.3f) {
@@ -13177,7 +13490,10 @@ void FarCry5Stereo::motion_post_present(float dt)
     // culled camera back onto the head. Shots follow the barrel; what the eyes see is never culled.
     const bool can_split = m_fire_split.load() && !head_look && !m_in_vehicle.load() && !m_cine_on && fc5::tobii::installed();
     if (!can_split) m_split_on = false;
-    const bool settle_pitch = m_settle_pitch.load() && m_in_vehicle.load() && m_veh_settle.load() > 0 && !head_look && m_mo.ev_ok && fc5::tobii::installed();
+    // exitpitch: during the exit animation too (the aim loop sends nothing then, see below).
+    const bool exit_anim    = !m_in_vehicle.load() && m_exit_settle > 0 && m_veh_entry_follow.load();
+    const bool settle_pitch = m_settle_pitch.load() && ((m_in_vehicle.load() && m_veh_settle.load() > 0) || (m_exit_pitch.load() && exit_anim)) && !head_look &&
+                              m_mo.ev_ok && fc5::tobii::installed();
     if (!head_look && !m_split_on && !settle_pitch && (m_ev_yaw != 0.0f || m_ev_pitch != 0.0f)) {
         m_ev_yaw = m_ev_pitch = 0.0f;
         fc5::tobii::set_angles(0.0f, 0.0f);
@@ -13226,8 +13542,7 @@ void FarCry5Stereo::motion_post_present(float dt)
         }
         return;
     }
-    if ((m_in_vehicle.load() && !head_look && (m_veh_settle.load() > 0 || (m_veh_aircraft && m_veh_driving.load() && m_aircraft_guard.load()))) ||
-        (!m_in_vehicle.load() && m_exit_settle > 0 && m_veh_entry_follow.load())) {
+    if ((m_in_vehicle.load() && !head_look && (m_veh_settle.load() > 0 || (m_veh_aircraft && m_veh_driving.load() && m_aircraft_guard.load()))) || exit_anim) {
         // vehentryfollow: getting out, the exit animation turns the game camera and the view follows it (update_vehicle).
         // Just got in: the game camera turns to the vehicle's front by itself. Flying: the mouse / right stick
         // turn the aircraft itself, so the head must not steer it (the view would chase its own turn: spinning).
@@ -13289,10 +13604,7 @@ void FarCry5Stereo::motion_post_present(float dt)
     // game's aim from the head to the barrel (12-40 deg in one or two sends) before the first shot.
     const bool      ready      = m_fire_ready.load() && can_split && !throwing && m_mo.valid && m_mo.ctrl_valid && !m_mo.slung && !m_unarmed && !m_menu_screen_on &&
                                  !m_wheel_open.load() && !m_sh_sprinting;   // sprinthead: the aim on the head while sprinting
-    // bulletaim 1 or 2 (FarCry5BulletSpeed.cpp): the shots are written along the barrel, so the game's aim stays on the head while firing
-    // (no swing, no fireturnmax or aimbacklimit, no trigger gate).
-    const bool      no_swing   = fc5::bullet::aim_mode() > 0 && fc5::bullet::shot_hook_ok();
-    const bool      aim_barrel = (trigger || ready) && !no_swing;
+    const bool      aim_barrel = trigger || ready;
     if (ready != m_fire_ready_was) {
         m_fire_ready_was = ready;
         spdlog::info("[Motion] fireready: the game's aim {}", ready ? "kept on the barrel (weapon in hand)" : "follows the head");
@@ -13419,6 +13731,35 @@ void FarCry5Stereo::motion_post_present(float dt)
             const float p   = std::clamp(std::asin(std::clamp(want.z, -1.0f, 1.0f)) + std::clamp(m_lead_vel_pitch * lead, -lim, lim), -1.5f, 1.5f);
             want            = glm::vec3{ -std::sin(y) * std::cos(p), std::cos(y) * std::cos(p), std::sin(p) };
         }
+    }
+    {
+        // aimease ms (Homard 27 Oct, headset: "when picking up weapons from sling or holster sidearm, there is too much camera movement
+        // especially when looking down"; his 12:25 video: a 2-3 deg jolt of the whole view at every sling grab and release, 1-4 frames,
+        // each at the game's aim jumping between the head and the gun, 12-40 deg in a send or two). When the aim's target changes between
+        // the head and the barrel without the trigger (a weapon taken in hand or put back: sling, hip, shoulder switch), the target is
+        // turned from the old one to the new one over aimease ms, so the camera on the player's neck moves a little each update.
+        const auto now_e = std::chrono::steady_clock::now();
+        const int  ease  = m_aim_ease_ms.load();
+        if (aim_barrel != m_aim_ease_barrel && m_aim_ease_valid && !trigger && !throwing && !meleeing && ease > 0) {
+            m_aim_ease_from = m_aim_ease_last;
+            m_aim_ease_t0   = now_e;
+            m_aim_ease_on   = true;
+            m_aim_eased++;
+        }
+        m_aim_ease_barrel = aim_barrel;
+        if (trigger || throwing || meleeing || ease <= 0) m_aim_ease_on = false;
+        if (m_aim_ease_on) {
+            const float k = std::chrono::duration<float, std::milli>(now_e - m_aim_ease_t0).count() / float(ease);
+            if (k >= 1.0f) m_aim_ease_on = false;
+            else {
+                const float     s  = k * k * (3.0f - 2.0f * k);   // smoothstep: no step at either end
+                const glm::vec3 a  = glm::normalize(m_aim_ease_from), b = glm::normalize(want);
+                const float     om = std::acos(std::clamp(glm::dot(a, b), -1.0f, 1.0f));
+                if (om > 1e-4f) want = (std::sin((1.0f - s) * om) * a + std::sin(s * om) * b) / std::sin(om);
+            }
+        }
+        m_aim_ease_last  = want;
+        m_aim_ease_valid = glm::length(want) > 0.5f;
     }
     const float     yaw_d = yaw_of(want), pit_d = std::asin(std::clamp(want.z, -1.0f, 1.0f));
     float           e_yaw = yaw_d - yaw_c;
@@ -13625,7 +13966,8 @@ void FarCry5Stereo::motion_post_present(float dt)
 
     if (m_snap_sync_pend != 0.0f) {
         // snapsync: the snap's mouse send is on its way; nothing more is sent until the eyes have turned with the camera
-        // (snapready: with firesplit on too, its offset held where it was above).
+        // (snapready: with firesplit on too, its offset held where it was above; snapstick: the stick let go, it would turn the camera on top).
+        if (m_stick_aim.load()) m_stick_x = m_stick_y = 0.0f;
         m_last_sent_x = 0;
         m_last_yaw    = yaw_c;
         return;
@@ -13643,6 +13985,29 @@ void FarCry5Stereo::motion_post_present(float dt)
     m_last_yaw = yaw_c;
 
     const auto now_t = std::chrono::steady_clock::now();
+    // aimstickretry N (a tester's 28 Oct Pimax log: two camera-not-following pauses 1.4 s apart, weapon on the sling, put the
+    // aim on the stick for the rest of the session; the stick held it 0.5-2 deg off, over the 0.2 deg gate, so most trigger
+    // presses never fired): the stick aim the fallback chose tries the mouse again after N s with the trigger up. If the game
+    // still ignores the mouse, two more pauses (about 2.5 s) bring the stick back.
+    if (m_stick_auto && m_stick_aim.load() && !trigger && m_stick_retry_s.load() > 0 &&
+        now_t - m_stick_auto_since >= std::chrono::seconds(m_stick_retry_s.load())) {
+        m_stick_aim        = false;
+        m_stick_auto       = false;
+        m_mouse_failures   = 0;
+        m_unanswered       = 0;
+        m_stick_x = m_stick_y = 0.0f;
+        m_prev_yaw_seen    = yaw_c;
+        spdlog::info("[Motion] stick aim fallback: trying the mouse again after {} s (aimstickretry)", m_stick_retry_s.load());
+    }
+    if (down_view_holds_aim()) {
+        // downview: knocked down the game camera is the animation's (the game ignores the mouse); nothing is sent, so the view's heading
+        // steer (update_downview) never chases a camera the aim moves, and the mouse-not-following fallback is left alone.
+        m_stick_x = m_stick_y = 0.0f;
+        m_last_sent_x = 0;
+        m_aim_err_deg = glm::degrees(std::sqrt(e_yaw * e_yaw + e_pit * e_pit));
+        popup_watch(0);
+        return;
+    }
     if (m_stick_aim.load()) {
         // Aim through the virtual pad's right stick (the game turns at a rate set by the deflection):
         // proportional to the error, past the game's dead zone, full deflection beyond ~12 degrees.
@@ -13660,6 +14025,7 @@ void FarCry5Stereo::motion_post_present(float dt)
     if (now_t < m_aim_paused_until) {
         m_last_sent_x = 0;
         m_aim_err_deg = glm::degrees(std::sqrt(e_yaw * e_yaw + e_pit * e_pit));
+        popup_watch(0);   // popupesc: still watched (nothing sent)
         return;
     }
     if (std::abs(m_last_sent_x) >= 20 && std::abs(glm::degrees(yaw_c - m_prev_yaw_seen)) < 0.01f) {
@@ -13676,14 +14042,20 @@ void FarCry5Stereo::motion_post_present(float dt)
             // through the pad's right stick from then on.
             static auto vrs = VR::get();
             if (++m_mouse_failures >= 2 && vrs->is_using_controllers() && !m_stick_aim.load()) {
-                m_stick_aim = true;
-                spdlog::info("[Motion] the mouse is not turning the game camera: aiming through the virtual pad's right stick instead");
+                m_stick_aim        = true;
+                m_stick_auto       = true;
+                m_stick_auto_since = now_t;
+                spdlog::info("[Motion] the mouse is not turning the game camera: aiming through the virtual pad's right stick instead{}",
+                             m_stick_retry_s.load() > 0 ? fmt::format(" (the mouse tried again in {} s)", m_stick_retry_s.load()) : std::string{});
             }
             m_last_sent_x = 0;
             return;
         }
     } else {
         m_unanswered = 0;
+        // A send of 20+ counts the camera followed: the mouse works, so earlier pauses (a cutscene an hour ago) no longer count
+        // toward the stick fallback.
+        if (std::abs(m_last_sent_x) >= 20) m_mouse_failures = 0;
     }
     m_prev_yaw_seen = yaw_c;
 
@@ -13743,8 +14115,19 @@ void FarCry5Stereo::motion_post_present(float dt)
             dy = sy;
         }
     }
+    if ((dx != 0 || dy != 0) && m_pop_hold.load() && m_pop_frozen.load()) {
+        // popuphold: the paused game gets one probe send every 0.5 s (the first one it answers ends the hold), not one per pair.
+        if (now_t < m_pop_probe_at) {
+            dx = 0;
+            dy = 0;
+            m_pop_held++;
+        } else {
+            m_pop_probe_at = now_t + std::chrono::milliseconds(500);
+        }
+    }
     if (dx != 0 || dy != 0) m_aim_sends++;
-    send_mouse(dx, dy, false, false);
+    if (pair_end) popup_watch(dx);   // popupesc: did the camera answer the last send?
+    if (!m_mouse_drop.load()) send_mouse(dx, dy, false, false);   // mousedrop (test): the game "ignoring the mouse"
     m_mouse_sum_x += dx;
     record_send(dx, dy);
     walk_after_send();   // walkbasis: the walk turn counts this send (FarCry5Walk.cpp)
@@ -13798,7 +14181,14 @@ void FarCry5Stereo::motion_post_present(float dt)
     // since the previous press (Homard's 21 Oct 12:41 log: "after 2576 ms", "after 31731 ms" for shots that left at once).
     if (trigger && !m_trigger_was) m_trigger_since = now_t;
     const bool moving_open = trigger && err < moving_gate && !(err < m_fire_gate_deg.load());
-    const bool fire      = trigger && (no_swing || m_fire_open || fast_open || moving_open || err < m_fire_gate_deg.load() * (m_stick_aim.load() ? 2.0f : 1.0f));   // bulletaim: no gate
+    // firewaitmax N ms (tester 28 Oct: presses held back for seconds while the aim never settled within the gate): a press is
+    // let through after N ms whatever the gate, while the aim is within 5 deg of the barrel (a gun pointed past where the game
+    // can aim still waits). With firefast and firemoving, gated shots in Homard's 19-21 Oct headset logs left within about
+    // 10-260 ms, so with mouse aim this seldom changes a shot.
+    const int  wait_max_ms = m_fire_wait_max_ms.load();
+    const auto held_ms     = std::chrono::duration_cast<std::chrono::milliseconds>(now_t - m_trigger_since).count();
+    const bool waited_open = trigger && m_trigger_was && wait_max_ms > 0 && held_ms >= wait_max_ms && err < 5.0f;
+    const bool fire      = trigger && (m_fire_open || fast_open || moving_open || waited_open || err < m_fire_gate_deg.load() * (m_stick_aim.load() ? 2.0f : 1.0f));   // bulletaim: no gate
     if (fire && !m_fire_open) {
         const float     hit = fc5::aim::last_hit();
         const glm::vec3 p   = m_mo.aim_origin + m_mo.barrel_dir * (hit > 0 ? hit : m_mo.converge);
@@ -13806,7 +14196,9 @@ void FarCry5Stereo::motion_post_present(float dt)
         if (const int d = m_vel_arm.exchange(-1); d >= 0) m_vel_scan_at = m_frame.load() + d;   // velshot (bullet speed research)
         spdlog::info("[Motion] shot released{}: aim error {:.2f} deg after {} ms; barrel meets the scene at {:.2f} m, screen ({:.4f}, {:.4f})",
                      (fast_open && !(err < m_fire_gate_deg.load()) ? fmt::format(" (firefast, {} frames after the swing)", m_frame.load() - m_fast_sent_frame) : std::string{}) +
-                         (moving_open ? fmt::format(" (firemoving, barrel turning {:.2f} deg per update)", m_barrel_speed) : std::string{}), err,
+                         (moving_open ? fmt::format(" (firemoving, barrel turning {:.2f} deg per update)", m_barrel_speed) : std::string{}) +
+                         (waited_open && !(err < m_fire_gate_deg.load() * (m_stick_aim.load() ? 2.0f : 1.0f)) && !fast_open && !moving_open
+                              ? fmt::format(" (firewaitmax {} ms{})", wait_max_ms, m_stick_aim.load() ? ", stick aim" : "") : std::string{}), err,
                      std::chrono::duration_cast<std::chrono::milliseconds>(now_t - m_trigger_since).count(), hit, cl.w > 0 ? cl.x / cl.w * 0.5f + 0.5f : -1.0f,
                      cl.w > 0 ? 0.5f - cl.y / cl.w * 0.5f : -1.0f);
         fc5::bullet::note_shot_release(uint64_t(std::chrono::duration_cast<std::chrono::milliseconds>(now_t - m_trigger_since).count()), m_weapon_sig_frame);
@@ -13922,6 +14314,9 @@ bool FarCry5Stereo::eye_rel(int frame, int eye, glm::mat4& rel, glm::vec4& tange
     if (!(tangents.y > tangents.x) || !(tangents.z > tangents.w)) {
         return false;
     }
+    // binoczoom: the eyes drawn over a field narrowed by the binoculars' zoom and shown over the headset's own, so the whole view
+    // is magnified as on the flat screen (update_binoculars).
+    if (const float z = m_binoc_mag.load(); z > 1.001f) tangents /= z;
     headset_fov = true;
     return true;
 }
@@ -13999,6 +14394,15 @@ fc5::gesture::Output FarCry5Stereo::gesture_poll(bool weapon_grip, bool other_gr
     in.throw_aimed                          = m_throw_aimed.load();
     in.wheel                                = m_wheel_open.load();
     in.recorded                             = throwable_recorded();
+    in.sig                                  = m_weapon_sig.load();
+    in.cur_side                             = m_hol_cur_side.load();
+    in.hiding                               = m_hol_hiding.load();
+    in.sig_known                            = m_hol_known.load();
+    in.side_recorded                        = m_hol_side_rec.load();
+    in.side_known                           = m_hol_side_known.load();
+    in.main_sig                             = m_hol_main.load();   // loadslot (FarCry5Gesture.cpp)
+    in.side_sig                             = m_hol_side_sig.load();
+    in.side_unlisted                        = m_hol_side_unlisted.load();
     {
         bool  sprint = false;
         float since  = 1e6f;
@@ -14048,6 +14452,20 @@ fc5::gesture::Output FarCry5Stereo::gesture_poll(bool weapon_grip, bool other_gr
     }
     const auto out = fc5::gesture::update(in);
     m_rumble_armed = in.weapon && !out.slung && !in_vehicle();
+    if (out.key_scan != 0) {
+        // sidearm with sidearmkey N: that number key tapped (scan code: the game reads raw keys; held 120 ms as popupesc's Esc).
+        const WORD scan = out.key_scan;
+        std::thread([scan] {
+            INPUT k{};
+            k.type       = INPUT_KEYBOARD;
+            k.ki.wScan   = scan;
+            k.ki.dwFlags = KEYEVENTF_SCANCODE;
+            SendInput(1, &k, sizeof(INPUT));
+            Sleep(120);
+            k.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+            SendInput(1, &k, sizeof(INPUT));
+        }).detach();
+    }
     return out;
 }
 
@@ -14155,13 +14573,39 @@ void FarCry5Stereo::probe_tick()
     // F6 in the game window, or the snap command (works while the headset has the focus).
     bool pair_shot = false;
     if (const int sp = m_snap_pair.load(); sp == 2 && (m_frame.load() & 1) == 0) { m_snap_pair = 1; pair_shot = true; }
-    else if (sp == 1 && (m_frame.load() & 1) == 1) { m_snap_pair = 0; pair_shot = true; }   // snappair: left then right of one game frame
+    else if (sp == 1 && (m_frame.load() & 1) == 1) {   // snappair: left then right of one game frame
+        m_snap_pair = 0;
+        pair_shot   = true;
+        if (m_snap_burst.load() > 0) { m_snap_burst--; m_snap_pair = 2; }   // snappairs N: the next pair too
+    }
     // F6 in AFW also saves the two pictures the headset gets at that present (afwsnap: the fresh eye and the rebuilt one;
     // Homard 19 Oct: the AFW-only gun jitter, for a headset capture).
     const bool f6 = hotkey(VK_F6);
     if (f6 && afw_mode()) { m_afw_snap_held = -1; m_afw_snap = true; }
     const bool snapshot = f6 || m_snap_requested.exchange(false) ||
                           ((m_frame.load() & 1) == 0 && m_snap_left.exchange(false)) || pair_shot;
+    {
+        // lodfov: how much the game draws (both eyes, every pass), to compare LOD settings by number.
+        static auto     lod_t   = now;
+        static uint64_t lod_pre = m_presents;
+        if (now - lod_t >= std::chrono::seconds(5)) {
+            const uint64_t n = std::max<uint64_t>(1, m_presents - lod_pre);
+            spdlog::info("[LOD] per present, last 5 s: {} indexed draws, {} instanced draws ({} instances), {:.2f} M triangles",
+                         g_lod_draws / n, g_lod_idraws / n, g_lod_inst / n, g_lod_tris / 3.0 / n / 1e6);
+            g_lod_draws = g_lod_idraws = g_lod_inst = g_lod_tris = 0;
+            lod_t   = now;
+            lod_pre = m_presents;
+        }
+    }
+    {
+        // Scope history list: the game's history textures it has released since (loads, menus, resizes) are let go once a
+        // second with their two copies, not only at the next scope use (29 Oct memory check: the list sat at its 160 cap).
+        static auto hist_t = now;
+        if (now - hist_t >= std::chrono::seconds(1)) {
+            hist_t = now;
+            fc5::scope::hist_prune();
+        }
+    }
     if (!snapshot && (m_probe_off.load() || now - m_last_probe < std::chrono::seconds(1))) {
         return;
     }
@@ -14227,12 +14671,14 @@ void FarCry5Stereo::probe_tick()
                          std::exchange(m_taa_draws, 0), std::exchange(m_taa_mv_runs, 0), std::exchange(m_taa_mvh_runs, 0), m_taa_mv.load() ? "on" : "off", std::exchange(m_taa_mv_miss, 0), m_shadow_mv.load() ? "on" : "off",
                          std::exchange(m_taa_mv_size, 0), std::exchange(m_taa_skips, 0), std::exchange(m_taa_sharpen_skips, 0), std::exchange(m_taa_skip_refused, 0), m_taa_skip.load() ? "on" : "off", fc5::dlss::enabled() ? "on" : "off");
         }
-        runtimes::OpenXR::s_fc5_xr_half = m_xr_half.load() && !afw_mode();   // xrhalf: Stereo only
+        runtimes::OpenXR::s_fc5_frame_lock = m_frame_lock.load();   // framelock
+        runtimes::OpenXR::s_fc5_lock_pairs = !afw_mode() && m_frame_double.load() ? 1 : 0;   // framelock auto: Stereo pairs always two, a switch starts afresh
         const uint64_t hw = runtimes::OpenXR::s_fc5_half_waits.exchange(0);
         const double   hm = std::exchange(runtimes::OpenXR::s_fc5_half_ms, 0.0);
-        spdlog::info("{} xrhalf {}{}: {} waits before xrWaitFrame in the last second, mean {:.2f} ms; dlaaphases {}; postclean {}", tag,
-                     m_xr_half.load() ? "on" : "off", m_xr_half.load() && afw_mode() ? " (inactive in AFW)" : "", hw, hw ? hm / double(hw) : 0.0, fc5::dlss::dlaa_phases(),
-                     m_post_clean.load() ? "on" : "off");
+        const int      fl = m_frame_lock.load();
+        spdlog::info("{} framelock {}: {} refresh(es) per picture, {}% of pictures over a refresh; {} waits before xrWaitFrame in the last second, mean {:.2f} ms; dlaaphases {}; postclean {}", tag,
+                     fl < 0 ? "auto" : fl == 0 ? "off" : fl == 1 ? "1" : "2", runtimes::OpenXR::s_fc5_lock_n.load(), runtimes::OpenXR::s_fc5_lock_over_pct.load(), hw,
+                     hw ? hm / double(hw) : 0.0, fc5::dlss::dlaa_phases(), m_post_clean.load() ? "on" : "off");
         size_t planar = 0;
         {
             std::lock_guard _{ m_ps_mtx };
@@ -14336,6 +14782,15 @@ void FarCry5Stereo::probe_tick()
                      std::exchange(m_hud_mark_over, 0), std::exchange(m_hud_mark_unboxed, 0), std::exchange(m_hud_mark_panel, 0), fc5::dlss::upscaling() ? m_hud_mul_draws : std::exchange(m_hud_mul_draws, 0),
                      m_hud_mul.load() ? "on" : "off",
                      std::exchange(m_hud_world_passes, 0));
+        spdlog::info("{} HUD world big markers: hudmarkcap {} (at most {:.1f} deg, icon {:.1f} deg), made smaller in {} calls; largest marker {:.1f} deg in the world, largest icon {:.1f} deg, lone icon {:.1f} deg on the panel (last second, before the limit); "
+                     "screen primitive draws taken into the HUD {}, left in the picture (other size) {} (hudprim {}, {} shaders)", tag,
+                     m_hud_mark_cap.load() ? "on" : "off", m_hud_mark_max.load(), m_hud_mark_icon.load(), std::exchange(m_hud_cap_frames, 0), std::exchange(m_hud_cap_world_max, 0.0f),
+                     std::exchange(m_hud_cap_icon_max, 0.0f), std::exchange(m_hud_cap_panel_max, 0.0f), std::exchange(m_hud_prim_draws, 0), std::exchange(m_hud_prim_left, 0),
+                     m_hud_prim.load() ? "on" : "off", [&] { std::lock_guard _{ m_ps_mtx }; return m_hud_prim_ps.size(); }());
+        spdlog::info("{} HUD screen primitives per eye: taken L {} R {}, to the marker image L {} R {}, to the panel L {} R {}; given the game's camera {}, not {} (hudprimcam {}) (last second)", tag,
+                     std::exchange(m_hud_prim_eye[0], 0), std::exchange(m_hud_prim_eye[1], 0), std::exchange(m_hud_prim_mark_n[0], 0), std::exchange(m_hud_prim_mark_n[1], 0),
+                     std::exchange(m_hud_prim_panel_n[0], 0), std::exchange(m_hud_prim_panel_n[1], 0), std::exchange(m_hud_prim_cam_n, 0), std::exchange(m_hud_prim_cam_miss, 0),
+                     m_hud_prim_cam.load() ? "on" : "off");
         spdlog::info("{} HUD panel: offered {} frames, submitted {} layers, {} frame ends (last second)", tag, std::exchange(VR::s_fc5_hud_offered, 0u),
                      std::exchange(VR::s_fc5_hud_submits, 0u), std::exchange(VR::s_fc5_end_frames, 0u));
         spdlog::info("{} indirect draws (DrawAuto / *Indirect) in the player's passes in the last second: {}", tag, std::exchange(m_indirect_draws, 0));
@@ -14367,8 +14822,9 @@ void FarCry5Stereo::probe_tick()
                      tag, m_body_draws_hidden.exchange(0), m_hide_body.load(), m_body_radius.load(), std::exchange(m_body_spared, 0), m_body_match.load(), m_body_rel.x, m_body_rel.y,
                      m_body_rel.z, m_frame.load() - m_body_rel_frame, std::exchange(m_glove_clothes_hidden, 0), m_glove_mesh_only.load(), m_glove_meshes.size(),
                      std::exchange(m_bare_folded, 0u), m_bare_hands.load(), std::exchange(m_cine_short_skipped, 0));
-        spdlog::info("{} post: {} post-pass draws in the last second, {} of them without the game's vignette and grain (vrpost {}); cinematic {} (3D follows the scene camera {}, once per pair {})", tag,
-                     std::exchange(m_postfx_seen, 0), std::exchange(m_postfx_changed, 0), m_postfx_vr.load(), m_cine_on, m_cine_follow.load(), m_cine_pair.load());
+        spdlog::info("{} post: {} post-pass draws in the last second, {} of them without the game's vignette and grain (vrpost {}); cinematic {} (3D follows the scene camera {}, once per pair {}, cinesteer {} from {:.0f} deg in {:.1f} s)", tag,
+                     std::exchange(m_postfx_seen, 0), std::exchange(m_postfx_changed, 0), m_postfx_vr.load(), m_cine_on, m_cine_follow.load(), m_cine_pair.load(),
+                     m_cine_steer.load(), m_cine_steer_start.load(), m_cine_steer_time.load());
     }
     if (snapshot) {
         // The draw lists of the next frame (weapon pass, and character/skinned/near-player world draws).
@@ -14419,7 +14875,9 @@ void FarCry5Stereo::vehicle_probe(ID3D11DeviceContext* ctx, UINT count)
     const int frame = m_frame.load();
     // afwvehown looks at every Vehicle_ draw of the frame (it keeps the largest: the body, not a door or the wheel).
     const bool own = m_afw_veh_own.load() && afw_mode() && m_in_vehicle.load();
-    if (!m_motion.load() || (m_veh_mesh_frame == frame && !own)) return;
+    const bool plane = m_plane_look.load() != 0 && m_in_vehicle.load();   // planelook: the largest Vehicle_ draw near the camera
+    const bool seat  = m_veh_seat_hold.load() && m_in_vehicle.load();     // vehseathold: the draw the seat is learnt on
+    if (!m_motion.load() || (m_veh_mesh_frame == frame && !own && !plane && !seat)) return;
     ID3D11PixelShader* ps = nullptr;
     ctx->PSGetShader(&ps, nullptr, nullptr);
     if (!ps) return;
@@ -14448,6 +14906,9 @@ void FarCry5Stereo::vehicle_probe(ID3D11DeviceContext* ctx, UINT count)
         spdlog::info("[Vehicle] probe: Vehicle_ draw at ({:.2f}, {:.2f}, {:.2f}) from the camera, b1 {} B, x axis ({:.2f}, {:.2f}, {:.2f}), y axis ({:.2f}, {:.2f}, {:.2f})", rel.x, rel.y, rel.z, c.size,
                      c.f[0], c.f[4], c.f[8], c.f[1], c.f[5], c.f[9]);
     }
+    if (!m_in_vehicle.load() && glm::length(rel) < 4.0f) m_veh_close_frame = frame;   // downedfoot (vehnear): a vehicle beside the player
+    if (plane && glm::length(rel) < 8.0f) plane_model_probe(frame, c.f, count, glm::length(rel));
+    if (seat && glm::length(rel) < 8.0f) veh_seat_probe(frame, c.f, count, glm::length(rel));
     if (std::sqrt(rel.x * rel.x + rel.y * rel.y) > 0.8f || rel.z > -0.3f || rel.z < -2.2f) return;
     if (m_veh_mesh_frame != frame) {
         m_veh_mesh_frame = frame;
@@ -14559,6 +15020,61 @@ void FarCry5Stereo::record_send(int dx, int dy)
     m_tag_dy[t & 31] += dy;
 }
 
+// popupesc: once per pair, at the aim's mouse send. A paused game (a tutorial pop-up) keeps its camera exactly still whatever the
+// mouse does: in Homard's 25 Oct 15:46 log both pop-ups held the game camera 30 deg off the head for 14 s and 49 s while the
+// aim sent a correction every pair. Only sideways sends count (looking up or down past the game's pitch limit also leaves the
+// camera still); the aim is the camera without the Extended View offset it carries (the mod sets that offset itself).
+void FarCry5Stereo::popup_watch(int dx)
+{
+    constexpr int kPopSends = 12;   // about 0.35 s of sends; a playing game answers a send within 2 pairs
+    const glm::vec3 f   = -glm::vec3{ glm::row(glm::mat4{ m_mo.game_rot }, 2) };
+    float           yaw = yaw_of(f), pit = std::asin(std::clamp(f.z, -1.0f, 1.0f));
+    if (m_mo.ev_ok) {
+        yaw -= m_mo.ev_oy;
+        pit -= m_mo.ev_op;
+    }
+    const bool still = std::abs(std::remainder(yaw - m_pop_yaw, glm::two_pi<float>())) < glm::radians(0.005f) && std::abs(pit - m_pop_pit) < glm::radians(0.005f) &&
+                       glm::length(m_mo.cam - m_pop_cam) < 0.001f;
+    if (!still) m_pop_unanswered = 0;
+    else if (m_pop_prev_dx != 0) m_pop_unanswered++;
+    m_pop_yaw     = yaw;
+    m_pop_pit     = pit;
+    m_pop_cam     = m_mo.cam;
+    m_pop_prev_dx = dx;
+    m_pop_frame   = m_frame.load();
+    const bool frozen = m_pop_unanswered >= kPopSends && !m_in_vehicle.load();
+    if (frozen != m_pop_frozen.exchange(frozen)) {
+        spdlog::info("[Pad] popupesc: {}", frozen ? fmt::format("the game camera answered none of {} sideways mouse sends (a pop-up has paused the game?): right B sends Esc{}{}",
+                                                                 m_pop_unanswered, m_popup_esc.load() ? "" : " (popupesc is off)",
+                                                                 m_pop_hold.load() ? "; aim sends held (one probe every 0.5 s, popuphold)" : "")
+                                                   : fmt::format("the game camera answers the mouse again: right B is pad Y again ({} aim sends held meanwhile)", m_pop_held));
+        m_pop_held     = 0;
+        m_pop_probe_at = {};
+    }
+}
+
+bool FarCry5Stereo::popup_esc_now() const
+{
+    return m_popup_esc.load() && m_pop_frozen.load() && m_frame.load() - m_pop_frame.load() < 30 && !m_menu_screen_on && !m_cine_on && !m_in_vehicle.load() &&
+           m_motion.load();
+}
+
+void FarCry5Stereo::popup_esc_tap()
+{
+    spdlog::info("[Pad] popupesc: right B sent Esc (the game camera answered none of the last {} sideways mouse sends)", m_pop_unanswered);
+    std::thread([] {
+        // Scan code: the game reads raw keys (tools\fc5ctl.ps1). Held 120 ms so the game sees it on at least one frame.
+        INPUT in{};
+        in.type       = INPUT_KEYBOARD;
+        in.ki.wScan   = 0x01;   // Esc
+        in.ki.dwFlags = KEYEVENTF_SCANCODE;
+        SendInput(1, &in, sizeof(INPUT));
+        Sleep(120);
+        in.ki.dwFlags = KEYEVENTF_SCANCODE | KEYEVENTF_KEYUP;
+        SendInput(1, &in, sizeof(INPUT));
+    }).detach();
+}
+
 // The counts sent that the camera of update seq does not hold yet (sent at update seq - firesplitmlag + 1 or later).
 void FarCry5Stereo::inflight(uint64_t seq, int& dx, int& dy) const
 {
@@ -14590,6 +15106,17 @@ void FarCry5Stereo::update_vehicle()
     const float cam_dist = std::sqrt(m_game_cam_pos[0] * m_game_cam_pos[0] + m_game_cam_pos[1] * m_game_cam_pos[1] + m_game_cam_pos[2] * m_game_cam_pos[2]);
     const bool  player   = m_player_views_last_frame != 0 && cam_dist > 2.0f && !m_menu_screen_on;
     if (!player) return; // menus, map, loading: keep the state as it was
+    // A fall's bookkeeping from its start (the camera's fall rule, or chuteopen's wingsuit ending in the air).
+    auto fall_begin = [&](std::chrono::steady_clock::time_point t, float z) {
+        m_falling         = true;
+        m_fall_t0         = t;
+        m_fall_peak       = m_fall_vz;
+        m_fall_slope_said = false;
+        m_fall_held = m_fall_old_would = m_fall_ended = false;
+        m_fall_zmin    = z;
+        m_fall_air_max = m_fall_air_on ? std::chrono::duration<float>(t - m_fall_air_t0).count() : 0.0f;
+        m_fall_why     = "";
+    };
     {
         // chutelook: falling on foot = the game camera sinking faster than 3 m/s for 15 updates; landed after ~1 s at under
         // 1 m/s (a parachute sinks faster; its opening jolt is shorter).
@@ -14598,16 +15125,62 @@ void FarCry5Stereo::update_vehicle()
         const float     dt = std::chrono::duration<float>(t - m_fall_t).count();
         if (m_fall_valid && dt > 0.0005f && dt < 0.25f && glm::length(p - m_fall_pos) < 20.0f) {
             m_fall_vz += std::min(1.0f, dt * 6.0f) * ((p.z - m_fall_pos.z) / dt - m_fall_vz);
+            m_veh_cam_speed += (1.0f - std::exp(-dt / 0.3f)) * (glm::length(p - m_fall_pos) / dt - m_veh_cam_speed);   // downedfoot
             m_fall_frames = m_fall_vz < -3.0f ? m_fall_frames + 1 : 0;
             m_land_frames = m_fall_vz > -1.0f ? m_land_frames + 1 : 0;
-            if (!m_falling && m_fall_frames > 15 && (!m_in_vehicle.load() || m_chute_vehicle)) {
-                m_falling = true;
-                m_fall_t0 = t;
+            // chuteland: not sinking faster than 1.6 m/s (smoothed over 0.25 s) since m_land_quiet_t0.
+            m_land_vz += (1.0f - std::exp(-dt / 0.25f)) * ((p.z - m_fall_pos.z) / dt - m_land_vz);
+            if (m_land_vz > -1.6f && !m_land_quiet) m_land_quiet_t0 = t;
+            m_land_quiet = m_land_vz > -1.6f;
+            // chutemin: the fall's start (first update sinking past 3 m/s), drop, the game's "in air" run, and its end (10 updates under 1 m/s).
+            if (m_fall_frames == 1 && !m_falling) {
+                m_fall_sink_t0 = m_fall_t;
+                m_fall_z0      = m_fall_pos.z;
+            }
+            {
+                const int air = fc5::lua::pawn_in_air();
+                if (air == 1 && !m_fall_air_on) m_fall_air_t0 = t;
+                if (air == 0 && m_fall_air_on) m_cg_air_run = std::chrono::duration<float>(t - m_fall_air_t0).count();   // chuteground: that run in the air
+                if (air >= 0) m_fall_air_on = air == 1;
+                // chuteground: the game says on the ground (not under a wingsuit or parachute) after under 1.5 s in the air (a jump: today's
+                // were 0.6-1.3 s; after a longer free fall "in air" false may be a plain chute opening, which the game calls on foot: the
+                // camera rules as before); in the air or no answer: falls are seen again.
+                if (air != 0 || m_co_suit || m_cg_air_run >= 1.5f) m_cg_ground = false;
+                else if (!m_cg_ground) { m_cg_ground = true; m_cg_ground_t0 = t; }
+                if (air != 0) m_cg_wait_air = false;
+            }
+            const bool cg_landed = m_chute_ground.load() && m_cg_ground && t - m_cg_ground_t0 >= std::chrono::milliseconds(250);
+            if (m_falling) {
+                m_fall_peak    = std::min(m_fall_peak, m_fall_vz);
+                m_fall_zmin    = std::min(m_fall_zmin, p.z);
+                if (m_fall_air_on) m_fall_air_max = std::max(m_fall_air_max, std::chrono::duration<float>(t - m_fall_air_t0).count());
+                if (!m_fall_ended && m_land_frames > 10) {
+                    m_fall_ended  = true;
+                    m_fall_sink_s = std::chrono::duration<float>(t - m_fall_sink_t0).count();
+                }
+            }
+            if (!m_falling && m_fall_frames > 15 && (!m_in_vehicle.load() || m_chute_vehicle) && !(m_chute_ground.load() && m_cg_wait_air)) {
+                fall_begin(t, p.z);
                 spdlog::info("[Fall] falling ({:.1f} m/s): the view is held as a vehicle (head look, the view follows the chute){}", m_fall_vz,
                              m_chute_look.load() ? "" : " (chutelook off)");
-            } else if (m_falling && (m_land_frames > 90 || (m_in_vehicle.load() && !m_chute_vehicle && !m_chute_look.load()))) {
+            } else if (m_falling && (m_land_frames > 90 || (m_chute_land.load() && m_land_quiet && t - m_land_quiet_t0 >= std::chrono::milliseconds(700)) ||
+                                     (m_in_vehicle.load() && !m_chute_vehicle && !m_chute_look.load()) || cg_landed)) {
                 m_falling = false;
-                spdlog::info("[Fall] landed ({:.1f} m/s)", m_fall_vz);
+                m_cg_air_run = 0.0f;
+                const float quiet_s = m_land_quiet ? std::chrono::duration<float>(t - m_land_quiet_t0).count() : 0.0f;
+                if (cg_landed) m_cg_wait_air = true;   // chuteground: the run on downhill starts no new fall
+                spdlog::info("[Fall] landed ({:.1f} m/s; {:.1f} s after the fall was seen): {}; held {} after the sink ended (under 1.6 m/s)", m_fall_vz,
+                             std::chrono::duration<float>(t - m_fall_t0).count(),
+                             m_land_frames > 90 ? "90 updates under 1 m/s" : m_land_quiet && quiet_s >= 0.7f ? "chuteland: under 1.6 m/s for 0.7 s"
+                             : cg_landed ? fmt::format("chuteground: the game says on the ground for {:.2f} s", std::chrono::duration<float>(t - m_cg_ground_t0).count()).c_str()
+                                         : "in a vehicle",
+                             m_land_quiet ? fmt::format("{:.2f} s", quiet_s) : std::string{ "0 s (still sinking)" });
+                if (m_chute_min.load() && m_fall_old_would && !m_fall_held)
+                    spdlog::info("[Fall] chutemin: not held as a parachute: sank {:.1f} s (past 3 m/s from {:.1f} s before it was seen), the game in the air {}, fastest {:.1f} m/s, "
+                                 "dropped {:.1f} m; {}", m_fall_ended ? m_fall_sink_s : std::chrono::duration<float>(t - m_fall_sink_t0).count(),
+                                 std::chrono::duration<float>(m_fall_t0 - m_fall_sink_t0).count(),
+                                 fc5::lua::pawn_in_air() < 0 && m_fall_air_max == 0.0f ? std::string{ "unknown" } : fmt::format("{:.1f} s at most", m_fall_air_max), -m_fall_peak,
+                                 m_fall_z0 - m_fall_zmin, m_fall_why);
             }
         }
         m_fall_pos   = p;
@@ -14617,20 +15190,188 @@ void FarCry5Stereo::update_vehicle()
     const int  frame     = m_frame.load();
     const bool fp        = m_cine_wcb_n > 0;
     const bool mesh_near = frame - m_veh_mesh_frame <= 2;
+    const bool seat_near = veh_seat_update(frame);   // vehseathold: the camera still in the seat learnt on the vehicle's model
     m_veh_mesh_count     = mesh_near ? m_veh_mesh_count + 1 : 0;
-    m_veh_in_frames      = (!fp || mesh_near) ? m_veh_in_frames + 1 : 0;
-    m_veh_out_frames     = (fp && !mesh_near) ? m_veh_out_frames + 1 : 0;
+    m_veh_in_frames      = (!fp || mesh_near || seat_near) ? m_veh_in_frames + 1 : 0;
+    m_veh_out_frames     = (fp && !mesh_near && !seat_near) ? m_veh_out_frames + 1 : 0;
+    // downedfoot: no weapon view is a vehicle only with a vehicle model seen under the camera or within 4 m since it went (vehnear),
+    // the seat, or the camera moving over 3 m/s for 20 updates (being knocked down, a death or an animation also hides the weapon view).
+    if (m_veh_in_frames == 0) {
+        m_veh_proof_mesh  = false;
+        m_veh_proof_said  = false;
+        m_veh_fast_frames = 0;
+    } else {
+        m_veh_proof_mesh  = m_veh_proof_mesh || mesh_near || frame - m_veh_close_frame <= 2;   // vehnear: within 4 m counts too
+        m_veh_fast_frames = m_veh_cam_speed > 3.0f ? m_veh_fast_frames + 1 : 0;
+    }
+    const bool veh_proof = !m_downed_foot.load() || m_veh_proof_mesh || seat_near || m_veh_fast_frames > 20;
     bool want            = m_in_vehicle.load();
+    // fallvmin: a fall over 0.5 s that never sank faster than fallvmin is a run down a slope, not held as a vehicle.
+    const bool fall_long = m_falling && std::chrono::duration<float>(std::chrono::steady_clock::now() - m_fall_t0).count() > 0.5f;
+    const bool fall_fast = m_fall_vmin.load() <= 0.0f || -m_fall_peak >= m_fall_vmin.load();
+    // chutemin: held only 0.8 s or more after the fall was seen with the fall not over (not 10 updates under 1 m/s: a balcony jump has landed by then),
+    // and, while the game says in the air (a jump or a free fall), once that has lasted 1.5 s. An open chute (not in the air) or no answer: the timing alone.
+    bool chute_ok = true;
+    if (m_chute_min.load() && m_falling && fall_long && fall_fast) {
+        const float since = std::chrono::duration<float>(std::chrono::steady_clock::now() - m_fall_t0).count();
+        const float air_s = m_fall_air_on ? std::chrono::duration<float>(std::chrono::steady_clock::now() - m_fall_air_t0).count() : 0.0f;
+        const char* why   = m_fall_ended ? "the fall was over (under 1 m/s for 10 updates: landed)"
+                          : since < 0.8f ? "under 0.8 s since it was seen"
+                          : m_fall_air_on && air_s < 1.5f ? "the game says in the air, under 1.5 s (a jump)" : nullptr;
+        chute_ok = why == nullptr;
+        if (why) m_fall_why = why;
+        m_fall_old_would = m_fall_old_would || (!want && !m_chute_vehicle && m_chute_look.load() && m_vehicle_force.load() < 0);   // the old rule would hold it
+    }
+    if (fall_long && !fall_fast && !m_chute_vehicle && !want && !m_fall_slope_said && m_chute_look.load()) {
+        m_fall_slope_said = true;
+        spdlog::info("[Fall] sinking {:.1f} m/s at most after 0.5 s (under fallvmin {:.1f}): a run down a slope, not held as a vehicle", -m_fall_peak, m_fall_vmin.load());
+    }
+    // vehscript: the game's own answer (-1 none: the rules below decide); the rules' answer kept alongside to compare every 10 s.
+    // A paraglider or wingsuit (the game's types 2 and 6) is no answer: falls and parachutes stay with chutelook and the rules.
+    int script_drv = -1, script_type = -1;
+    int script_in  = m_veh_script.load() ? fc5::lua::vehicle_state(script_drv, script_type) : -1;
+    const int script_raw = script_in;   // before the paraglider / wingsuit drop (stance check below)
+    if (script_in == 1 && (script_type == 2 || script_type == 6)) script_in = -1;
+    // chuteopen: the game's wingsuit or parachute (types 6 / 2, the chute opened from the wingsuit included) is held as a parachute while
+    // it lasts; its end on the ground is the landing, in the air (the chute cut) a fall. No answer for a moment: kept as it was.
+    if (!m_chute_open.load() || !m_veh_script.load()) {
+        m_co_suit = false;
+    } else if (script_raw >= 0) {
+        static const char* const kSuit[] = { "?", "?", "parachute", "?", "?", "?", "wingsuit" };
+        const bool suit_now = script_raw == 1 && (script_type == 2 || script_type == 6);
+        const auto ct       = std::chrono::steady_clock::now();
+        if (suit_now && !m_co_suit) {
+            spdlog::info("[Fall] chuteopen: the game says {} (type {}): held as a parachute at once (no entry settle or recentre, the heading kept, "
+                         "the head look on){}", kSuit[script_type], script_type, m_chute_look.load() ? "" : " (chutelook off)");
+        } else if (!suit_now && m_co_suit) {
+            const int  air    = fc5::lua::pawn_in_air();
+            const char* what  = kSuit[m_co_type == 2 || m_co_type == 6 ? m_co_type : 0];
+            if (script_raw == 0 && air != 1 && m_land_vz > -3.0f) {
+                spdlog::info("[Fall] {}chuteopen: the game's {} ended on the ground (in air {}, sinking {:.1f} m/s{}): landed at once", m_falling ? "landed: " : "", what,
+                             air == 0 ? "false" : "unknown", -m_land_vz,
+                             m_falling ? fmt::format("; {:.1f} s after the fall was seen", std::chrono::duration<float>(ct - m_fall_t0).count()) : std::string{});
+                m_falling     = false;
+                m_cg_wait_air = air == 0;   // the run on after landing starts no new fall
+                m_cg_air_run  = 0.0f;
+            } else {
+                spdlog::info("[Fall] chuteopen: the game's {} ended in the air (in air {}, sinking {:.1f} m/s): {}", what, air == 1 ? "true" : air == 0 ? "false" : "unknown",
+                             -m_land_vz, m_falling ? "the fall goes on" : "held as a fall");
+                if (!m_falling) fall_begin(ct, m_game_cam_pos[2]);
+            }
+        }
+        m_co_suit = suit_now;
+        m_co_type = suit_now ? script_type : -1;
+    }
+    chute_probe_tick();   // chuteprobe
+    m_veh_game_type = script_in == 1 ? script_type : -1;   // vehair
+    // vehscript stance (30 Oct, the 09:27 log: 0 standing, 1 crouched, 4 downed, 18 seated in any vehicle): 4 is never a vehicle; 18 with no
+    // GetPawnVehicle answer is one; GetPawnVehicle is trusted when the two disagree (logged on each change).
+    const int stance = m_veh_script.load() ? fc5::lua::pawn_stance() : -1;
+    {
+        const int code = stance < 0 ? 0 : script_raw == 1 && script_type != 2 && script_type != 6 && stance != 18 ? 1 : script_raw == 0 && stance == 18 ? 2
+                       : script_raw != 1 && stance == 4 ? 3 : script_raw < 0 && stance == 18 ? 4 : 0;
+        if (code != m_vst_said) {
+            if (code == 1) spdlog::info("[Vehicle] vehscript: the game says in a vehicle (type {}) but its stance is {}, not 18 (seated): GetPawnVehicle trusted", script_type, stance);
+            if (code == 2) spdlog::info("[Vehicle] vehscript: the game says on foot but its stance is 18 (seated): GetPawnVehicle trusted");
+            if (code == 3) spdlog::info("[Vehicle] vehscript: the stance 4 (downed): on foot (never a vehicle, a fall held as one ends)");
+            if (code == 4) spdlog::info("[Vehicle] vehscript: no GetPawnVehicle answer, the stance 18 (seated): in a vehicle");
+            m_vst_said = code;
+        }
+    }
+    if (!m_veh_heur_want && m_veh_in_frames > 20 && veh_proof) m_veh_heur_want = true;
+    else if (m_veh_heur_want && m_veh_out_frames > 30) m_veh_heur_want = false;
+    if (m_veh_script.load()) {
+        const auto vnow = std::chrono::steady_clock::now();
+        m_vsc_n++;
+        if (script_in < 0) m_vsc_unknown++;
+        else {
+            m_vsc_game_in += script_in;
+            m_vsc_in_out += script_in == 1 && !m_veh_heur_want;
+            m_vsc_out_in += script_in == 0 && m_veh_heur_want;
+            m_vsc_drv += script_drv == 1;
+        }
+        m_vsc_rules_in += m_veh_heur_want;
+        if (vnow - m_vsc_t0 > std::chrono::seconds(10)) {
+            if (m_vsc_t0 != std::chrono::steady_clock::time_point{})
+                spdlog::info("[Vehicle] vehscript last 10 s: {} updates; the game said in a vehicle in {} (driving in {}), no answer in {}; the hands' pass rules said in a vehicle in {}; "
+                             "disagreed in {} (the game in a vehicle, the rules on foot {}; the game on foot, the rules in a vehicle {}); now the game {}, the rules {}",
+                             m_vsc_n, m_vsc_game_in, m_vsc_drv, m_vsc_unknown, m_vsc_rules_in, m_vsc_in_out + m_vsc_out_in, m_vsc_in_out, m_vsc_out_in,
+                             script_in < 0 ? "no answer" : script_in ? "in a vehicle" : "on foot", m_veh_heur_want ? "in a vehicle" : "on foot");
+            m_vsc_t0 = vnow;
+            m_vsc_n = m_vsc_game_in = m_vsc_rules_in = m_vsc_in_out = m_vsc_out_in = m_vsc_unknown = m_vsc_drv = 0;
+        }
+    }
     if (m_vehicle_force.load() >= 0) want = m_vehicle_force.load() == 1;
-    else if (m_chute_look.load() && m_falling && (m_chute_vehicle || want || std::chrono::duration<float>(std::chrono::steady_clock::now() - m_fall_t0).count() > 0.5f))
+    else if (stance == 4 && script_raw != 1) want = false;   // vehscript stance: downed, never a vehicle (also ends a fall held as one: a crash under the chute)
+    else if (m_co_suit) want = true;   // chuteopen: the game's wingsuit or parachute, held until it ends
+    else if (m_chute_look.load() && m_falling && (m_chute_vehicle || want || (fall_long && fall_fast && chute_ok)))
         want = true;   // chutelook: falling for over 0.5 s (not a hop off a ledge), or taken as a vehicle while falling = held until landed
-    else if (!want && m_veh_in_frames > 20) want = true;
+    else if (script_in >= 0) want = script_in == 1;   // vehscript: the game says
+    else if (stance == 18 && script_raw < 0) want = true;    // vehscript stance: seated with no GetPawnVehicle answer
+    else if (!want && m_veh_in_frames > 20) {
+        if (veh_proof) {
+            want = true;
+            if (m_downed_foot.load())
+                spdlog::info("[Vehicle] downedfoot: a vehicle by {}", m_veh_proof_mesh ? "its model within 4 m" : seat_near ? "the seat" : "the camera's speed (over 3 m/s)");
+        }
+        else if (!m_veh_proof_said) {
+            m_veh_proof_said = true;
+            spdlog::info("[Vehicle] downedfoot: no weapon view for {} updates, but no vehicle model within 4 m and the camera at {:.1f} m/s: kept on foot "
+                         "(knocked down, a death or an animation; {} times)", m_veh_in_frames, m_veh_cam_speed, ++m_downed_kept);
+        }
+    }
     else if (want && m_veh_out_frames > 30) want = false;
     const bool chute_start = want && m_falling && m_chute_look.load() && m_vehicle_force.load() < 0 && !m_chute_vehicle;
+    if (chute_start) m_fall_held = true;   // chutemin (log)
+    const bool suit_start  = want && m_co_suit && m_vehicle_force.load() < 0 && !m_chute_vehicle;   // chuteopen
     const bool chute_end   = !want && m_chute_vehicle;
     if (!want) m_chute_vehicle = false;
     const bool was_driving = m_veh_driving.load();
-    m_veh_driving          = want && !fp;
+    // vehseathold: a weapon drawn from the driver's seat (the game's sidearm in a boat) leaves the player driving.
+    const bool seat_drive  = want && fp && seat_near && m_vsh_driving && m_veh_settle.load() == 0;
+    // vehdrivegun: the game's own answer first (vehscript: GetPawnVehicleSeat counts from 1, the driver's seat lookup from 0; seat 0 while getting in
+    // is no answer): the driver drives with a weapon out (drive and shoot), a passenger rides. With no answer (getting in, vehscript off or silent), a
+    // weapon view that shows while driving within 1.5 s of the right trigger's LB (or while held, or after one sent during this vehicle's entry) is
+    // the driver's sidearm: latched until the vehicle is left.
+    const int game_drv = (m_veh_drive_gun.load() && want && script_in == 1 && m_vehicle_force.load() < 0 && !m_chute_vehicle) ? script_drv : -1;
+    if (!want) {
+        if (m_vdg_latched) spdlog::info("[Vehicle] vehdrivegun: out of the vehicle; {} frames the driver's sidearm left the driver driving", m_vdg_frames);
+        m_vdg_latched = false;
+        m_vdg_said    = false;
+        m_vdg_frames  = 0;
+    } else if (m_veh_drive_gun.load() && game_drv < 0 && fp && was_driving && !m_vdg_latched && !m_chute_vehicle && m_in_vehicle.load()) {
+        using clk          = std::chrono::steady_clock;
+        const int64_t lb   = m_vt_lb_t.load();
+        const float   ago  = lb != 0 ? std::chrono::duration<float>(clk::now().time_since_epoch() - clk::duration(lb)).count() : -1.0f;
+        const bool    held = m_vt_lb_held.load();
+        const bool    in_entry = lb != 0 && m_veh_settle.load() > 0 && m_veh_settle_entry && clk::duration(lb) >= m_veh_settle_t0.time_since_epoch();
+        if (held || (ago >= 0.0f && ago < 1.5f) || in_entry) {
+            m_vdg_latched = true;
+            if (!m_vdg_said) {
+                m_vdg_said = true;
+                spdlog::info("[Vehicle] vehdrivegun: the weapon view after the right trigger (LB) while driving: the driver's sidearm, still driving ({}; {})",
+                             held ? "LB held" : in_entry && !(ago < 1.5f) ? fmt::format("LB {:.1f} s ago, during the entry", ago) : fmt::format("LB {:.2f} s ago", ago), game_seat_text());
+            }
+        }
+    }
+    const bool drive_gun   = want && fp && m_vdg_latched && m_veh_drive_gun.load() && game_drv < 0;
+    if (drive_gun) m_vdg_frames++;
+    m_veh_driving          = game_drv >= 0 ? game_drv == 1 : want && (!fp || seat_drive || drive_gun);
+    {
+        // vehdrivegun: which rule decides driving / riding, logged when it changes in a vehicle.
+        const char* rule = !want ? nullptr : game_drv == 1 ? "the game: driver" : game_drv == 0 ? "the game: passenger" : drive_gun ? "the right trigger's LB (the driver's sidearm)"
+                         : seat_drive ? "vehseathold (the driver's seat)" : fp ? "the weapon view (a passenger)" : "no weapon view (the driver)";
+        if (rule && m_veh_drive_gun.load() && m_vdg_rule != rule)
+            spdlog::info("[Vehicle] vehdrivegun: {} decided by {} ({})", m_veh_driving.load() ? "driving" : "riding", rule, game_seat_text());
+        m_vdg_rule = rule;
+    }
+    if (seat_drive) {
+        if (!m_vsh_kept_said) {
+            m_vsh_kept_said = true;
+            spdlog::info("[Vehicle] vehseathold: the hands' pass is back with the camera still in the driver's seat: still driving (the trigger stays the throttle)");
+        }
+        m_vsh_kept++;
+    }
 
     const glm::vec3 pos{ m_game_cam_pos[0], m_game_cam_pos[1], m_game_cam_pos[2] };
     const auto      now = std::chrono::steady_clock::now();
@@ -14642,7 +15383,7 @@ void FarCry5Stereo::update_vehicle()
         m_veh_settle_stable = 0;
         m_veh_settle_yaw    = m_cine_game_yaw;
         veh_follow_start();   // vehfollowhead
-        spdlog::info("[Vehicle] now {}", m_veh_driving.load() ? "driving" : "riding");
+        spdlog::info("[Vehicle] now {} ({})", m_veh_driving.load() ? "driving" : "riding", game_seat_text());
     }
     if (want != m_in_vehicle.load()) {
         m_in_vehicle        = want;
@@ -14651,13 +15392,22 @@ void FarCry5Stereo::update_vehicle()
         m_veh_speed         = 0.0f;
         m_veh_mesh_off_valid = false;
         m_air_target_valid   = false;
+        planelook_reset();   // planelook: the seat learnt again in each vehicle
         m_veh_aircraft       = false;
         m_veh_air_frames     = 0;
+        m_vehair_said        = false;   // vehair: once per ride
         m_veh_flying         = false;   // vehcomfort: seen flying again first
         m_vfly_climb_t       = 0.0f;
         m_vfly_tilt_t        = 0.0f;
         m_vfly_zn            = 0;
         m_vc_init            = false;
+        if (m_vsh_valid)
+            spdlog::info("[Vehicle] vehseathold: {} frames a drawn weapon left the driver driving; the camera at most {:.2f} m from the seat while in it", m_vsh_kept, m_vsh_off_max);
+        m_vsh_valid          = false;   // vehseathold: learnt again in each vehicle
+        m_vsh_near           = false;
+        m_vsh_kept           = 0;
+        m_vsh_kept_said      = false;
+        m_vsh_off_max        = 0.0f;
         if (!want) {
             // Getting out: once the exit animation is over (the game camera holds still), recentre.
             m_exit_settle    = 1;
@@ -14677,13 +15427,19 @@ void FarCry5Stereo::update_vehicle()
                      m_vehicle_force.load() >= 0 ? ", forced" : "");
         if (chute_end) m_exit_settle = 0;   // landed after a fall: no exit animation, no fade or recentre
     }
-    if (chute_start) {
+    if (chute_start || suit_start) {
         // chutelook: no entry animation to wait for: no settle, no fade, no recentre (the view follows the chute at once).
         // Also taken over when the game's parachute was already seen as a vehicle (it would drop out when a weapon shows).
+        // chuteopen: the same for the game's wingsuit or parachute, also when it was already taken as a vehicle with its settle running.
+        if (suit_start && m_veh_settle.load() > 0) {
+            m_body_yaw_pending = 0.0f;   // vehentryfollow's step: no turn
+            spdlog::info("[Vehicle] chuteopen: the entry settle dropped ({:.1f} s in): no settle cut, no recentre",
+                         std::chrono::duration<float>(now - m_veh_settle_t0).count());
+        }
         m_chute_vehicle    = true;
         m_veh_settle       = 0;
         m_veh_settle_entry = false;
-        spdlog::info("[Vehicle] falling: held as a vehicle until landed (chutelook)");
+        spdlog::info("[Vehicle] {}: held as a vehicle until landed ({})", chute_start ? "falling" : "the game's wingsuit or parachute", chute_start ? "chutelook" : "chuteopen");
     }
     if (!m_in_vehicle.load()) {
         if (m_exit_settle > 0) {
@@ -14735,11 +15491,15 @@ void FarCry5Stereo::update_vehicle()
             if (mesh_near) {
                 // The model axis that matches the settled camera (to the nearest quarter turn).
                 const float raw      = std::remainder(m_cine_game_yaw - mesh_yaw(), glm::two_pi<float>());
-                m_veh_mesh_off       = glm::half_pi<float>() * std::round(raw / glm::half_pi<float>());
+                const float quarter  = glm::half_pi<float>() * std::round(raw / glm::half_pi<float>());
+                // vehnose: the model's y axis is every vehicle's front in the logs (cars y +0; a plane settled y +90 or -180 with its
+                // entry camera on the door, and the travel direction turned it back to y +0 at take-off).
+                m_veh_mesh_off       = m_veh_nose.load() ? 0.0f : quarter;
                 m_veh_mesh_off_valid = true;
-                spdlog::info("[Vehicle] model axes: x yaw {:.1f}, y yaw {:.1f} deg; camera {:.1f} deg -> ahead = model y {:+.0f} deg (off by {:.1f} deg)",
+                spdlog::info("[Vehicle] model axes: x yaw {:.1f}, y yaw {:.1f} deg; camera {:.1f} deg -> ahead = model y {:+.0f} deg (off by {:.1f} deg){}",
                              glm::degrees(std::atan2(-m_veh_mesh_x.x, m_veh_mesh_x.y)), glm::degrees(mesh_yaw()), glm::degrees(m_cine_game_yaw), glm::degrees(m_veh_mesh_off),
-                             glm::degrees(std::remainder(raw - m_veh_mesh_off, glm::two_pi<float>())));
+                             glm::degrees(std::remainder(raw - m_veh_mesh_off, glm::two_pi<float>())),
+                             m_veh_nose.load() ? fmt::format("; vehnose: the model's forward (nearest the camera: y {:+.0f})", glm::degrees(quarter)) : std::string{});
                 m_veh_heading = std::remainder(mesh_yaw() + m_veh_mesh_off, glm::two_pi<float>());
             }
             if (m_vehicle_follow.load() && m_motion.load() && m_body_valid) {
@@ -14754,8 +15514,10 @@ void FarCry5Stereo::update_vehicle()
                 m_recenter_requested = true;   // after the entry animation: the head's current direction = the vehicle's front
                 spdlog::info("[Vehicle] in: recentred after the entry animation");
             }
-            spdlog::info("[Vehicle] settled: heading {:.0f} deg ({}), {}", glm::degrees(m_veh_heading), m_veh_mesh_off_valid ? "from the vehicle model" : "from the camera; then from the travel direction",
+            spdlog::info("[Vehicle] settled: heading {:.0f} deg ({}), {}", glm::degrees(m_veh_heading),
+                         m_veh_mesh_off_valid ? (m_veh_nose.load() ? "from the vehicle model's forward, vehnose" : "from the vehicle model") : "from the camera; then from the travel direction",
                          m_veh_driving.load() ? "driving" : "riding");
+            veh_seat_learn(frame);   // vehseathold
         }
         m_veh_pos_valid = false;
         return;
@@ -14814,7 +15576,17 @@ void FarCry5Stereo::update_vehicle()
         const float vz  = (dt2 > 0.0005f && dt2 < 0.25f) ? (pos.z - m_veh_last_pos.z) / dt2 : 0.0f;
         const bool  air = m_veh_driving.load() && (std::abs(vz) > 2.5f || std::abs(m_cine_roll) > 10.0f);
         m_veh_air_frames = air ? m_veh_air_frames + 1 : std::max(0, m_veh_air_frames - 1);
-        if (!m_veh_aircraft && m_veh_air_frames > 20) {
+        if (veh_type_grounded()) {
+            // vehair: the game says a car, quad, boat or motorcycle: never flying, whatever its bumps and tilt.
+            if (m_veh_air_frames > 20 && !m_vehair_said) {
+                m_vehair_said = true;
+                static const char* const kType[] = { "wheeled", "boat", "paraglider", "motorcycle", "helicopter", "plane", "wingsuit", "none" };
+                spdlog::info("[Vehicle] vehair: not flying: roll {:.1f} deg / vz {:.1f} m/s but the game says {} (type {}){}", m_cine_roll, vz,
+                             m_veh_game_type < 8 ? kType[m_veh_game_type] : "?", m_veh_game_type, m_veh_aircraft ? "; the flying state cleared" : "");
+            }
+            if (m_veh_aircraft) spdlog::info("[Vehicle] vehair: flying cleared (the game says type {}): the head steers the game camera again", m_veh_game_type);
+            m_veh_aircraft = false;
+        } else if (!m_veh_aircraft && m_veh_air_frames > 20) {
             m_veh_aircraft = true;
             spdlog::info("[Vehicle] flying (vertical speed {:.1f} m/s, roll {:.1f} deg): the head no longer steers the game camera{}", vz, m_cine_roll,
                          m_aircraft_guard.load() ? "" : " (guard off)");
@@ -14842,7 +15614,7 @@ void FarCry5Stereo::update_cinematic()
 {
     // A player camera (not a loading screen's camera parked at the origin, not the world map's terrain view).
     const float cam_dist = std::sqrt(m_game_cam_pos[0] * m_game_cam_pos[0] + m_game_cam_pos[1] * m_game_cam_pos[1] + m_game_cam_pos[2] * m_game_cam_pos[2]);
-    const bool  player   = m_player_views_last_frame != 0 && cam_dist > 2.0f && m_frame.load() - m_map_seen_frame.load() >= 180;
+    const bool  player   = m_player_views_last_frame != 0 && cam_dist > 2.0f && m_frame.load() - m_map_seen_frame.load() >= 180 && !m_map_held;
     // On the flat screen the mod stops steering the aim: its error is stale, so it is not a sign then.
     const bool aim_live  = !m_menu_screen_on;
     const bool weapon = m_weapon_draws_this_frame > 0;
@@ -14913,6 +15685,45 @@ void FarCry5Stereo::update_cinematic()
     }
 }
 
+// binoczoom (Homard 27 Oct: "make a flat screen comparison for binoculars to make sure they look the same or correct if its not
+// the case"): the game's binoculars narrow its camera from 120 to 80 deg (2.06x, simulator 27 Oct 22:56), which the headset never
+// showed: the eyes kept the headset's own field, so the binoculars magnified nothing. A D-pad up press on foot (their toggle)
+// arms this; while the game camera is then narrower than before the press (aim down sights not held), the eyes are drawn over a
+// field narrowed by the same ratio and shown over the headset's (eye_rel): the whole view magnified, as on the flat screen. It
+// follows the game's own zoom-in animation and ends when the camera is back to its field, or 2 s after a press that zoomed
+// nothing (D-pad up doing something else).
+void FarCry5Stereo::update_binoculars(float tan_half)
+{
+    const bool can   = m_binoc_zoom.load() && m_motion.load() && !m_in_vehicle.load() && !m_menu_screen_on && !m_cine_on && !m_lt_sent.load() && tan_half > 1e-3f;
+    const auto now   = std::chrono::steady_clock::now();
+    const bool press = m_binoc_press.exchange(false);
+    auto       end   = [&](const char* why) {
+        if (m_binoc_armed && m_binoc_peak > 1.1f) spdlog::info("[Binoculars] eyes back to the headset's field ({}; up to x{:.2f})", why, m_binoc_peak);
+        m_binoc_armed = false;
+        m_binoc_mag   = 1.0f;
+    };
+    if (!can) {
+        end("menu, vehicle, cinematic, aim down sights or binoczoom off");
+        if (tan_half > 1e-3f) m_binoc_base_tan = tan_half;
+        return;
+    }
+    if (press && !m_binoc_armed) {
+        m_binoc_armed    = true;
+        m_binoc_armed_at = now;
+        m_binoc_peak     = 1.0f;
+    }
+    if (!m_binoc_armed) {
+        m_binoc_base_tan = tan_half;
+        return;
+    }
+    const float z = std::clamp(m_binoc_base_tan / tan_half, 1.0f, 6.0f);
+    if (z > 1.1f && m_binoc_peak <= 1.1f) spdlog::info("[Binoculars] the game camera narrows after D-pad up: the eyes magnified with it (now x{:.2f})", z);
+    m_binoc_peak = std::max(m_binoc_peak, z);
+    if (m_binoc_peak > 1.1f && z < 1.02f) return end("the game camera back to its field");
+    if (m_binoc_peak <= 1.1f && now - m_binoc_armed_at > std::chrono::seconds(2)) return end("no zoom within 2 s of the press");
+    m_binoc_mag = z > 1.02f ? z : 1.0f;
+}
+
 // Menus, maps and loading screens (no player camera) are 2D: show them on a flat screen at a
 // distance instead of filling the headset's view.
 void FarCry5Stereo::update_menu_screen()
@@ -14934,7 +15745,29 @@ void FarCry5Stereo::update_menu_screen()
     // The world map (drawn with its own WorldMap shaders, only on some frames) is also shown on the
     // flat screen, and stays there 2 s after its shaders were last seen: the map's own 3D terrain
     // view passes for a player camera on the other frames.
-    const bool map_open = m_map_flat.load() && m_frame.load() - m_map_seen_frame.load() < 180;
+    const bool map_seen = m_frame.load() - m_map_seen_frame.load() < 180;
+    // mapsticky (Homard 27 Oct 21:37-21:45: "in menus, only left trigger does something"): the map draws its WorldMap shaders only
+    // on some frames, none for seconds while it stands still, and its terrain view passes for the player camera (the mod even took
+    // it for a vehicle). The map then went back to 3D, where the right stick, the right trigger and the right grip are play
+    // controls kept from the game: only the left trigger (LB) reached the map. The map now stays flat until it is closed: a press
+    // that closes it (B, Back, Start; keyboard Esc or M) about when its shaders stopped, or the first-person pass back for 0.5 s
+    // (play on foot). Its size is no sign: 1920x1080 in the headset that night, the play size in the simulator.
+    const int frame = m_frame.load();
+    if (m_map_close_press.exchange(false) || (foreground_is_game() && ((GetAsyncKeyState(VK_ESCAPE) & 0x8000) || (GetAsyncKeyState('M') & 0x8000))))
+        m_map_close_frame = frame;
+    if (map_seen) {
+        m_map_held        = false;
+        m_map_held_weapon = 0;
+    } else if (m_map_held || (m_map_seen_frame.load() > 0 && frame - m_map_seen_frame.load() < 200)) {
+        m_map_held_weapon       = m_weapon_draws_last_frame > 0 ? m_map_held_weapon + 1 : 0;
+        const bool closed       = m_map_close_frame >= m_map_seen_frame.load() - 30;
+        const char* why         = !m_map_sticky.load() ? "mapsticky off" : closed ? "a press that closes the map" : m_map_held_weapon > 30 ? "the first-person pass back"
+                                  : frame - m_map_seen_frame.load() > 120 * 120 ? "two minutes without a WorldMap shader" : nullptr;
+        if (!m_map_held && !why) spdlog::info("[Menu] mapsticky: no WorldMap shader for 180 frames, the map kept on the flat screen until it is closed");
+        if (m_map_held && why) spdlog::info("[Menu] mapsticky: map closed ({}), {} frames after its last WorldMap shader", why, frame - m_map_seen_frame.load());
+        m_map_held = !why;
+    }
+    const bool map_open = m_map_flat.load() && (map_seen || m_map_held);
     // Back to 3D only once the player camera has been there for ~0.5 s (no flicker).
     // A cinematic shown flat (option): the flat screen while it lasts.
     const bool cine_flat = m_cine_on && m_cine_mode.load() == 0;
@@ -14969,6 +15802,7 @@ void FarCry5Stereo::update_menu_screen()
         }
         if (want) {
             m_menu_cam_before = m_world_cam_pos;
+            fc5::loadpopup::stop("the flat menu screen again");
         } else {
             // loadrecenter: back in play somewhere else (a save loaded, a respawn, fast travel) or for the first time: the
             // view is recentred on the head as it is now (where you face, your height). A pause menu or the map leave it.
@@ -14978,6 +15812,9 @@ void FarCry5Stereo::update_menu_screen()
                 m_recenter_requested = true;
                 spdlog::info("[FC5] loadrecenter: back in play {} ({:.0f} m from the camera before the menu): recentring", m_played_once ? "somewhere else" : "for the first time", moved);
             }
+            // loadpopup: the same moment, whatever loadrecenter is.
+            if (!m_played_once || moved > 20.0f) fc5::loadpopup::start(m_played_once ? "back in play somewhere else" : "first play");
+            else fc5::loadpopup::resume();
             m_played_once = true;
         }
         m_menu_screen_on                                = want;
@@ -15314,7 +16151,7 @@ void FarCry5Stereo::poll_commands()
             spdlog::info("[Settings] no {}: the release defaults used and {}", kSettingsFile, out ? "written as it" : "could not be written");
         }
     } else {
-        // Commands from the F11 Tests tab's switch buttons, then the command file.
+        // Commands from F11 buttons, then the command file.
         bool have = false;
         if (!m_ui_cmds.empty()) {
             ss << m_ui_cmds << '\n';
@@ -15350,31 +16187,20 @@ void FarCry5Stereo::poll_commands()
         }
         const bool on  = arg == "on" || arg == "1" || arg == "true";
         const float fv = arg.empty() ? 0.0f : std::strtof(arg.c_str(), nullptr);
-        static const std::unordered_set<std::string> kPersistent{ "fastlights", "rumble", "rumblegain", "shotbuzz", "shotbuzzamp", "shotbuzzms", "snapturn", "snapdeg", "turnspeed", "hudmode", "huddist", "hudscale", "hudheight", "dlss", "dlsssharp", "dlsspreset",
-                                                                   "upright", "lensdirt", "skipps", "keeprunning", "mapflat", "grip", "grippitch", "modelyaw", "modelpitch",
-                                                                   "aimdot", "aimdotsize", "twohand", "foregrip", "hidetracers", "tracersfromgun", "framedouble", "hands", "reflections", "cinematics", "vehicles", "wheelstick", "hipspread", "norecoil", "nosway", "steadyview", "vehrecenter", "aircraftguard", "headlook", "cinestrict", "menulevel", "weaponsmooth", "fovexact", "fovsize", "dlsscammv", "afw", "aniso", "mipbias", "mipbiasauto",
-                                                                   "gputime", "eyeprobeoff", "bbcopyskip", "probeoff", "logbuffered", "savelater", "snapresetfix", "pairjumps", "vehicleperpair", "doublehmd", "exposuregate", "fovmargin", "fovnarrow", "ngxisolate", "dlsstrim", "firegate", "firefast", "firemoving", "hudscreen", "hudsize", "hudfullres", "f11image", "hudpanel", "foreignpass", "hudmask", "firesplit", "firemeasure", "snapsync", "aimlead", "vehstick", "vehfade", "vehentryfollow", "vehcullheads", "airfollow", "airroll", "vehplayerfov", "chutelook", "lakeoverscan", "dlssmvbest", "dlssmvcheck",
-                                                                   "aoexact", "decaleye", "taamv", "taaskip", "fingergrip", "fingerswap", "dlssjitgate", "dlssoffres", "hudmul", "hudmarkers", "hudmarkdist", "hudmarksize", "hudmarksmooth", "nodof", "afwgunown", "flameworld", "flamehold" };
+        static const std::unordered_set<std::string> kPersistent{ "fastlights", "helipitch", "stickview", "rumble", "rumblegain", "shotbuzz", "shotbuzzamp", "shotbuzzms", "snapturn", "snapdeg", "turnspeed", "hudmode", "huddist", "hudscale", "hudheight", "dlss", "dlsssharp", "dlsspreset",
+                                                                   "upright", "lensdirt", "skipps", "keeprunning", "mapflat", "mapsticky", "binoczoom", "grip", "grippitch", "modelyaw", "modelpitch",
+                                                                   "aimdot", "aimdotsize", "twohand", "foregrip", "hidetracers", "tracersfromgun", "framedouble", "hands", "reflections", "cinematics", "vehicles", "wheelstick", "hipspread", "norecoil", "nosway", "vehrecenter", "aircraftguard", "headlook", "cinestrict", "menulevel", "weaponsmooth", "fovexact", "fovsize", "dlsscammv", "afw", "aniso", "mipbias", "mipbiasauto",
+                                                                   "gputime", "eyeprobeoff", "bbcopyskip", "probeoff", "logbuffered", "savelater", "snapresetfix", "pairjumps", "vehicleperpair", "doublehmd", "exposuregate", "fovmargin", "fovnarrow", "ngxisolate", "dlsstrim", "firegate", "firewaitmax", "aimstickretry", "firefast", "firemoving", "hudscreen", "hudsize", "hudfullres", "f11image", "hudpanel", "foreignpass", "hudmask", "firesplit", "firemeasure", "snapsync", "snapready", "snapstick", "aimlead", "vehstick", "vehfade", "vehentryfollow", "vehcullheads", "airfollow", "airroll", "vehplayerfov", "chutelook", "chutemin", "chuteland", "chuteopen", "chuteground", "chuteprobe", "downedfoot", "vehscript", "gamestate", "lakeoverscan", "dlssmvbest", "dlssmvcheck", "dlssmvsway",
+                                                                   "aoexact", "decaleye", "taamv", "taaskip", "fingergrip", "fingerswap", "dlssjitgate", "dlssoffres", "hudmul", "hudmarkers", "hudmarkdist", "hudmarksize", "hudmarksmooth", "hudmarkcap", "hudmarkmax", "hudmarkicon", "hudprim", "hudprimcam", "nodof", "afwgunown", "flameworld", "flamehold", "popupesc", "popuphold", "lodfov" };
         if (kPersistent.contains(cmd)) {
             if (!from_settings) persist_changed = true;
             m_persist[cmd] = line;
         }
-        if (cmd == "shotprobe" || cmd == "bulletaim" || cmd == "bulletorigin") {
-            // FC2 VR item 2 (FarCry5BulletSpeed.cpp): shotprobe N (test); bulletaim 0|1|2 (saved); bulletorigin head|muzzle (saved, test).
+        if (cmd == "shotprobe") {
+            // shotprobe N (test, FarCry5BulletSpeed.cpp): the next N shots' origin and direction logged. bulletaim and bulletorigin were
+            // removed with F11 Experimental > Research for alternatives (Homard 30 Oct).
             auto* base = reinterpret_cast<uint8_t*>(GetModuleHandleA("FC_m64.dll"));
-            if (cmd == "shotprobe") {
-                if (fc5::bullet::install_shot_hook(base)) fc5::bullet::shot_probe(arg.empty() ? 60 : std::max(1, (int)fv));
-            } else {
-                if (cmd == "bulletaim") {
-                    const int m = std::clamp((int)fv, 0, 2);
-                    fc5::bullet::set_aim_mode(m);
-                    if (m > 0) fc5::bullet::install_shot_hook(base);
-                } else {
-                    fc5::bullet::set_origin_muzzle(arg == "muzzle");
-                }
-                if (!from_settings) persist_changed = true;
-                m_persist[cmd] = line;
-            }
+            if (fc5::bullet::install_shot_hook(base)) fc5::bullet::shot_probe(arg.empty() ? 60 : std::max(1, (int)fv));
             spdlog::info("[FC5 cmd] {}", line);
             continue;
         }
@@ -15422,6 +16248,12 @@ void FarCry5Stereo::poll_commands()
             spdlog::info("[FC5 cmd] {}", line);
             continue;
         }
+        if (cmd == "ofxrguides") {
+            // Outside the else-if chain below (MSVC C1061).
+            fc5::dlss::set_ofxr_tags(on);
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
         if (cmd == "bonesrc" || cmd == "bonescan") {
             // Outside the else-if chain below (MSVC C1061: it is at the compiler's nesting limit).
             m_keep_bones = true;
@@ -15448,9 +16280,9 @@ void FarCry5Stereo::poll_commands()
         {
             // Body gestures (FarCry5Gesture.cpp): "<gesture> on|off", "<gesture>size m"; tests gesturegrip, gestureshoulder.
             bool keep_it = false;
-            if (melee_command(cmd, arg, ls, keep_it) || throwable_command(cmd, arg, fv, ls, keep_it) || fc5::gesture::command(cmd, arg, fv, ls, keep_it) || gun_still_command(cmd, arg, fv, ls, keep_it) ||
-                walk_command(cmd, arg, keep_it) || pivot_command(cmd, arg, keep_it) || skin_pose_command(cmd, arg, keep_it) || skel_hand_command(cmd, arg, keep_it) || bob_command(cmd, arg, keep_it) ||
-                vehtrans_command(cmd, arg, keep_it) || vehcomfort_command(cmd, arg, keep_it)) {
+            if (fc5::memscan::command(cmd, arg, ls) || fc5::switchspeed::command(cmd, arg, fv, ls, keep_it) || fc5::loadpopup::command(cmd, arg, fv, ls, keep_it) || melee_command(cmd, arg, ls, keep_it) || throwable_command(cmd, arg, fv, ls, keep_it) || holster_command(cmd, arg, fv, ls, keep_it) || fc5::gesture::command(cmd, arg, fv, ls, keep_it) || gun_still_command(cmd, arg, fv, ls, keep_it) ||
+                walk_command(cmd, arg, keep_it) || pivot_command(cmd, arg, keep_it) || throw_arc_command(cmd, arg, keep_it) || bob_command(cmd, arg, keep_it) ||
+                vehtrans_command(cmd, arg, keep_it) || downview_command(cmd, arg, keep_it) || vehcomfort_command(cmd, arg, keep_it) || planelook_command(cmd, arg, keep_it) || weapon_switch_command(cmd, arg, fv, ls, keep_it)) {
                 if (keep_it) {
                     if (!from_settings) persist_changed = true;
                     m_persist[cmd] = line;
@@ -15466,6 +16298,12 @@ void FarCry5Stereo::poll_commands()
             else if (cmd == "shotbuzzamp") m_shot_buzz_amp = std::clamp(arg.empty() ? 1.0f : fv, 0.1f, 1.0f);
             else if (cmd == "shotbuzzms") m_shot_buzz_ms = std::clamp(arg.empty() ? 80 : int(fv), 20, 250);
             else m_rumble_log = on;
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "popupesc" || cmd == "popuphold") {   // right B sends Esc while a pop-up has paused the game (popup_esc_now); own block (nesting limit)
+            if (cmd == "popupesc") m_popup_esc = on;
+            else m_pop_hold = on;
             spdlog::info("[FC5 cmd] {}", line);
             continue;
         }
@@ -15513,9 +16351,17 @@ void FarCry5Stereo::poll_commands()
         if (cmd == "aimclean") { m_aim_clean = on; continue; }   // test: the aim march on the depth copied at the weapon pass's first draw
         if (cmd == "firemoving") { m_fire_moving = on; continue; }   // saved
         if (cmd == "firemovingk") { m_fire_moving_k = std::clamp(arg.empty() ? 1.0f : fv, 0.0f, 4.0f); continue; }   // test: game updates of barrel turn allowed as aim error
+        if (cmd == "firewaitmax") { m_fire_wait_max_ms = std::clamp(arg.empty() ? 250 : std::atoi(arg.c_str()), 0, 5000); continue; }   // saved: longest a press waits for the gate (ms, 0 = no limit)
+        if (cmd == "aimstickretry") { m_stick_retry_s = std::clamp(arg.empty() ? 10 : std::atoi(arg.c_str()), 0, 600); continue; }   // saved: the stick fallback tries the mouse again after N s (0 = never)
         if (cmd == "firefastmax") { m_fire_fast_max = std::clamp(arg.empty() ? 0.2f : fv, 0.01f, 3.0f); continue; }   // test: largest measured error the fast first shot leaves with
         if (cmd == "firefast") {   // own block (nesting limit); saved
             m_fire_fast = on;
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "snappairs") {   // N snappairs of consecutive pairs (own block: the chains are at the nesting limit); not saved
+            m_snap_burst = std::clamp(arg.empty() ? 4 : (int)fv, 1, 16) - 1;
+            m_snap_pair  = 2;
             spdlog::info("[FC5 cmd] {}", line);
             continue;
         }
@@ -15527,9 +16373,9 @@ void FarCry5Stereo::poll_commands()
         {
             // Research 15 Oct (gun doubling, shadow crawl, water squares, daytime clarity; F11 Experimental > Research 15 Oct). Own block
             // (nesting limit); the switches are saved, the logs and the marker are not.
-            static const std::unordered_set<std::string> kR15Saved{ "gunanchor", "steadyexact", "shadowmv", "shadowmvnew", "shadowkernel", "prevmvonce", "ssrjitterpair", "ssrtileclear", "ssrmv", "xrhalf", "queryvisible", "dlaaphases", "postclean", "shoreblur", "shoreblurpx", "asmfloor" };
+            static const std::unordered_set<std::string> kR15Saved{ "gunanchor", "steadyexact", "shadowmv", "shadowmvnew", "shadowkernel", "prevmvonce", "ssrjitterpair", "ssrtileclear", "ssrretry", "ssrmv", "framelock", "queryvisible", "dlaaphases", "postclean", "asmfloor" };
             static const std::unordered_set<std::string> kR15{ "gunanchor", "steadyexact", "gunqlog", "shadowmv", "shadowmvnew", "shadowkernel", "prevmvonce", "jitterlog", "ssrjitterpair", "ssrmv", "ssredgelog", "queryvisible", "ssrmarker",
-                                                               "ssrptrlog", "ssrtileclear", "ssrclearlog", "xrhalf", "dlaaphases", "postclean", "postlog", "shoreblur", "shoreblurpx", "asmlog", "asmdiff", "asmcb", "testheadpos", "asmfloor", "asmfloordepth", "smvtrace" };
+                                                               "ssrptrlog", "ssrtileclear", "ssrretry", "ssrclearlog", "xrhalf", "framelock", "dlaaphases", "postclean", "postlog", "asmlog", "asmdiff", "asmcb", "testheadpos", "asmfloor", "asmfloordepth", "smvtrace" };
             if (kR15.contains(cmd)) {
                 if (kR15Saved.contains(cmd)) {
                     if (!from_settings) persist_changed = true;
@@ -15547,12 +16393,18 @@ void FarCry5Stereo::poll_commands()
                 else if (cmd == "ssrjitterpair") m_ssr_jitter_pair = on;
                 else if (cmd == "ssrmarker") m_ssr_marker = on;
                 else if (cmd == "ssrtileclear") m_ssr_tile_clear = on;
+                else if (cmd == "ssrretry") m_ssr_retry = on;
                 else if (cmd == "ssrclearlog") m_ssr_clear_log = arg.empty() ? 40 : std::clamp(n, 0, 10000);
                 else if (cmd == "ssrmv") m_ssr_mv = on;
                 else if (cmd == "queryvisible") m_query_visible = on;
                 else if (cmd == "ssredgelog") m_ssr_edge_log = arg.empty() ? 6 : std::clamp(n, 0, 1000);
                 else if (cmd == "ssrptrlog") m_ssr_ptr_log = arg.empty() ? 60 : std::clamp(n, 0, 10000);
-                else if (cmd == "xrhalf") { m_xr_half = on; runtimes::OpenXR::s_fc5_xr_half = on && !afw_mode(); }
+                else if (cmd == "xrhalf") { if (on) { m_frame_lock = 2; runtimes::OpenXR::s_fc5_frame_lock = 2; } }   // old name: on = framelock 2
+                else if (cmd == "framelock") {   // framelock auto|off|1|2 (saved)
+                    const int fl = arg == "off" || arg == "0" ? 0 : arg == "1" ? 1 : arg == "2" ? 2 : -1;
+                    m_frame_lock = fl;
+                    runtimes::OpenXR::s_fc5_frame_lock = fl;
+                }
                 else if (cmd == "dlaaphases") fc5::dlss::set_dlaa_phases(arg.empty() ? 8 : n);
                 else if (cmd == "postclean") m_post_clean = on;
                 else if (cmd == "postlog") m_post_log = 1;
@@ -15570,9 +16422,7 @@ void FarCry5Stereo::poll_commands()
                     spdlog::info("[Test] head position offset ({:.2f} {:.2f} {:.2f}) m", x, y, z);
                 }
                 else if (cmd == "asmdiff") { g_asm_diff = arg.empty() ? 600 : std::clamp(n, 0, 20000); g_asm_log = std::max(g_asm_log.load(), g_asm_diff.load() + 4); }
-                else if (cmd == "shoreblur") m_shore_blur = on;
                 else if (cmd == "nodof") g_no_dof = on;   // saved: the game's depth of field off (the near gun stays sharp)
-                else if (cmd == "shoreblurpx") m_shore_blur_px = std::clamp(arg.empty() ? 3.0f : fv, 1.0f, 8.0f);
                 spdlog::info("[FC5 cmd] {}", line);
                 continue;
             }
@@ -15615,6 +16465,21 @@ void FarCry5Stereo::poll_commands()
             m_persist[cmd] = line;
             (cmd == "lakeshared" ? m_lake_shared : m_lake_pixel) = on;
             spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "cinesteer" || cmd == "cinesteerstart" || cmd == "cinesteertime") {   // own block (nesting limit); saved
+            if (!from_settings) persist_changed = true;
+            if (cmd == "cinesteer") {
+                m_cine_steer   = on;
+                m_persist[cmd] = on ? "cinesteer on" : "cinesteer off";
+            } else if (cmd == "cinesteerstart") {
+                m_cine_steer_start = std::clamp(fv, 10.0f, 90.0f);
+                m_persist[cmd]     = fmt::format("cinesteerstart {:.0f}", m_cine_steer_start.load());
+            } else {
+                m_cine_steer_time = std::clamp(fv, 0.3f, 3.0f);
+                m_persist[cmd]    = fmt::format("cinesteertime {:.1f}", m_cine_steer_time.load());
+            }
+            spdlog::info("[FC5 cmd] {}", m_persist[cmd]);
             continue;
         }
         if (cmd == "bodymatch" || cmd == "bodymatchtol" || cmd == "bodycore" || cmd == "glovemesh" || cmd == "gloveany" || cmd == "barehands" || cmd == "fingergrip" || cmd == "fingerswap" || cmd == "fingertest" || cmd == "cinedelay" || cmd == "cinepair" || cmd == "cinefollow" || cmd == "vrpost" || cmd == "cinecull") {   // own block (nesting limit)
@@ -15675,6 +16540,36 @@ void FarCry5Stereo::poll_commands()
             spdlog::info("[FC5 cmd] {}", line);
             continue;
         }
+        if (cmd == "downedfoot") {
+            m_downed_foot = on;
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "chutemin") {   // chutemin on|off (saved)
+            m_chute_min = on;
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "chuteland") {   // chuteland on|off (saved)
+            m_chute_land = on;
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "chuteopen" || cmd == "chuteground" || cmd == "chuteprobe") {   // on|off (saved)
+            (cmd == "chuteopen" ? m_chute_open : cmd == "chuteground" ? m_chute_ground : m_chute_probe) = on;
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "gamestate" || cmd == "gamestatestatus") {   // log only: the game's own state beside the mod's (research/2026-10-30_engine_natives.md)
+            if (cmd == "gamestate") m_gamestate = on;
+            spdlog::info("[FC5 cmd] {}; {}", line, fc5::lua::gamestate_status());
+            continue;
+        }
+        if (cmd == "vehscript" || cmd == "vehscriptstatus") {
+            if (cmd == "vehscript") m_veh_script = on;
+            spdlog::info("[FC5 cmd] {}; {}", line, fc5::lua::vehicle_status());
+            continue;
+        }
         if (cmd == "vehplayerfov") {
             m_veh_playerfov = on;
             spdlog::info("[FC5 cmd] {}", line);
@@ -15695,6 +16590,16 @@ void FarCry5Stereo::poll_commands()
         if (cmd == "airfollow" || cmd == "airroll") {
             if (cmd == "airfollow") m_air_follow = on;
             else m_air_roll = std::clamp(fv, 0.0f, 1.0f);
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
+        if (cmd == "lodfov") {   // lodfov off|on|<scale> (saved; the next game start)
+            spdlog::info("[FC5 cmd] {}", line);
+            fc5::lodfov::set(arg);
+            continue;
+        }
+        if (cmd == "mapsticky" || cmd == "binoczoom") {   // own block (nesting limit)
+            (cmd == "mapsticky" ? m_map_sticky : m_binoc_zoom) = on;
             spdlog::info("[FC5 cmd] {}", line);
             continue;
         }
@@ -15725,6 +16630,12 @@ void FarCry5Stereo::poll_commands()
                          m_padsim_rgrip.load(), m_padsim_l[0].load(), m_padsim_l[1].load(), m_padsim_r[0].load(), m_padsim_r[1].load(), m_padsim_old.load());
             continue;
         }
+        if (cmd == "helipitch" || cmd == "stickview") {   // helipitch on|off, stickview on|off (saved)
+            if (cmd == "helipitch") m_heli_pitch = on;
+            else m_stick_view = on;
+            spdlog::info("[FC5 cmd] {}", line);
+            continue;
+        }
         if (cmd == "vehstick" || cmd == "vehfade" || cmd == "vehentryfollow" || cmd == "vehcullheads") {
             if (cmd == "vehstick") m_veh_stick = on;
             else if (cmd == "vehfade") m_veh_fade = on;
@@ -15733,8 +16644,10 @@ void FarCry5Stereo::poll_commands()
             spdlog::info("[FC5 cmd] {}", line);
             continue;
         }
-        if (cmd == "snapsync" || cmd == "culllog" || cmd == "aimlead") {
+        if (cmd == "snapsync" || cmd == "snapready" || cmd == "snapstick" || cmd == "culllog" || cmd == "aimlead") {
             if (cmd == "snapsync") m_snap_sync = on;
+            else if (cmd == "snapready") m_snap_ready = on;   // saved by F11 since 21 Oct, never read back at start until now
+            else if (cmd == "snapstick") m_snap_stick = on;
             else if (cmd == "culllog") m_cov_trace = std::max(-1, int(fv));   // -1: the per-second line every second
             else m_aim_lead = std::clamp(fv, 0.0f, 6.0f);
             spdlog::info("[FC5 cmd] {}", line);
@@ -15742,6 +16655,7 @@ void FarCry5Stereo::poll_commands()
         }
         // Shadow pipeline test commands (own chain: the main one is at the compiler's nesting limit).
         {
+            bool hit = true;   // handled here: logged and done (they used to fall through to the last chain's "unknown")
             if (cmd == "swaypos") m_debug_sway_pos = fv;
             else if (cmd == "pdafterswap") m_pd_after_swap = on;
             else if (cmd == "prevmotionlog") m_prevmotion_log = arg.empty() ? 12 : (int)fv;
@@ -15763,7 +16677,7 @@ void FarCry5Stereo::poll_commands()
             else if (cmd == "hipspread") g_spread_scale = std::clamp(fv, 0.0f, 2.0f);
             else if (cmd == "hipspreadbase") g_spread_base_too = on;
             else if (cmd == "afwdump") afw_dump();
-            else if (cmd == "steadyview") m_steady_view = on;
+            else if (cmd == "steadyview") m_steady_view = on;   // test since 29 Oct (retired switch, not saved)
             else if (cmd == "vehrecenter") m_veh_auto_recenter = on;
             else if (cmd == "vistaeye") m_vista_eye = on;
             else if (cmd == "cinestrict") m_cine_strict = on;
@@ -15773,6 +16687,10 @@ void FarCry5Stereo::poll_commands()
         else if (cmd == "dlssmvstat") fc5::dlss::motion_stat(std::max(1, (int)fv));
         else if (cmd == "dlssmvbest") fc5::dlss::set_motion_best(on);
         else if (cmd == "dlssmvcheck") fc5::dlss::set_motion_check(on);
+        else if (cmd == "dlssmvsway") {
+            fc5::dlss::set_motion_sway(arg == "on" ? 0.5f : arg == "off" || arg.empty() ? 0.0f : fv);
+            spdlog::info("[DLSS] dlssmvsway {:.2f} px (0 = off)", fc5::dlss::motion_sway());
+        }
         else if (cmd == "dlssmvdump") fc5::dlss::motion_dump(std::clamp((int)fv, 2, 12));
         // Indoor AO and blood decals while moving (13 Oct).
         else if (cmd == "aoexact") { m_ao_exact = on; spdlog::info("[AO] aoexact {}", on ? "on" : "off"); }
@@ -15885,9 +16803,14 @@ void FarCry5Stereo::poll_commands()
             else if (cmd == "norecoil") { m_no_recoil = on; set_game_patch(0, on); }
             else if (cmd == "nosway") { m_no_sway = on; set_game_patch(1, on); }
             else if (cmd == "paircheck") { m_pair_check = on; if (fv > 1.0f) m_pair_every = (int)fv; }
+            else hit = false;
+            if (hit && cmd != "afwdump") {   // afwdump: the main chain's request_dump runs too
+                spdlog::info("[FC5 cmd] {}", line);
+                continue;
+            }
         }
         // AFW gun tests (own block: the research chains are at the compiler's nesting limit).
-        if (cmd == "ctrlsway" || cmd == "afwheldgun" || cmd == "afwfgpush" || cmd == "afwfpeye" || cmd == "afwfpss" || cmd == "afwfptrace" || cmd == "unarmedhand" || cmd == "slinghand" || cmd == "slinghandtilt" || cmd == "gripbyhand" || cmd == "griphand" || cmd == "afwgunmv" || cmd == "afwgunpose" || cmd == "afwgunmvpose" || cmd == "afwgunown" || cmd == "afwsteady" || cmd == "afwroot" || cmd == "afwfoot" || cmd == "afwrail" || cmd == "afwvehnear" || cmd == "afwdepthlate" || cmd == "afwvehbody" || cmd == "afwvehown" || cmd == "afwvehmv" || cmd == "vehlog" || cmd == "afwstartstereo") {
+        if (cmd == "ctrlsway" || cmd == "afwheldgun" || cmd == "afwfgpush" || cmd == "afwfpeye" || cmd == "afwfpss" || cmd == "afwfptrace" || cmd == "unarmedhand" || cmd == "slinghand" || cmd == "slinghandtilt" || cmd == "gripbyhand" || cmd == "griphand" || cmd == "afwgunmv" || cmd == "afwgunpose" || cmd == "afwgunmvpose" || cmd == "afwgunown" || cmd == "afwsteady" || cmd == "afwroot" || cmd == "afwfoot" || cmd == "afwrail" || cmd == "afwfoliage" || cmd == "afwcopies" || cmd == "afwvehnear" || cmd == "afwdepthlate" || cmd == "afwvehbody" || cmd == "afwvehown" || cmd == "afwvehmv" || cmd == "vehlog" || cmd == "afwstartstereo") {
             if (cmd == "afwfgpush") m_afw_fg_push = on;
             else if (cmd == "afwfpeye") { m_afw_fp_eye = on; m_fp_target_log = 0; }
             else if (cmd == "afwfpss") m_afw_fp_ss = std::clamp((int)fv, 1, 2);
@@ -15911,6 +16834,8 @@ void FarCry5Stereo::poll_commands()
             else if (cmd == "afwroot") m_afw_root_every = on;   // the body root (walkbob's height) at every AFW frame
             else if (cmd == "afwfoot") m_afw_foot = on;         // a refined point off its depth footprint is refused
             else if (cmd == "afwrail") m_afw_rail = on;         // thin near things retried from the texel beside the seed
+            else if (cmd == "afwfoliage") m_afw_foliage = on;   // needles, leaves and grass not taken for moved
+            else if (cmd == "afwcopies") m_afw_copies = on;     // the mod's copies (holster, sling, throwable, pouch) drawn for the held eye too
             else if (cmd == "afwdepthlate") m_afw_depth_late = on;
             else if (cmd == "afwvehnear") m_afw_veh_near = arg == "off" ? 0.0f : arg == "on" ? 5.0f : std::clamp(fv, 0.0f, 20.0f);
             else if (cmd == "afwvehbody") m_afw_veh_body = arg == "off" ? 0.0f : arg == "on" ? 3.0f : std::clamp(fv, 0.0f, 10.0f);
@@ -16103,6 +17028,11 @@ void FarCry5Stereo::poll_commands()
             else if (cmd == "hudmarkdist") m_hud_mark_dist = std::clamp(fv, 1.0f, 1000.0f);
             else if (cmd == "hudmarksize") m_hud_mark_size = std::clamp(fv, 0.2f, 2.0f);
             else if (cmd == "hudmarksmooth") m_hud_mark_smooth = std::clamp(fv, 0.0f, 1.0f);
+            else if (cmd == "hudmarkcap") m_hud_mark_cap = on;
+            else if (cmd == "hudprim") m_hud_prim = on;
+            else if (cmd == "hudprimcam") m_hud_prim_cam = on;
+            else if (cmd == "hudmarkmax") m_hud_mark_max = std::clamp(fv, 1.0f, 20.0f);
+            else if (cmd == "hudmarkicon") m_hud_mark_icon = std::clamp(fv, 0.5f, 10.0f);
             else if (cmd == "hudmarklag") m_hud_mark_lag = std::clamp((int)fv, 0, 6);
             else if (cmd == "hudmarklog") m_hud_mark_log = std::clamp((int)fv, 0, 2000);
             else if (cmd == "hudmarkdump") m_hud_mark_dump = std::clamp((int)fv, 0, 30);
@@ -16205,6 +17135,7 @@ void FarCry5Stereo::poll_commands()
         if (empty_hands_command(cmd, arg, ls, from_settings, persist_changed)) continue;
         if (reddot_command(cmd, arg, from_settings, persist_changed)) continue;
         if (fc5::shadowshare::command(cmd, fv, on)) continue;   // cascadelog, giplanelog (own chain: the main one is at the nesting limit)
+        if (fc5::locallights::command(cmd, fv, on)) continue;   // lampeye
         if (cmd == "aimdot") m_aim_dot = on;
         else if (cmd == "aimdotsize") m_aim_dot_px = std::clamp(fv, 1.0f, 40.0f);
         else if (cmd == "hudmode") m_hud_mode = std::clamp((int)fv, 0, 2);
@@ -16379,7 +17310,8 @@ void FarCry5Stereo::poll_commands()
         else if (cmd == "aimgain") m_aim_gain = fv;
         else if (cmd == "turn") m_dbg_turn = fv;
         else if (cmd == "trigger") m_dbg_trigger = on;
-        else if (cmd == "aimstick") m_stick_aim = on;
+        else if (cmd == "aimstick") { m_stick_aim = on; m_stick_auto = false; note_stick_by_hand("cmd aimstick"); }
+        else if (cmd == "mousedrop") m_mouse_drop = on;   // test (not saved): aim loop mouse moves not sent, for the stick fallback and aimstickretry in the simulator
         else if (cmd == "vigem") m_use_vigem = on;
         else if (cmd == "menuscreen") m_menu_screen = on;
         else if (cmd == "menudistance") m_menu_distance = fv;
@@ -16875,11 +17807,26 @@ void FarCry5Stereo::on_post_present()
     m_player_views_last_frame = m_player_views_this_frame;
     // Review R4 (cmd vehicleperpair): both eyes of a pair see one camera position; sampled at the right eye only, the
     // vertical speed is no longer zero every other present.
-    if (!(m_veh_per_pair.load() && m_frame_double.load() && m_stereo2.load()) || (m_frame.load() & 1) != 0) update_vehicle();
+    if (!(m_veh_per_pair.load() && m_frame_double.load() && m_stereo2.load()) || (m_frame.load() & 1) != 0) {
+        update_vehicle();
+        update_downview();   // downview (FarCry5DownView.cpp)
+    }
     update_cinematic();
     update_menu_screen();
     m_weapon_draws_last_frame = m_weapon_draws_this_frame;
     m_weapon_draws_this_frame = 0;
+    // weaponidsplit: a gun whose largest piece is a 65535-index one is told apart by its largest other piece; the id held so far stays
+    // while its piece is still drawn (another piece growing larger for a moment, a muzzle flash, does not change the weapon).
+    if (m_weapon_id_split.load() && m_weapon_sig_frame == 65535u && m_weapon_sig2_frame != 0) {
+        UINT       id  = 0x10000u | m_weapon_sig2_frame;
+        const UINT cur = m_weapon_sig.load();
+        if ((cur & 0x10000u) && cur != id)
+            for (int i = 0; i < m_sig_counts_n; ++i)
+                if (m_sig_counts[i] == (cur & 0xFFFFu)) { id = cur; break; }
+        m_weapon_sig_frame = id;
+    }
+    m_weapon_sig2_frame = 0;
+    m_sig_counts_n      = 0;
     if (m_weapon_sig_frame != 0 && m_weapon_sig_frame != m_weapon_sig.load()) {
         std::lock_guard _{ m_weapon_cal_mtx };
         const auto it = m_weapon_cal.find(m_weapon_sig_frame);
@@ -16887,6 +17834,7 @@ void FarCry5Stereo::on_post_present()
                      it != m_weapon_cal.end() ? fmt::format("calibrated: yaw {:+.1f}, pitch {:+.1f} deg", it->second.first, it->second.second) : std::string{ "default calibration" });
     }
     if (m_weapon_sig_frame != 0) m_weapon_sig = m_weapon_sig_frame;
+    holster_frame_end();   // sidearm: this frame's recording, the kinds of weapon held
     // Sight glass (a reticle or a scope's glass) drawn by this frame's weapon: only a gun drawing it magnifies (optic_now).
     if (m_optic_this_frame && m_weapon_sig_frame != 0) {
         m_optic_sig   = m_weapon_sig_frame;
@@ -16907,6 +17855,17 @@ void FarCry5Stereo::on_post_present()
         }
         m_unarmed               = unarmed;
         m_glove_seen_this_frame = false;
+        weapon_switch_frame(m_weapon_sig_frame);   // shoulderdraw (FarCry5WeaponSwitch.cpp)
+        fc5::switchspeed::frame();                 // switchfast (FarCry5SwitchSpeed.cpp)
+        {
+            // loadpopup (FarCry5LoadPopup.cpp): what the mod's load-time work has done.
+            fc5::loadpopup::Steps ls{};
+            ls.allowed         = m_motion.load() && !flat_screen_on() && !in_vehicle() && !m_cine_on;
+            ls.armed           = !unarmed;
+            ls.weapon_recorded = m_hol_known.load();
+            ls.side_recorded   = m_hol_side_rec.load();
+            fc5::loadpopup::frame(ls);
+        }
         empty_hands_frame();   // emptyhandstill
     }
     m_weapon_sig_frame = 0;
@@ -17043,6 +18002,7 @@ void FarCry5Stereo::on_post_present()
         spdlog::info("[FC5 stats] presents={} frame={} views/frame={} rewritten/frame={} main={}x{} unmaps={} viewports={} hmd={} ref={} stereo={}", m_presents,
                      m_frame.load(), m_views_last_frame, m_modified_last_frame, m_main_w, m_main_h, m_unmaps_total, m_viewports_total, vr->is_hmd_active(), m_have_ref,
                      m_stereo_enabled.load());
+        if (fc5::dlss::enabled() && fc5::dlss::ofxr_tags()) spdlog::info("[DLSS] ofxrguides (OFXR frame generation tags), last 5 s: {}", fc5::dlss::ofxr_tag_stats());
         if (m_motion.load()) {
             spdlog::info("[Pad] virtual pad updates in 5 s: {}{}", m_pad_updates, m_pad_failed ? " (pad unavailable)" : "");
             m_pad_updates = 0;
@@ -17074,9 +18034,10 @@ void FarCry5Stereo::on_post_present()
                 last_skips = m_exposure_skips;
             }
             if (m_afw_fp_eye.load()) {
-                spdlog::info("[AFW] afwfpeye: held-eye weapon passes {} ({} draws; skipped: other target {}, writes elsewhere {}, no camera copy {}, no held camera {}); rebuilds with them {} of {} (fed {}); depth {}x{} at {}x{}; gun vectors re-anchored {} (afwgunmv {}), {} through the gun's transforms (afwgunmvpose {}); "
+                spdlog::info("[AFW] afwfpeye: held-eye weapon passes {} ({} draws, of them the mod's copies {} (afwcopies {}); skipped: other target {}, writes elsewhere {}, no camera copy {}, no held camera {}); rebuilds with them {} of {} (fed {}); depth {}x{} at {}x{}; gun vectors re-anchored {} (afwgunmv {}), {} through the gun's transforms (afwgunmvpose {}); "
                              "colour from the last image through the gun's pose {}, not ({}) (afwgunpose {}): the gun's move in the game camera's space between an eye's images {:.2f} cm mean, {:.2f} cm / {:.2f} deg max",
-                             std::exchange(m_fp_frames, 0), std::exchange(m_fp_draws, 0), std::exchange(m_fp_skip_target, 0), std::exchange(m_fp_skip_uav, 0),
+                             std::exchange(m_fp_frames, 0), std::exchange(m_fp_draws, 0), std::exchange(m_fp_copy_draws, 0), m_afw_copies.load() ? "on" : "off",
+                             std::exchange(m_fp_skip_target, 0), std::exchange(m_fp_skip_uav, 0),
                              std::exchange(m_fp_skip_cb, 0), std::exchange(m_fp_skip_nocam, 0), s.fp_rebuilds, s.rebuilds, std::exchange(m_fp_composed, 0), m_fp_w, m_fp_h, m_fp_tex_ss, m_fp_tex_ss,
                              std::exchange(m_gun_mv_fixed, 0), m_afw_gun_mv.load() ? "on" : "off", std::exchange(m_gun_mv_pose_n, 0), m_afw_gun_mv_pose.load() ? "on" : "off",
                              m_fp_pose_n, std::exchange(m_fp_pose_miss, 0), m_afw_gun_pose.load() ? "on" : "off", m_fp_pose_n ? m_fp_pose_cm / float(m_fp_pose_n) : 0.0f,
@@ -17169,8 +18130,13 @@ namespace
 
 void FarCry5Stereo::ssr_detect(ID3D11DeviceContext* ctx, UINT slot)
 {
+    const bool retry = m_ssr_retry.load();
+    if (retry && m_ssr_tries >= 8 && m_frame.load() >= m_ssr_next_try) m_ssr_tries = 0;   // ssrretry: a new round
     if (m_ssr_tries >= 8 || !m_ssr.valid || m_frame.load() < m_ssr_next_try) return;
-    m_ssr_next_try = m_frame.load() + 30; // a readback waits for the GPU: at most one look per 30 frames
+    if (retry && ModSettings::g_internalSettings.forceFlatScreen) return;   // ssrretry: no look at the menu's or map's camera
+    // A readback waits for the GPU: at most one look per 30 frames. ssrretry: 31, so the looks take the game call and the
+    // extra call in turn (with 30 every look was the same call of the pair).
+    m_ssr_next_try = m_frame.load() + (retry ? 31 : 30);
     ++m_ssr_tries;
     ID3D11DeviceContext1* ctx1 = nullptr;
     if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext1), reinterpret_cast<void**>(&ctx1))) || !ctx1) return;
@@ -17218,7 +18184,13 @@ void FarCry5Stereo::ssr_detect(ID3D11DeviceContext* ctx, UINT slot)
         m_ssr_form = form;
         spdlog::info("[SSR] reprojection form {} recognised: each eye's reflections get that eye's own reprojection", form);
     } else if (m_ssr_tries >= 8) {
-        spdlog::info("[SSR] reprojection form not recognised after {} tries: the game's matrix is left as is", m_ssr_tries);
+        if (retry) {
+            m_ssr_next_try = m_frame.load() + 1200;
+            if (++m_ssr_rounds <= 3 || m_ssr_rounds % 20 == 0)
+                spdlog::info("[SSR] reprojection form not recognised after {} tries (round {}): looked for again in 1200 frames (ssrretry on)", m_ssr_tries, m_ssr_rounds);
+        } else {
+            spdlog::info("[SSR] reprojection form not recognised after {} tries: the game's matrix is left as is", m_ssr_tries);
+        }
     }
 }
 
@@ -17451,14 +18423,7 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
         }
         return changed;
     };
-    // Controllers: the trigger clicks too (A already does), the right stick scrolls.
-    {
-        static bool was = false;
-        static auto vr  = VR::get();
-        const bool  t   = m_menu_trigger.load() && vr->is_using_controllers();
-        if (t != was) ImGui::GetIO().AddMouseButtonEvent(0, t);
-        was = t;
-    }
+    // Controllers: the right trigger clicks like A (OverlayComponent sends one button state for both), the right stick scrolls.
 
     // Header: what is running, and the level.
     {
@@ -17504,142 +18469,164 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
 
     if (ImGui::BeginTabItem("Display", nullptr, tab_flag(0))) {
         tab_body_begin();
-        section("Rendering");
-        {
-            int mode = m_stereo2.load() && !m_afw_start_held ? 1 : 0;   // AFW shown while afwstartstereo stands in with Stereo
-            if (combo("Rendering (F8)", &mode, "AFW (early experimental, visible artifacts)\0Stereo\0")) {
-                m_stereo2  = mode == 1;
-                m_afw_test = mode == 0;
-                m_afw_start_held = false;
-                m_afw_start_done = true;
-                m_persist.erase("afw");
-                m_persist["render"] = mode == 1 ? "render stereo" : "render afw";
-                save_settings();
-            }
-            hint("Stereo renders both eyes every game frame (sharpest, heaviest). AFW renders one eye per frame and rebuilds the other from depth.");
-        }
-        section("Field of view");
-        {
-            float fp = std::round(m_fov_scale.load() * 100.0f);
-            if (slider("Field of view (smaller = sharper)", fp, 70.0f, 100.0f, fp >= 99.5f ? "100%% (full)" : "%.0f%%", 1.0f)) {
-                m_fov_scale = std::clamp(fp / 100.0f, 0.7f, 1.0f);
-                keep("fovnarrow", fmt::format("fovnarrow {:.2f}", m_fov_scale.load()));
-            }
-            hint("Draws a narrower view with the same number of pixels, so every degree gets more of them: at 80% the picture is about 25% "
-                 "sharper, and the edge of the lens, beyond what is drawn, stays black. 100% = the headset's whole field of view.");
-        }
-        if (m_fov_exact.load()) {
-            int fs = m_fov_faster.load() ? 1 : 0;
-            if (combo("Use the pixels it saves for", &fs, "A sharper image (same cost)\0Speed (same sharpness as before, next start)\0")) {
-                m_fov_faster = fs == 1;
-                keep("fovsize", fs == 1 ? "fovsize faster" : "fovsize sharper");
-            }
-            hint("Each eye is drawn with the headset's exact angles (F11 Debug > Head tracking and view), which leaves pixels over: spend them on sharpness or on speed.");
-        }
-        section("Image quality");
-        v = fc5::dlss::enabled();
-        if (ImGui::Checkbox("DLSS", &v)) {
-            fc5::dlss::set_enabled(v);
-            m_persist["dlss"] = v ? "dlss on" : "dlss off";
-            save_settings();
-        }
-        hint("NVIDIA DLSS per eye (off: the game's own SMAA).");
-        if (!fc5::dlss::enabled() && g_force_w > 0 && g_out_w > g_force_w + 8) {
-            // dlssoffres: turned off while the game renders below the eye size (DLSS upscaling): the picture is stretched.
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "The game renders at %ux%u, stretched to the eye size %ux%u.", g_force_w, g_force_h, g_out_w, g_out_h);
-            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Restart the game: without DLSS it then renders at the eye size.");
-        }
-        // "Exact head motion for DLSS" (dlsscammv on/off) is gone from here (F11 review, Homard 24 Oct): Debug > DLSS, anti-aliasing and
-        // post effects > "DLSS motion vectors" sets the same dlsscammv, "Game motion vectors only" being off.
-        {
-            static const float kRatios[] = { 1.0f, 0.67f, 0.58f, 0.50f };
-            const float        cur       = g_render_ratio_next > 0.0f ? g_render_ratio_next : g_render_ratio_start;
-            int                sel       = 0;
-            for (int i = 0; i < 4; ++i)
-                if (std::abs(kRatios[i] - cur) < 0.02f) sel = i;
-            if (combo("DLSS render scale", &sel, "Native (DLAA)\0Quality (0.67)\0Balanced (0.58)\0Performance (0.50)\0")) {
-                g_render_ratio_next = kRatios[sel];
-                std::ofstream{ kResolutionFile } << fmt::format("auto {:.2f}\n", kRatios[sel]);
-                spdlog::info("[Res] {} set to auto {:.2f}: applies at the next start", kResolutionFile, kRatios[sel]);
-            }
-            hint("How large the game renders before DLSS scales up to the headset. Lower = faster. Applies at the next start.");
-            if (g_render_ratio_next > 0.0f && std::abs(g_render_ratio_next - g_render_ratio_start) > 0.01f) ImGui::TextColored(kAccent, "Restart the game to apply the render scale");
-        }
-        if (level >= 1) {
-            float sh = fc5::dlss::sharpness();
-            if (slider("DLSS sharpening", sh, 0.0f, 1.0f, "%.2f", 0.05f)) {
-                fc5::dlss::set_sharpness(sh);
-                m_persist["dlsssharp"] = fmt::format("dlsssharp {:.2f}", sh);
-                save_settings();
-            }
-            // Presets: J (10) / K (11) = DLSS 4 transformer; L (12) / M (13) = DLSS 4.5 second-generation transformer (310.5+ library).
-            const int pr   = fc5::dlss::preset();
-            int       model = pr == 11 ? 1 : pr == 10 ? 2 : pr == 12 ? 3 : pr == 13 ? 4 : 0;
-            if (combo("DLSS model", &model, "Library default\0Transformer (preset K, recommended)\0Transformer (preset J)\0DLSS 4.5 transformer (preset L)\0DLSS 4.5 transformer (preset M)\0")) {
-                const int p = model == 1 ? 11 : model == 2 ? 10 : model == 3 ? 12 : model == 4 ? 13 : 0;
-                fc5::dlss::set_preset(p);
-                m_persist["dlsspreset"] = fmt::format("dlsspreset {}", p);
-                save_settings();
-            }
-            hint("Use preset K (the default): it keeps the ground sharp. Preset M smeared the ground under you into soft patches (headset, 13 Oct).");
-            int               step  = (int)std::lround(m_res_scale.load() * 10.0f);
-            const std::string label = fmt::format("x{:.1f}", step / 10.0f);
-            if (slider_int("Resolution multiplier", step, 10, 20, label.c_str(), 1)) {
-                m_res_scale           = step / 10.0f;
-                m_persist["resscale"] = fmt::format("resscale {:.1f}", step / 10.0f);
-                save_settings();
-            }
-            hint("Scales the eye images (the headset's recommended size times this) and with them the game's render size (the eye size times the render scale above: below 1 DLSS upscales to the eye size; with DLSS off at start the game renders at the eye size). Applies at the next start.");
-            ImGui::TextDisabled("Eye images %ux%u (x%.1f), game renders %ux%u%s; DLSS: %s", g_out_w, g_out_h, g_res_scale_start, g_force_w, g_force_h,
-                                g_force_w && g_out_w > g_force_w + 8 ? " (DLSS upscales)" : "", fc5::dlss::status().c_str());
-            const float want_ratio = g_render_ratio_next > 0.0f ? g_render_ratio_next : g_render_ratio_start;
-            const bool  differs    = std::abs(m_res_scale.load() - g_res_scale_start) > 0.01f || std::abs(want_ratio - g_render_ratio_start) > 0.01f;
-            if (differs || g_live_stage != 0) {
-                if (differs) ImGui::TextColored(kAccent, "Restart the game to apply x%.1f, or:", m_res_scale.load());
-                if (ImGui::Button(g_live_stage == 4 ? "Apply now (armed; with the slider put back, withdraws it)" : "Apply now (experimental)")) {
-                    const std::string err = live_request(m_res_scale.load(), want_ratio);
-                    if (!err.empty()) g_live_status = err;
-                    spdlog::info("[Res] F11 Apply now: {}", err.empty() ? std::string{ "requested" } : err);
+        if (ImGui::CollapsingHeader("Rendering", ImGuiTreeNodeFlags_DefaultOpen)) {
+            {
+                // Stereo first (29 Oct, Homard's 14:50 log: the list opens under the pointer, so a stray click lands on the first entry;
+                // AFW first turned one into a switch to AFW). Only the list order changed: the saved line is still "render stereo|afw".
+                int mode = m_stereo2.load() && !m_afw_start_held ? 0 : 1;   // AFW shown while afwstartstereo stands in with Stereo
+                if (combo("Rendering (F8)", &mode, "Stereo\0AFW (early experimental, visible artifacts)\0")) {
+                    const bool st = mode == 0;
+                    m_stereo2  = st;
+                    m_afw_test = !st;
+                    m_afw_start_held = false;
+                    m_afw_start_done = true;
+                    m_persist.erase("afw");
+                    m_persist["render"] = st ? "render stereo" : "render afw";
+                    save_settings();
+                    spdlog::info("[Render] {} (F11 menu, saved)", st ? "stereo" : "AFW");
                 }
-                hint("Then change Resolution in the game's Options > Video to any other value: the game rebuilds its images at the mod's size (its own resolution choice is ignored) and the headset images follow. Experimental.");
+                hint("Stereo renders both eyes every game frame (sharpest, heaviest). AFW renders one eye per frame and rebuilds the other from depth.");
             }
-            if (!g_live_status.empty()) ImGui::TextDisabled("Live change: %s", g_live_status.c_str());
         }
-        section("Effects");
-        {
-            float lo = m_lake_overscan.load();
-            if (lo < 0.3f) lo = 1.625f;
-            if (slider("Water detail at shorelines (area the lake data covers)", lo, 0.4f, 1.625f, lo >= 1.62f ? "1.625 (game)" : "%.2f", 0.05f)) {
-                m_lake_overscan = lo >= 1.62f ? 0.0f : lo;
-                keep("lakeoverscan", lo >= 1.62f ? std::string{ "lakeoverscan off" } : fmt::format("lakeoverscan {:.2f}", lo));
+        if (ImGui::CollapsingHeader("Field of view", ImGuiTreeNodeFlags_DefaultOpen)) {
+            {
+                float fp = std::round(m_fov_scale.load() * 100.0f);
+                if (slider("Field of view (smaller = sharper)", fp, 70.0f, 100.0f, fp >= 99.5f ? "100%% (full)" : "%.0f%%", 1.0f)) {
+                    m_fov_scale = std::clamp(fp / 100.0f, 0.7f, 1.0f);
+                    keep("fovnarrow", fmt::format("fovnarrow {:.2f}", m_fov_scale.load()));
+                }
+                hint("Draws a narrower view with the same number of pixels, so every degree gets more of them: at 80% the picture is about 25% "
+                     "sharper, and the edge of the lens, beyond what is drawn, stays black. 100% = the headset's whole field of view.");
             }
-            hint("The lake's water data is drawn into a fixed-size image covering the view times this number: smaller = sharper, less blocky shorelines. 1.0 covers exactly the view; below 1 (16 Oct) it still covers the whole view, so water never vanishes at the sides, and gives the far shorelines at the horizon 1/X times the detail (0.6 = 1.7 times) and the water right below you less; 1.625 is the game's own. More sharpness comes from \"Water detail only below the horizon\" (F11 Debug > Water, on at every start).");
-            bool nd = g_no_dof.load();
-            if (ImGui::Checkbox("No depth of field (the gun's sights and stock stay sharp)", &nd)) m_ui_cmds += nd ? "nodof on\n" : "nodof off\n";
-            hint("On (default): the game's depth-of-field blur is off, so what is very near (the rear sight, the scope's eyepiece, the stock) "
-                 "is not blurred; in the headset your eyes focus by themselves. Off: the game's blur.");
-            // From Debug > Mandatory > Anti-aliasing and post effects (Homard 24 Oct: "in the display section of effect").
-            bool vp = m_postfx_vr.load();
-            if (ImGui::Checkbox("No vignette or film grain (both eyes alike)", &vp)) {
-                m_postfx_vr = vp;
-                keep("vrpost", vp ? "vrpost on" : "vrpost off");
+            if (m_fov_exact.load()) {
+                int fs = m_fov_faster.load() ? 1 : 0;
+                if (combo("Use the pixels it saves for", &fs, "A sharper image (same cost)\0Speed (same sharpness as before, next start)\0")) {
+                    m_fov_faster = fs == 1;
+                    keep("fovsize", fs == 1 ? "fovsize faster" : "fovsize sharper");
+                }
+                hint("Each eye is drawn with the headset's exact angles (F11 Debug > Head tracking and view), which leaves pixels over: spend them on sharpness or on speed.");
             }
-            hint("On (default): the game's darkened picture edges and film grain are left out. Off: the game darkens each eye's edges around a "
-                 "different point and adds different grain to each eye.");
-            // From Debug > DLSS, anti-aliasing and post effects (Homard 24 Oct 11:17: the on-screen effects too).
-            bool pc = m_post_clean.load();
-            if (ImGui::Checkbox("No chromatic aberration or post distortion in the headset", &pc)) {
-                m_post_clean = pc;
-                keep("postclean", pc ? "postclean on" : "postclean off");
-                spdlog::info("[F11] postclean {}", pc ? "on" : "off");
+            {
+                // lodfov (Homard 28 Oct, route A): the game's render config with LodScale / KillLodScale scaled, read at the game's start.
+                const float ls = fc5::lodfov::scale();
+                int         li = ls <= 0.0f ? 0 : ls > 0.78f ? 1 : ls > 0.6f ? 2 : 3;
+                if (combo("Far detail: LOD as at the flat FOV", &li, "Off (the game's own)\0A little more (x0.85)\0As on the flat screen (x0.70)\0More than flat (x0.50)\0")) {
+                    static const char* kv[] = { "off", "0.85", "on", "0.5" };
+                    fc5::lodfov::set(kv[li]);
+                    keep("lodfov", std::string{ "lodfov " } + kv[li]);
+                }
+                hint(fmt::format("Once the mod has asked the game for a 120 deg view (getting in or out of a vehicle, F11 Comfort), the game picks simpler "
+                                 "models and drops small objects sooner (its LOD x1.42). This hands it a render config with LodScale and KillLodScale lowered: "
+                                 "x0.70 = the flat screen's detail then. Before the first vehicle of a session x0.70 is finer than the flat screen and costs "
+                                 "about 3 ms per frame pair. Takes effect at the next game start. Now: {}.",
+                                 fc5::lodfov::describe()).c_str());
             }
-            hint("On (default): the colour fringes and the sharpening / distortion term the game's final pass adds for a flat screen are left out "
-                 "of the headset picture. The log line from Experimental > Research 15 Oct, \"Log the game's post settings once\", says whether "
-                 "the game uses them at all.");
         }
-        if (level >= 1) {
+        if (ImGui::CollapsingHeader("Image quality", ImGuiTreeNodeFlags_DefaultOpen)) {
+            v = fc5::dlss::enabled();
+            if (ImGui::Checkbox("DLSS", &v)) {
+                fc5::dlss::set_enabled(v);
+                m_persist["dlss"] = v ? "dlss on" : "dlss off";
+                save_settings();
+            }
+            hint("NVIDIA DLSS per eye (off: the game's own SMAA).");
+            if (!fc5::dlss::enabled() && g_force_w > 0 && g_out_w > g_force_w + 8) {
+                // dlssoffres: turned off while the game renders below the eye size (DLSS upscaling): the picture is stretched.
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "The game renders at %ux%u, stretched to the eye size %ux%u.", g_force_w, g_force_h, g_out_w, g_out_h);
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Restart the game: without DLSS it then renders at the eye size.");
+            }
+            // "Exact head motion for DLSS" (dlsscammv on/off) is gone from here (F11 review, Homard 24 Oct): Debug > DLSS, anti-aliasing and
+            // post effects > "DLSS motion vectors" sets the same dlsscammv, "Game motion vectors only" being off.
+            {
+                static const float kRatios[] = { 1.0f, 0.67f, 0.58f, 0.50f };
+                const float        cur       = g_render_ratio_next > 0.0f ? g_render_ratio_next : g_render_ratio_start;
+                int                sel       = 0;
+                for (int i = 0; i < 4; ++i)
+                    if (std::abs(kRatios[i] - cur) < 0.02f) sel = i;
+                if (combo("DLSS render scale", &sel, "Native (DLAA)\0Quality (0.67)\0Balanced (0.58)\0Performance (0.50)\0")) {
+                    g_render_ratio_next = kRatios[sel];
+                    std::ofstream{ kResolutionFile } << fmt::format("auto {:.2f}\n", kRatios[sel]);
+                    spdlog::info("[Res] {} set to auto {:.2f}: applies at the next start", kResolutionFile, kRatios[sel]);
+                }
+                hint("How large the game renders before DLSS scales up to the headset. Lower = faster. Applies at the next start.");
+                if (g_render_ratio_next > 0.0f && std::abs(g_render_ratio_next - g_render_ratio_start) > 0.01f) ImGui::TextColored(kAccent, "Restart the game to apply the render scale");
+            }
+            if (level >= 1) {
+                float sh = fc5::dlss::sharpness();
+                if (slider("DLSS sharpening", sh, 0.0f, 1.0f, "%.2f", 0.05f)) {
+                    fc5::dlss::set_sharpness(sh);
+                    m_persist["dlsssharp"] = fmt::format("dlsssharp {:.2f}", sh);
+                    save_settings();
+                }
+                // Presets: J (10) / K (11) = DLSS 4 transformer; L (12) / M (13) = DLSS 4.5 second-generation transformer (310.5+ library).
+                const int pr   = fc5::dlss::preset();
+                int       model = pr == 11 ? 1 : pr == 10 ? 2 : pr == 12 ? 3 : pr == 13 ? 4 : 0;
+                if (combo("DLSS model", &model, "Library default\0Transformer (preset K, recommended)\0Transformer (preset J)\0DLSS 4.5 transformer (preset L)\0DLSS 4.5 transformer (preset M)\0")) {
+                    const int p = model == 1 ? 11 : model == 2 ? 10 : model == 3 ? 12 : model == 4 ? 13 : 0;
+                    fc5::dlss::set_preset(p);
+                    m_persist["dlsspreset"] = fmt::format("dlsspreset {}", p);
+                    save_settings();
+                }
+                hint("Use preset K (the default): it keeps the ground sharp. Preset M smeared the ground under you into soft patches (headset, 13 Oct).");
+                int               step  = (int)std::lround(m_res_scale.load() * 10.0f);
+                const std::string label = fmt::format("x{:.1f}", step / 10.0f);
+                if (slider_int("Resolution multiplier", step, 10, 20, label.c_str(), 1)) {
+                    m_res_scale           = step / 10.0f;
+                    m_persist["resscale"] = fmt::format("resscale {:.1f}", step / 10.0f);
+                    save_settings();
+                }
+                hint("Scales the eye images (the headset's recommended size times this) and with them the game's render size (the eye size times the render scale above: below 1 DLSS upscales to the eye size; with DLSS off at start the game renders at the eye size). Applies at the next start.");
+                ImGui::TextDisabled("Eye images %ux%u (x%.1f), game renders %ux%u%s; DLSS: %s", g_out_w, g_out_h, g_res_scale_start, g_force_w, g_force_h,
+                                    g_force_w && g_out_w > g_force_w + 8 ? " (DLSS upscales)" : "", fc5::dlss::status().c_str());
+                const float want_ratio = g_render_ratio_next > 0.0f ? g_render_ratio_next : g_render_ratio_start;
+                const bool  differs    = std::abs(m_res_scale.load() - g_res_scale_start) > 0.01f || std::abs(want_ratio - g_render_ratio_start) > 0.01f;
+                if (differs || g_live_stage != 0) {
+                    if (differs) ImGui::TextColored(kAccent, "Restart the game to apply x%.1f, or:", m_res_scale.load());
+                    if (ImGui::Button(g_live_stage == 4 ? "Apply now (armed; with the slider put back, withdraws it)" : "Apply now (experimental)")) {
+                        const std::string err = live_request(m_res_scale.load(), want_ratio);
+                        if (!err.empty()) g_live_status = err;
+                        spdlog::info("[Res] F11 Apply now: {}", err.empty() ? std::string{ "requested" } : err);
+                    }
+                    hint("Then change Resolution in the game's Options > Video to any other value: the game rebuilds its images at the mod's size (its own resolution choice is ignored) and the headset images follow. Experimental.");
+                }
+                if (!g_live_status.empty()) ImGui::TextDisabled("Live change: %s", g_live_status.c_str());
+            }
+        }
+        if (ImGui::CollapsingHeader("Effects", ImGuiTreeNodeFlags_DefaultOpen)) {
+            {
+                float lo = m_lake_overscan.load();
+                if (lo < 0.3f) lo = 1.625f;
+                if (slider("Water detail at shorelines (area the lake data covers)", lo, 0.4f, 1.625f, lo >= 1.62f ? "1.625 (game)" : "%.2f", 0.05f)) {
+                    m_lake_overscan = lo >= 1.62f ? 0.0f : lo;
+                    keep("lakeoverscan", lo >= 1.62f ? std::string{ "lakeoverscan off" } : fmt::format("lakeoverscan {:.2f}", lo));
+                }
+                hint("The lake's water data is drawn into a fixed-size image covering the view times this number: smaller = sharper, less blocky shorelines. 1.0 covers exactly the view; below 1 (16 Oct) it still covers the whole view, so water never vanishes at the sides, and gives the far shorelines at the horizon 1/X times the detail (0.6 = 1.7 times) and the water right below you less; 1.625 is the game's own. More sharpness comes from \"Water detail only below the horizon\" (F11 Debug > Water, on at every start).");
+                bool nd = g_no_dof.load();
+                if (ImGui::Checkbox("No depth of field (the gun's sights and stock stay sharp)", &nd)) m_ui_cmds += nd ? "nodof on\n" : "nodof off\n";
+                hint("On (default): the game's depth-of-field blur is off, so what is very near (the rear sight, the scope's eyepiece, the stock) "
+                     "is not blurred; in the headset your eyes focus by themselves. Off: the game's blur.");
+                // From Debug > Mandatory > Anti-aliasing and post effects (Homard 24 Oct: "in the display section of effect").
+                bool vp = m_postfx_vr.load();
+                if (ImGui::Checkbox("No vignette or film grain (both eyes alike)", &vp)) {
+                    m_postfx_vr = vp;
+                    keep("vrpost", vp ? "vrpost on" : "vrpost off");
+                }
+                hint("On (default): the game's darkened picture edges and film grain are left out. Off: the game darkens each eye's edges around a "
+                     "different point and adds different grain to each eye.");
+                // From Debug > DLSS, anti-aliasing and post effects (Homard 24 Oct 11:17: the on-screen effects too).
+                bool pc = m_post_clean.load();
+                if (ImGui::Checkbox("No chromatic aberration or post distortion in the headset", &pc)) {
+                    m_post_clean = pc;
+                    keep("postclean", pc ? "postclean on" : "postclean off");
+                    spdlog::info("[F11] postclean {}", pc ? "on" : "off");
+                }
+                hint("On (default): the colour fringes and the sharpening / distortion term the game's final pass adds for a flat screen are left out "
+                     "of the headset picture. The log line from Experimental > Research 15 Oct, \"Log the game's post settings once\", says whether "
+                     "the game uses them at all.");
+            }
+        }
+        if (level >= 1 && ImGui::CollapsingHeader("Scale", ImGuiTreeNodeFlags_DefaultOpen)) {
             // From Comfort (Homard 24 Oct).
-            section("Scale");
             float s = m_world_scale.load();
             if (slider("World scale", s, 0.5f, 2.0f, "%.2f", 0.05f)) m_world_scale = s;
             hint("Above 1 the world looks bigger (eye distance shrinks).");
@@ -17652,9 +18639,9 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
     // HUD and menus on their own tab (Homard 2026-10-14: out of Display). Same switches and commands as before.
     if (ImGui::BeginTabItem("HUD and menus", nullptr, tab_flag(8))) {
         tab_body_begin();
-        section("Game HUD");
-        {
-            int hm = m_hud_mode.load();
+        // Each part opens and closes (Homard 30 Oct: "bring the different subsection in HUD/menu into subsection you can close/open").
+        int hm = m_hud_mode.load();
+        if (ImGui::CollapsingHeader("Game HUD", ImGuiTreeNodeFlags_DefaultOpen)) {
             if (combo("Game HUD", &hm, "In the image (experimental)\0On its own panel (default)\0Hidden (experimental)\0")) {
                 m_hud_mode = hm;
                 keep("hudmode", fmt::format("hudmode {}", hm));
@@ -17688,6 +18675,11 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                 if (slider("HUD panel distance (m)", hd, 0.5f, 3.0f, "%.2f", 0.05f)) { m_hud_distance = hd; keep("huddist", fmt::format("huddist {:.2f}", hd)); }
                 if (slider("HUD panel width (m)", hw, 0.5f, 3.0f, "%.2f", 0.05f)) { m_hud_width = hw; keep("hudscale", fmt::format("hudscale {:.2f}", hw)); }
                 if (slider("HUD panel height (m)", hh, -1.0f, 1.0f, "%.2f", 0.05f)) { m_hud_height = hh; keep("hudheight", fmt::format("hudheight {:.2f}", hh)); }
+                // "Hit indicators tint the world" (hudmul): in Debug > HUD and this menu (Homard 24 Oct).
+            }
+        }
+        if (hm == 1 && ImGui::CollapsingHeader("World markers")) {   // the HUD on its own panel only
+            {
                 bool wm = m_hud_markers.load();
                 if (ImGui::Checkbox("World markers on their targets", &wm)) {
                     m_hud_markers = wm;
@@ -17702,6 +18694,45 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                         keep("hudmarksize", fmt::format("hudmarksize {:.2f}", ms));
                     }
                     hint("1 = the game's own size. Each marker shrinks about its icon, which stays on the target.");
+                    bool mc = m_hud_mark_cap.load();
+                    if (ImGui::Checkbox("Limit the size of big markers (C4, near enemies)", &mc)) {
+                        m_hud_mark_cap = mc;
+                        keep("hudmarkcap", mc ? "hudmarkcap on" : "hudmarkcap off");
+                    }
+                    hint("The game draws a few markers (placed C4, some enemy marks) several times bigger than the rest, so they stay huge after "
+                         "the shrink above. On: any marker wider than the size below is made smaller about its icon. Off: as before 29 Oct.");
+                    if (mc) {
+                        float mx = m_hud_mark_max.load();
+                        if (slider("Largest world marker (deg)", mx, 1.0f, 15.0f, "%.1f", 0.5f)) {
+                            m_hud_mark_max = mx;
+                            keep("hudmarkmax", fmt::format("hudmarkmax {:.1f}", mx));
+                        }
+                        hint("How wide a marker may look at most, in degrees of your view (its icon and distance together).");
+                        float mi = m_hud_mark_icon.load();
+                        if (slider("Largest marker icon (deg)", mi, 0.5f, 6.0f, "%.1f", 0.1f)) {
+                            m_hud_mark_icon = mi;
+                            keep("hudmarkicon", fmt::format("hudmarkicon {:.1f}", mi));
+                        }
+                        hint("The icon alone (the C4 reticle, an enemy mark) may look at most this wide; its distance text shrinks with it.");
+                    }
+                    bool hp = m_hud_prim.load();
+                    if (ImGui::Checkbox("Detection chevrons as HUD (not drawn huge into the view)", &hp)) {
+                        m_hud_prim = hp;
+                        keep("hudprim", hp ? "hudprim on" : "hudprim off");
+                    }
+                    hint("Some indicators (the white and red chevrons when an enemy or animal notices you) are drawn with another game shader "
+                         "than the rest of the HUD, so they went straight into your view at the flat screen's size: about 5x too big and "
+                         "pixelated. On (default): they join the HUD and get the marker size above (or the panel's). Off: as before 30 Oct.");
+                    if (hp) {
+                        bool hc = m_hud_prim_cam.load();
+                        if (ImGui::Checkbox("  Chevrons placed with the game's camera", &hc)) {
+                            m_hud_prim_cam = hc;
+                            keep("hudprimcam", hc ? "hudprimcam on" : "hudprimcam off");
+                        }
+                        hint("These indicators read the world camera, which holds your eye's camera; the world markers are placed for the "
+                             "game's own camera. On (default): they are drawn with the game's camera, so they sit over the enemy noticing "
+                             "you like the other markers. Off: they come out small but in the wrong place (Homard 30 Oct 13:27).");
+                    }
                     float mst = m_hud_mark_smooth.load();
                     if (slider("World marker steadiness (s)", mst, 0.0f, 0.5f, "%.2f", 0.01f)) {
                         m_hud_mark_smooth = mst;
@@ -17715,11 +18746,27 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                     }
                     hint("How far away the markers look in 3D. Far suits distant objectives; nearer suits markers on people close by.");
                 }
-                // "Hit indicators tint the world" (hudmul): in Debug > HUD and this menu (Homard 24 Oct).
             }
         }
-        if (level >= 1) {
-            section("Menus, map and loading screens");
+        if (ImGui::CollapsingHeader("Tutorial pop-ups")) {
+            bool pe = m_popup_esc.load();
+            if (ImGui::Checkbox("B closes tutorial pop-ups", &pe)) {
+                m_popup_esc = pe;
+                keep("popupesc", pe ? "popupesc on" : "popupesc off");
+            }
+            hint("A tutorial pop-up pauses the game and only the keyboard's Esc closes it. On: while the game is paused under one (its camera "
+                 "stops following your aim), the right B sends Esc instead of its usual action. Off: B always does its usual action.");
+            bool ph = m_pop_hold.load();
+            if (ImGui::Checkbox("Hold the aim's mouse moves while the game is paused", &ph)) {
+                m_pop_hold = ph;
+                keep("popuphold", ph ? "popuphold on" : "popuphold off");
+            }
+            hint("The mod aims through small mouse moves. While a pop-up or menu has paused the game they reach the pop-up instead, which can "
+                 "switch the game's button prompts to the keyboard. On (default): only one move every half second until the game answers. "
+                 "Off: a move every frame, as before 27 Oct.");
+        }
+        if (ImGui::CollapsingHeader("Loading popup")) fc5::loadpopup::draw_menu(m_ui_cmds, hint);   // loadpopup (FarCry5LoadPopup.cpp)
+        if (level >= 1 && ImGui::CollapsingHeader("Menus, map and loading screens")) {
             v = m_menu_screen.load();
             if (ImGui::Checkbox("Menus, map and loading screens on a flat screen", &v)) m_menu_screen = v;
             float md = m_menu_distance.load();
@@ -17731,7 +18778,23 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             }
             hint("The game draws its 16:9 menu backgrounds, videos and loading pictures for a tall headset image. On: the whole picture, "
                  "with blurred bands above and below. Off: the picture fills the screen with its sides cut off (before 20 Oct).");
-            section("This menu in the headset");
+            bool ms = m_map_sticky.load();
+            if (ImGui::Checkbox("The map stays on the flat screen while it stands still", &ms)) {
+                m_map_sticky = ms;
+                keep("mapsticky", ms ? "mapsticky on" : "mapsticky off");
+            }
+            hint("On: the map stays flat until you close it (B, Back, the menu button, Esc or M) or the weapon is in hand again, so the sticks, "
+                 "triggers and grips keep working in it. Off (before 28 Oct): a map left still for about 1.5 s could go back to 3D, and only the "
+                 "left trigger reached it.");
+            bool bz = m_binoc_zoom.load();
+            if (ImGui::Checkbox("Binoculars magnify the view", &bz)) {
+                m_binoc_zoom = bz;
+                keep("binoczoom", bz ? "binoczoom on" : "binoczoom off");
+            }
+            hint("On: while the game's binoculars are up (left grip + left stick up), the whole view is magnified by their zoom (about 2x), "
+                 "as on the flat screen. Off (before 28 Oct): the binoculars show the normal view.");
+        }
+        if (level >= 1 && ImGui::CollapsingHeader("This menu in the headset", ImGuiTreeNodeFlags_DefaultOpen)) {
             static auto vrm = VR::get();
             vrm->get_overlay_component().draw_panel_options();
             hint("Where the menu panel hangs and how large it is; with pointing on, the controller moves the cursor.");
@@ -17743,7 +18806,6 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
     // Gesture-based control on its own tab (Homard 2026-10-14). Same switches and commands as before.
     if (ImGui::BeginTabItem("Gestures", nullptr, tab_flag(9))) {
         tab_body_begin();
-        section("Gestures");
         // Each zone size and place saved as its command line; the Default buttons use the same (Homard 24 Oct 12:58: "next to gesture
         // interactions zones and slings position add reset button to reset to default position").
         auto keep_size = [&](int g) {
@@ -17789,13 +18851,18 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             }
             return nudged || changed;
         };
-        {
+        if (ImGui::CollapsingHeader("Gesture zones and buzz")) {
             bool zb = fc5::gesture::zone_buzz();
             if (ImGui::Checkbox("Light buzz when a hand enters a gesture zone", &zb)) {
                 fc5::gesture::set_zone_buzz(zb);
                 keep("gesturebuzz", zb ? "gesturebuzz on" : "gesturebuzz off");
             }
             hint("A short light tick on that controller when the hand (grip released) reaches a zone; a firmer one when the gesture fires.");
+            bool mw = fc5::gesture::miss_walk();
+            if (ImGui::Checkbox("A grip pressed just outside a zone does not turn the left stick into the D-pad##gesturemisswalk", &mw)) m_ui_cmds += mw ? "gesturemisswalk on\n" : "gesturemisswalk off\n";
+            hint("On (default): a grip pressed near a gesture zone but outside it (a missed grab) leaves the left stick walking until that grip "
+                 "is let go, so walking does not press the D-pad (D-pad up opens the binoculars). The right stick still works as the D-pad. Off: "
+                 "any left grip press makes both sticks the D-pad.");
             // gesturezones (Homard 24 Oct: "make interaction zone visible").
             bool zs = fc5::gesture::zone_show();
             if (ImGui::Checkbox("Debug: show the gesture zones", &zs)) {
@@ -17841,17 +18908,43 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             if (d >= 0.0f) ImGui::TextDisabled("Hand now %.0f cm from the zone centre (%s)", d * 100.0f, d < fc5::gesture::radius(g) ? "inside" : "outside");
             ImGui::PopID();
         };
-        int g_sling = -1, g_throw = -1, g_shoulder = -1;
+        int g_sling = -1, g_throw = -1, g_shoulder = -1, g_shoulder_l = -1, g_side = -1;
         for (int g = 0; g < fc5::gesture::count(); ++g) {
             const std::string n = fc5::gesture::name(g);
             if (n == "sling") g_sling = g;
             else if (n == "throwable") g_throw = g;
             else if (n == "shoulderswitch") g_shoulder = g;
+            else if (n == "shoulderleft") g_shoulder_l = g;
+            else if (n == "sidearm") g_side = g;
             else gesture_row(g);
         }
-        // The weapon switch at the right shoulder in its own section with its placement (Homard 24 Oct 12:16).
-        if (ImGui::CollapsingHeader("Right shoulder: switch weapon")) {
-            if (g_shoulder >= 0) gesture_row(g_shoulder);
+        // The shoulders in their own section with their placement (Homard 24 Oct 12:16). The F11 Gestures sections hold every gesture's
+        // rows, the experimental ones labelled so (Homard 29 Oct 14:01: "move all the new gestures into the gesture F11 section and
+        // specific relevant subsection ... Add (experimental) to holster, shoulder weapon switch and throwables"). Each shoulder its own
+        // weapon slot (Homard 30 Oct: "make left shoulder weapon slot 1 and right shoulder weapon slot 2", 11:33 "they don't have
+        // separated slots in the F11 menu").
+        if (ImGui::CollapsingHeader("Shoulders: weapon slots (experimental)")) {
+            auto slot_row = [&](int g, int right) {
+                if (g < 0) return;
+                gesture_row(g);
+                ImGui::PushID(100 + g);
+                int slot = fc5::gesture::shoulder_slot(right);
+                ImGui::TextUnformatted(right ? "Right shoulder takes slot" : "Left shoulder takes slot");
+                bool ch = false;
+                for (int k = 1; k <= 4; ++k) {
+                    ImGui::SameLine();
+                    ch |= ImGui::RadioButton(fmt::format("{}##slot{}", k, k).c_str(), &slot, k);
+                }
+                if (ch) {
+                    fc5::gesture::set_shoulder_slot(right, slot);
+                    keep(right ? "shoulderrightslot" : "shoulderleftslot", fmt::format("{} {}", right ? "shoulderrightslot" : "shoulderleftslot", slot));
+                }
+                ImGui::PopID();
+            };
+            slot_row(g_shoulder_l, 0);
+            slot_row(g_shoulder, 1);
+            hint("The game's weapon slots 1-4, as its keyboard keys 1-4 select them (slot 1 your first main weapon, slot 2 the second); the mod presses that key. "
+                 "A slot that is locked or empty gives nothing: your weapon stays in your hand.");
             float sp[3]{};
             fc5::gesture::get_shoulder_place(sp);
             float scm[3]{ sp[0] * 100.0f, sp[1] * 100.0f, sp[2] * 100.0f };
@@ -17871,10 +18964,12 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                 fc5::gesture::reset_shoulder();
                 keep_shoulder();
                 if (g_shoulder >= 0) reset_size(g_shoulder);
+                if (g_shoulder_l >= 0) reset_size(g_shoulder_l);
             }
-            hint("Where the zone sits, from your eyes when you look straight ahead (left-handed: the left shoulder). It hangs from your neck and turns "
-                 "with your body, not your head: looking left or right does not move it (it follows only once you look more than 35 deg aside, like the "
+            hint("Where the zones sit, from your eyes when you look straight ahead: the right shoulder's, the left one's mirrored (left-handed: swapped). They hang from your neck and turn "
+                 "with your body, not your head: looking left or right does not move them (they follow only once you look more than 35 deg aside, like the "
                  "sling). Default: 18 cm to the side, 25 cm below and 13 cm behind the eyes.");
+            draw_weapon_switch_menu(hint, section);   // shoulderdraw, shoulderinstant (FarCry5WeaponSwitch.cpp), from Experimental > Weapon switch
         }
         if (ImGui::CollapsingHeader("Sling")) {
             if (g_sling >= 0) gesture_row(g_sling);
@@ -17922,9 +19017,45 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                 keep_sling_zone();
                 if (g_sling >= 0) reset_size(g_sling);
             }
-            hint("Default: grip 9 cm right, 50 cm below and 10 cm in front of the eyes; barrel 70 deg to the left, -30 deg down, no roll.");
+            hint("Default: grip 9 cm right, 50 cm below and 5 cm in front of the eyes; barrel 70 deg to the left, -30 deg down, no roll.");
         }
-        if (ImGui::CollapsingHeader("Throwable")) {
+        // sidearm (Homard 26 Oct: "a sidearms gesture on right hip"; FarCry5Holster.cpp), experimental.
+        if (ImGui::CollapsingHeader("Holster: sidearm on the right hip (experimental)")) {
+            if (g_side >= 0) gesture_row(g_side);
+            auto keep_hip = [&] {
+                float p[3]{}, r[3]{};
+                fc5::gesture::get_hip_place(p, r);
+                keep("sidearmpos", fmt::format("sidearmpos {:.2f} {:.2f} {:.2f}", p[0], p[1], p[2]));
+                keep("sidearmrot", fmt::format("sidearmrot {:.0f} {:.0f} {:.0f}", r[0], r[1], r[2]));
+            };
+            float pos[3]{}, rot[3]{};
+            fc5::gesture::get_hip_place(pos, rot);
+            float cm[3]{ pos[0] * 100.0f, pos[1] * 100.0f, pos[2] * 100.0f };
+            bool  changed = false, pdef = false;
+            changed |= slider_def("Sidearm: grip to the right", cm[0], -50.0f, 50.0f, "%.0f cm", 1.0f, nullptr);
+            changed |= slider_def("Sidearm: grip below the eyes", cm[1], 0.0f, 120.0f, "%.0f cm", 1.0f, nullptr);
+            changed |= slider_def("Sidearm: grip in front", cm[2], -40.0f, 60.0f, "%.0f cm", 1.0f, nullptr);
+            changed |= slider_def("Sidearm: barrel to the left", rot[0], -180.0f, 180.0f, "%.0f deg", 5.0f, nullptr);
+            changed |= slider_def("Sidearm: barrel down", rot[1], -90.0f, 90.0f, "%.0f deg", 5.0f, nullptr);
+            changed |= slider_def("Sidearm: roll", rot[2], -180.0f, 180.0f, "%.0f deg", 5.0f, &pdef);
+            if (pdef) {
+                fc5::gesture::reset_hip_place();
+                keep_hip();
+            } else if (changed) {
+                const float p[3]{ cm[0] / 100.0f, cm[1] / 100.0f, cm[2] / 100.0f };
+                fc5::gesture::set_hip_place(p, rot);
+                keep_hip();
+            }
+            hint("Where the sidearm hangs (its grip, the zone's centre), from your head; it turns with your body like the sling. Default: 26 cm right, "
+                 "63 cm below and 12 cm behind the eyes, the barrel 80 deg down with the grip to the back.");
+            if (ImGui::Button("Sidearm: place and zone size back to default")) {
+                fc5::gesture::reset_hip_place();
+                keep_hip();
+                if (g_side >= 0) reset_size(g_side);
+            }
+            draw_holster_menu(keep, hint);   // the weapons recorded, which is the sidearm, the switch key
+        }
+        if (ImGui::CollapsingHeader("Throwable and pouch (experimental)")) {
             if (g_throw >= 0) gesture_row(g_throw);
             float tp[3]{};
             fc5::gesture::get_throw_place(tp);
@@ -17948,6 +19079,26 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             }
             hint("Where the throwable and its zone sit, from your head (left-handed: to the right); it turns with your body like the sling. Default: 10 cm "
                  "left of the centre line, 30 cm below and 8 cm in front of the eyes.");
+            // From Experimental: the throw arc (Research for alternatives), throwv2 and the pouch (Throwables (test)).
+            bool ta = m_throw_arc.load();
+            if (ImGui::Checkbox("Throw arc##throwarc", &ta)) {
+                m_throw_arc = ta;
+                keep("throwarc", ta ? "throwarc on" : "throwarc off");
+            }
+            hint("While you hold a throwable (from the chest, or with the throw button held), a dotted arc shows where it would fly if thrown where you look. "
+                 "A guide: the game's own throw speed is not known to the mod (throwarcspeed, 15 m/s), and walls do not stop the arc.");
+            draw_throw_v2_menu(keep, hint, section);   // throwv2, the pouch and their choices (FarCry5Throwable.cpp)
+        }
+        // Melee, from Experimental > Research for alternatives: meleeswing, then meleestill and meleehit (FarCry5Melee.cpp).
+        if (ImGui::CollapsingHeader("Melee: swing to hit (experimental)")) {
+            bool msw = m_melee_swing.load();
+            if (ImGui::Checkbox("Melee by swinging (log only)##meleeswing", &msw)) {
+                m_melee_swing = msw;
+                keep("meleeswing", msw ? "meleeswing on" : "meleeswing off");
+            }
+            hint("Test of the detection only: a fast swing of your weapon hand (over meleespeed, 2.5 m/s) with something within reach in front is written "
+                 "to the log ([Melee]). The game's melee is not pressed yet.");
+            draw_melee_menu(keep, hint);
         }
         ImGui::EndChild();
         ImGui::EndTabItem();
@@ -17955,372 +19106,385 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
 
     if (ImGui::BeginTabItem("Motion control", nullptr, tab_flag(2))) {
         tab_body_begin();
-        section("Motion controls");
-        v = m_motion.load();
-        if (ImGui::Checkbox("Motion controls (F7)", &v)) {
-            m_motion     = v;
-            m_body_valid = false;
-        }
-        hint("The weapon sits in your hand and shoots where the barrel points.");
-        v = m_left_handed.load();
-        if (ImGui::Checkbox("Left-handed (weapon on the left controller; not tested)", &v)) m_left_handed = v;
-        {
-            bool hv = m_hands_float.load();
-            if (ImGui::Checkbox("Hand models", &hv)) {
-                m_hands_float = hv;
-                keep("hands", hv ? "hands on" : "hands off");
+        if (ImGui::CollapsingHeader("Motion controls")) {
+            v = m_motion.load();
+            if (ImGui::Checkbox("Motion controls (F7)", &v)) {
+                m_motion     = v;
+                m_body_valid = false;
             }
-            hint("The left hand follows the left controller, and grips the weapon when you hold it with two hands.");
-        }
-        // "Aim dot" (aimdot): one choice with the red dot, Weapon > Sights "Red dot" (Homard 24 Oct).
-        {
-            float hs = g_spread_scale.load();
-            if (ImGui::SliderFloat("Hip-fire spread", &hs, 0.0f, 1.5f, "%.2f")) {
-                g_spread_scale = hs;
-                keep("hipspread", fmt::format("hipspread {:.2f}", hs));
-            }
-            hint("How wide hip shots spread: 1 = the game's own (the revolver: a 3 degree cone), 0 = every shot exactly where the barrel points (tighter than aiming down sights). "
-                 "Shots while aiming down sights keep the game's spread.");
-            float fg = m_fire_gate_deg.load();
-            if (ImGui::SliderFloat("Shot release precision", &fg, 0.1f, 1.0f, "%.2f deg")) {
-                m_fire_gate_deg = fg;
-                keep("firegate", fmt::format("firegate {:.2f}", fg));
-            }
-            hint("A shot leaves once the game's aim is this close to the barrel's line. Smaller = more precise; without Fast shot release, "
-                 "later too (at 0.10 a moving gun held shots back up to half a second). 0.75 = the old setting: up to 0.6 deg off.");
-            bool ff = m_fire_fast.load();
-            if (ImGui::Checkbox("Fast shot release", &ff)) {
-                m_fire_fast = ff;
-                keep("firefast", ff ? "firefast on" : "firefast off");
-            }
-            hint("On: at a trigger press the game's aim jumps onto the barrel in one step and the shot leaves as soon as that step reaches the game "
-                 "(about two headset frames). Off: the aim eases onto the barrel and the shot waits until it sits within the precision above "
-                 "(17-18 Oct: 70-150 ms usually, up to half a second). Works with Debug > Firing: shots follow the barrel.");
-            bool fm = m_fire_moving.load();
-            if (ImGui::Checkbox("Shots leave at once while the gun moves", &fm)) {
-                m_fire_moving = fm;
-                keep("firemoving", fm ? "firemoving on" : "firemoving off");
-            }
-            hint("On: while the gun turns in your hand, the shot leaves once the game's aim is within the barrel's own turn over one game update "
-                 "(at most 1 deg), instead of waiting for the precision above; a steady gun keeps the precision. Off: a moving one-handed "
-                 "pistol waited 35-260 ms on every press (21 Oct).");
-        }
+            hint("The weapon sits in your hand and shoots where the barrel points.");
+            v = m_left_handed.load();
+            if (ImGui::Checkbox("Left-handed (weapon on the left controller; not tested)", &v)) m_left_handed = v;
             {
-                bool nr = m_no_recoil.load();
-                if (ImGui::Checkbox("No recoil kick", &nr)) {
-                    m_no_recoil = nr;
-                    set_game_patch(0, nr);
-                    keep("norecoil", nr ? "norecoil on" : "norecoil off");
+                bool hv = m_hands_float.load();
+                if (ImGui::Checkbox("Hand models", &hv)) {
+                    m_hands_float = hv;
+                    keep("hands", hv ? "hands on" : "hands off");
                 }
-                hint("Shooting no longer kicks the game's camera up (the next shot then goes where the barrel points).");
-                bool ns = m_no_sway.load();
-                if (ImGui::Checkbox("No weapon sway", &ns)) {
-                    m_no_sway = ns;
-                    set_game_patch(1, ns);
-                    keep("nosway", ns ? "nosway on" : "nosway off");
-                }
-                hint("Stops the game's idle and aiming sway of the gun and camera.");
-                bool sv = m_steady_view.load();
-                if (ImGui::Checkbox("Steady view while shooting", &sv)) {
-                    m_steady_view = sv;
-                    keep("steadyview", sv ? "steadyview on" : "steadyview off");
-                }
-                hint("While the trigger or the grip is held, your view stays anchored to the body: the game camera turning to the gun, aiming down sights or recoil no longer move where your eyes are. Walking still moves you.");
+                hint("The left hand follows the left controller, and grips the weapon when you hold it with two hands.");
             }
+            // "Aim dot" (aimdot): one choice with the red dot, Weapon > Sights "Red dot" (Homard 24 Oct).
+            {
+                float hs = g_spread_scale.load();
+                if (ImGui::SliderFloat("Hip-fire spread", &hs, 0.0f, 1.5f, "%.2f")) {
+                    g_spread_scale = hs;
+                    keep("hipspread", fmt::format("hipspread {:.2f}", hs));
+                }
+                hint("How wide hip shots spread: 1 = the game's own (the revolver: a 3 degree cone), 0 = every shot exactly where the barrel points (tighter than aiming down sights). "
+                     "Shots while aiming down sights keep the game's spread.");
+                float fg = m_fire_gate_deg.load();
+                if (ImGui::SliderFloat("Shot release precision", &fg, 0.1f, 1.0f, "%.2f deg")) {
+                    m_fire_gate_deg = fg;
+                    keep("firegate", fmt::format("firegate {:.2f}", fg));
+                }
+                hint("A shot leaves once the game's aim is this close to the barrel's line. Smaller = more precise; without Fast shot release, "
+                     "later too (at 0.10 a moving gun held shots back up to half a second). 0.75 = the old setting: up to 0.6 deg off.");
+                int fw = m_fire_wait_max_ms.load();
+                if (ImGui::SliderInt("Longest a shot waits", &fw, 0, 1000, fw > 0 ? "%d ms" : "no limit")) {
+                    m_fire_wait_max_ms = fw;
+                    keep("firewaitmax", fmt::format("firewaitmax {}", fw));
+                }
+                hint("A held trigger fires after this long even if the game's aim has not reached the precision above (while it is within 5 deg "
+                     "of the barrel). A tester's trigger did nothing for seconds without it (28 Oct). 0 = wait for the precision however long.");
+                bool ff = m_fire_fast.load();
+                if (ImGui::Checkbox("Fast shot release", &ff)) {
+                    m_fire_fast = ff;
+                    keep("firefast", ff ? "firefast on" : "firefast off");
+                }
+                hint("On: at a trigger press the game's aim jumps onto the barrel in one step and the shot leaves as soon as that step reaches the game "
+                     "(about two headset frames). Off: the aim eases onto the barrel and the shot waits until it sits within the precision above "
+                     "(17-18 Oct: 70-150 ms usually, up to half a second). Works with Debug > Firing: shots follow the barrel.");
+                bool fm = m_fire_moving.load();
+                if (ImGui::Checkbox("Shots leave at once while the gun moves", &fm)) {
+                    m_fire_moving = fm;
+                    keep("firemoving", fm ? "firemoving on" : "firemoving off");
+                }
+                hint("On: while the gun turns in your hand, the shot leaves once the game's aim is within the barrel's own turn over one game update "
+                     "(at most 1 deg), instead of waiting for the precision above; a steady gun keeps the precision. Off: a moving one-handed "
+                     "pistol waited 35-260 ms on every press (21 Oct).");
+            }
+                {
+                    bool nr = m_no_recoil.load();
+                    if (ImGui::Checkbox("No recoil kick", &nr)) {
+                        m_no_recoil = nr;
+                        set_game_patch(0, nr);
+                        keep("norecoil", nr ? "norecoil on" : "norecoil off");
+                    }
+                    hint("Shooting no longer kicks the game's camera up (the next shot then goes where the barrel points).");
+                    bool ns = m_no_sway.load();
+                    if (ImGui::Checkbox("No weapon sway", &ns)) {
+                        m_no_sway = ns;
+                        set_game_patch(1, ns);
+                        keep("nosway", ns ? "nosway on" : "nosway off");
+                    }
+                    hint("Stops the game's idle and aiming sway of the gun and camera.");
+                    // "Steady view while shooting" (steadyview) retired 29 Oct (off since 12 Oct; the body-based view keeps the eyes on the body):
+                    // a test command now, no longer saved.
+                }
+        }
         // The button layout choice ("controls new") and "Right grip aims down sights" (gripads) were removed (Homard 24 Oct): one layout
         // (the Layout tab), the right grip never aims down sights on foot. "Weapon wheel: pick with the right stick" (wheelstick, on by
         // default): in Debug > Hands and weapon.
-        if (level >= 1) {
-            section("Body");
+        if (level >= 1 && ImGui::CollapsingHeader("Body")) {
             v = m_hide_arms.load();
             if (ImGui::Checkbox("Floating weapon (hide the game's arms)", &v)) m_hide_arms = v;
             v = m_hide_body.load();
             if (ImGui::Checkbox("Hide the player's own body", &v)) m_hide_body = v;
         }
-        draw_walk_menu(keep, hint, section);   // walkbasis (FarCry5Walk.cpp)
-        section("View");
-        draw_bob_menu(keep, hint);             // walkbob (FarCry5WalkBob.cpp); viewpivot is in Debug > Head tracking and view
+        draw_walk_menu(keep, hint, section);   // walkbasis (FarCry5Walk.cpp); walkbob is part of Comfort > Smooth motion > Body-based view (bodyview)
         ImGui::EndChild();
         ImGui::EndTabItem();
     }
 
     if (ImGui::BeginTabItem("Weapon", nullptr, tab_flag(3))) {
         tab_body_begin();
-        section("Feel");
-        {
-            float ws = m_wsmooth.load();
-            if (slider("Weapon smoothing", ws, 0.0f, 1.0f, ws <= 0.001f ? "off" : "%.2f", 0.05f)) {
-                m_wsmooth = ws;
-                keep("weaponsmooth", fmt::format("weaponsmooth {:.2f}", ws));
-            }
-            hint("Steadies the weapon when your hand moves slowly (tremor, small shakes) and lets fast swings through: the gun, the shots and the hand "
-                 "all take the steadied pose. Higher = steadier, more lag on slow moves (0.2: a still hand filtered at about 7 Hz; 0.5: about 3.4 Hz; "
-                 "1: about 1 Hz). 0 = off.");
-            int rm = std::clamp(m_rumble_mode.load(), 0, 2);
-            if (combo("Controller vibration", &rm, "The game's own (shots on the left hand)\0The weapon hand (both while it is held with two hands)\0Both hands\0")) {
-                m_rumble_mode = rm;
-                keep("rumble", rm == 0 ? "rumble game" : rm == 2 ? "rumble both" : "rumble gun");
-            }
-            hint("The game's pad rumble: shots, hits, explosions. The weapon hand: the controller holding the gun vibrates, and the other one too "
-                 "while it holds the gun with two hands; with no weapon in hand or while driving, both. The game's own: the pad's heavy motor on the "
-                 "left controller and its light motor on the right, so firing buzzed only the left hand (the old way).");
-            float rg = m_rumble_gain.load();
-            if (slider("Vibration strength", rg, 0.0f, 2.0f, rg <= 0.001f ? "off" : "x%.2f", 0.1f)) {
-                m_rumble_gain = rg;
-                keep("rumblegain", fmt::format("rumblegain {:.2f}", rg));
-            }
-            hint("x1 = as before. Higher makes the game's light rumbles stronger (the strongest are already at the controller's limit); 0 = no vibration "
-                 "from the game (the gesture zones' buzz stays).");
-            bool sb = m_shot_buzz.load();
-            if (ImGui::Checkbox("A firm pulse on every shot", &sb)) {
-                m_shot_buzz = sb;
-                keep("shotbuzz", sb ? "shotbuzz on" : "shotbuzz off");
-            }
-            hint("Each of your shots gives the hands holding the gun the same pulse, on top of the game's rumble (which changes from shot to shot). "
-                 "Off: only the game's rumble. Not with \"The game's own\" above.");
-            if (sb) {
-                float sa = m_shot_buzz_amp.load();
-                if (slider("Shot pulse strength", sa, 0.1f, 1.0f, "%.2f", 0.05f)) {
-                    m_shot_buzz_amp = sa;
-                    keep("shotbuzzamp", fmt::format("shotbuzzamp {:.2f}", sa));
-                }
-                int sm = m_shot_buzz_ms.load();
-                if (slider_int("Shot pulse length", sm, 20, 250, "%d ms", 10)) {
-                    m_shot_buzz_ms = sm;
-                    keep("shotbuzzms", fmt::format("shotbuzzms {}", sm));
-                }
-                hint("1.00 = the controller's strongest. Longer feels heavier; above about 100 ms the pulses of a fast automatic run together.");
-            }
-            // The firing limit (fireturnmax: "never hide what you see" and "how far the view may turn to the gun") was removed (Homard 24 Oct):
-            // shots always follow the barrel (no limit); firesplit keeps the drawn camera on the head.
-        }
-        section("Bullet tracers");
-        {
-            // One selector for hidetracers + tracersfromgun (Homard 2026-10-14); same commands and saved lines as before.
-            int tr = !m_hide_tracers.load() ? 0 : m_tracers_from_gun.load() ? 2 : 1;
-            if (combo("Bullet tracers", &tr, "Game's own (from your eyes)\0Hidden\0Follow the muzzle\0")) {
-                m_hide_tracers     = tr != 0;
-                m_tracers_from_gun = tr == 2;
-                keep("hidetracers", tr != 0 ? "hidetracers on" : "hidetracers off");
-                keep("tracersfromgun", tr == 2 ? "tracersfromgun on" : "tracersfromgun off");
-            }
-            hint("The game draws the tracer streaks from your eyes, not from the gun. Hidden: no streaks. Follow the muzzle: the streaks start at the gun barrel.");
-            bool fw = m_flame_world.load();
-            if (ImGui::Checkbox("Flames and smoke stay in the world (flamethrower)", &fw)) m_ui_cmds += fw ? "flameworld on\n" : "flameworld off\n";
-            hint("On (default): the flamethrower's flames and the gun's smoke and sparks leave the barrel and stay where they are in the world, "
-                 "as on a flat screen. Off: they are drawn with the gun, so flames already in the air swing with your hand (before 24 Oct).");
-            if (fw) {
-                float fh = m_flame_hold.load();
-                if (slider("Flames stay in the world for", fh, 0.0f, 5.0f, "%.1f s after firing", 0.1f)) {
-                    m_flame_hold = fh;
-                    keep("flamehold", fmt::format("flamehold {:.1f}", fh));
-                }
-                hint("When not firing, the flames and smoke go with the gun again, so the flamethrower's small pilot flame stays on its nozzle. "
-                     "While firing and for this long after you let go of the trigger they stay in the world (the stream still in the air), then "
-                     "they turn back onto the gun over 0.4 s. Longer if the last flames of a burst start to swing with your hand; shorter if the "
-                     "pilot flame lags the nozzle too long after a burst.");
-            }
-            if (fc5::bullet::speed_available()) {
-                float bs = fc5::bullet::speed_scale();
-                if (slider("Bullet speed", bs, 1.0f, 4.0f, "x%.2f", 0.25f)) m_ui_cmds += fmt::format("bulletspeed {:.2f}\n", bs);
-                hint("The game's bullets fly at about 300 m/s and drop (about 0.5 m at 100 m). x2 = 600 m/s: a quarter of the drop and half the lead on moving "
-                     "targets; x3 = 900 m/s, close to a real rifle. Rockets and arrows are not changed. Enemies firing the same kind of weapon get it too.");
-            }
-        }
-        section("Sights");   // from Experimental > Unfinished features (Tests cleanup 19 Oct; HEADSET_QUEUE 53 passed)
-        {
-            bool sa = m_sight_aim.load();
-            if (ImGui::Checkbox("Shots go through the centre of the gun's sights (red dot, scope, iron sights)", &sa)) m_ui_cmds += sa ? "sightaim on\n" : "sightaim off\n";
-            hint("On (default): with your eye behind the sights, the shots, the red dot, the aim dot and the scope's crosshair are all at the "
-                 "sight's centre, at any distance. Each weapon's sight line is read from the game's own aim-down-sights pose (a short "
-                 "automatic aim-down-sights the first time you bring a new weapon to your eye). Off: the shots follow the controller's axis "
-                 "(before 18 Oct).");
-            if (ImGui::Button("Read this weapon's sights again")) m_ui_cmds += "sightforget\n";
-            hint("Forgets this weapon's sight line; it is read again the next time you bring the gun to your eye. Use it after changing its sight.");
-            // One choice for aimdot + reddot + reddotonly (Homard 19 Oct 17:25 for the last two; 24 Oct: the aim dot from Motion control
-            // joined it). Same commands and saved lines as before. The aim dot is the marker where the shots land on any gun; the red dot
-            // is drawn in reflex and holographic sights (and the aim dot is then drawn outside the sight's window only, by reddot_draw).
+        if (ImGui::CollapsingHeader("Feel")) {
             {
-                const bool ad = m_aim_dot.load(), rdo = m_reddot.load(), only = m_reddot_only.load();
-                int        rd = !rdo ? (ad ? 1 : 0) : !ad ? 4 : only ? 3 : 2;
-                if (combo("Red dot", &rd, "Off\0Aim dot only (the game's own dot in reflex sights)\0In reflex sights, and an aim dot on every gun\0"
-                                          "Only in reflex sights; an aim dot on guns without one (realistic)\0Only in reflex sights; no aim dot at all\0")) {
-                    const bool want_ad = rd != 0, want_rd = rd >= 2, want_only = rd == 3;
-                    m_aim_dot = want_ad;
-                    keep("aimdot", want_ad ? "aimdot on" : "aimdot off");
-                    m_ui_cmds += want_rd ? "reddot on\n" : "reddot off\n";
-                    if (want_rd) m_ui_cmds += want_only ? "reddotonly on\n" : "reddotonly off\n";
+                float ws = m_wsmooth.load();
+                if (slider("Weapon smoothing", ws, 0.0f, 1.0f, ws <= 0.001f ? "off" : "%.2f", 0.05f)) {
+                    m_wsmooth = ws;
+                    keep("weaponsmooth", fmt::format("weaponsmooth {:.2f}", ws));
                 }
-                hint("The aim dot is a small dot where your shots land, on every gun. The red dot is drawn in reflex and holographic sights, at the "
-                     "target's distance, and stays on the target wherever your eye is behind the sight (the game's own dot is painted on the sight's "
-                     "glass and slides off the target). In reflex sights, and an aim dot: the aim dot also shows outside the sight's window. Only in "
-                     "reflex sights (realistic): a gun with a reflex sight shows its dot only through the window; other guns keep the aim dot. "
-                     "No aim dot at all: only the sights' dots. Off: neither, the game's own dot.");
+                hint("Steadies the weapon when your hand moves slowly (tremor, small shakes) and lets fast swings through: the gun, the shots and the hand "
+                     "all take the steadied pose. Higher = steadier, more lag on slow moves (0.2: a still hand filtered at about 7 Hz; 0.5: about 3.4 Hz; "
+                     "1: about 1 Hz). 0 = off.");
+                int rm = std::clamp(m_rumble_mode.load(), 0, 2);
+                if (combo("Controller vibration", &rm, "The game's own (shots on the left hand)\0The weapon hand (both while it is held with two hands)\0Both hands\0")) {
+                    m_rumble_mode = rm;
+                    keep("rumble", rm == 0 ? "rumble game" : rm == 2 ? "rumble both" : "rumble gun");
+                }
+                hint("The game's pad rumble: shots, hits, explosions. The weapon hand: the controller holding the gun vibrates, and the other one too "
+                     "while it holds the gun with two hands; with no weapon in hand or while driving, both. The game's own: the pad's heavy motor on the "
+                     "left controller and its light motor on the right, so firing buzzed only the left hand (the old way).");
+                float rg = m_rumble_gain.load();
+                if (slider("Vibration strength", rg, 0.0f, 2.0f, rg <= 0.001f ? "off" : "x%.2f", 0.1f)) {
+                    m_rumble_gain = rg;
+                    keep("rumblegain", fmt::format("rumblegain {:.2f}", rg));
+                }
+                hint("x1 = as before. Higher makes the game's light rumbles stronger (the strongest are already at the controller's limit); 0 = no vibration "
+                     "from the game (the gesture zones' buzz stays).");
+                bool sb = m_shot_buzz.load();
+                if (ImGui::Checkbox("A firm pulse on every shot", &sb)) {
+                    m_shot_buzz = sb;
+                    keep("shotbuzz", sb ? "shotbuzz on" : "shotbuzz off");
+                }
+                hint("Each of your shots gives the hands holding the gun the same pulse, on top of the game's rumble (which changes from shot to shot). "
+                     "Off: only the game's rumble. Not with \"The game's own\" above.");
+                if (sb) {
+                    float sa = m_shot_buzz_amp.load();
+                    if (slider("Shot pulse strength", sa, 0.1f, 1.0f, "%.2f", 0.05f)) {
+                        m_shot_buzz_amp = sa;
+                        keep("shotbuzzamp", fmt::format("shotbuzzamp {:.2f}", sa));
+                    }
+                    int sm = m_shot_buzz_ms.load();
+                    if (slider_int("Shot pulse length", sm, 20, 250, "%d ms", 10)) {
+                        m_shot_buzz_ms = sm;
+                        keep("shotbuzzms", fmt::format("shotbuzzms {}", sm));
+                    }
+                    hint("1.00 = the controller's strongest. Longer feels heavier; above about 100 ms the pulses of a fast automatic run together.");
+                }
+                // The firing limit (fireturnmax: "never hide what you see" and "how far the view may turn to the gun") was removed (Homard 24 Oct):
+                // shots always follow the barrel (no limit); firesplit keeps the drawn camera on the head.
             }
-            int rg = std::clamp(m_reddot_glass.load(), 0, 2);
-            if (combo("Glass of closed red dot sights", &rg, "Game's (dark)\0Clear\0Clear, no reflection\0")) m_ui_cmds += fmt::format("reddotglass {}\n", rg);
-            hint("Closed red dot sights (a tube with glass at both ends, like the AR-C's) show a dark glass until the game aims down "
-                 "sights, which it never does in VR. Clear (default): the dark layer is left out, the glass keeps a faint reflection. "
-                 "Clear, no reflection: the glass is left out too. Magnifying scopes are not changed.");
         }
+        if (ImGui::CollapsingHeader("Bullet tracers")) {
             {
-                // The red dot's look (moved from Experimental, Homard 20 Oct).
-                const bool rd = m_reddot.load();
-                if (rd) {
-                    ImGui::Indent(24.0f);
-                    float moa = m_reddot_moa.load();
-                    if (slider("Dot size", moa, 2.0f, 20.0f, "%.0f MOA", 1.0f)) {
-                        m_reddot_moa = moa;
-                        keep("reddotsize", fmt::format("reddotsize {:.1f}", moa));
+                // One selector for hidetracers + tracersfromgun (Homard 2026-10-14); same commands and saved lines as before.
+                int tr = !m_hide_tracers.load() ? 0 : m_tracers_from_gun.load() ? 2 : 1;
+                if (combo("Bullet tracers", &tr, "Game's own (from your eyes)\0Hidden\0Follow the muzzle\0")) {
+                    m_hide_tracers     = tr != 0;
+                    m_tracers_from_gun = tr == 2;
+                    keep("hidetracers", tr != 0 ? "hidetracers on" : "hidetracers off");
+                    keep("tracersfromgun", tr == 2 ? "tracersfromgun on" : "tracersfromgun off");
+                }
+                hint("The game draws the tracer streaks from your eyes, not from the gun. Hidden: no streaks. Follow the muzzle: the streaks start at the gun barrel.");
+                bool fw = m_flame_world.load();
+                if (ImGui::Checkbox("Flames and smoke stay in the world (flamethrower)", &fw)) m_ui_cmds += fw ? "flameworld on\n" : "flameworld off\n";
+                hint("On (default): the flamethrower's flames and the gun's smoke and sparks leave the barrel and stay where they are in the world, "
+                     "as on a flat screen. Off: they are drawn with the gun, so flames already in the air swing with your hand (before 24 Oct).");
+                if (fw) {
+                    float fh = m_flame_hold.load();
+                    if (slider("Flames stay in the world for", fh, 0.0f, 5.0f, "%.1f s after firing", 0.1f)) {
+                        m_flame_hold = fh;
+                        keep("flamehold", fmt::format("flamehold {:.1f}", fh));
                     }
-                    float br = m_reddot_bright.load();
-                    if (slider("Dot brightness", br, 0.2f, 1.0f, "%.2f", 0.05f)) {
-                        m_reddot_bright = br;
-                        keep("reddotbright", fmt::format("reddotbright {:.2f}", br));
-                    }
-                    bool gl = m_reddot_glow.load();
-                    if (ImGui::Checkbox("Soft glow around the dot", &gl)) m_ui_cmds += gl ? "reddotglow on\n" : "reddotglow off\n";
-                    ImGui::Unindent(24.0f);
+                    hint("When not firing, the flames and smoke go with the gun again, so the flamethrower's small pilot flame stays on its nozzle. "
+                         "While firing and for this long after you let go of the trigger they stay in the world (the stream still in the air), then "
+                         "they turn back onto the gun over 0.4 s. Longer if the last flames of a burst start to swing with your hand; shorter if the "
+                         "pilot flame lags the nozzle too long after a burst.");
+                }
+                if (fc5::bullet::speed_available()) {
+                    float bs = fc5::bullet::speed_scale();
+                    if (slider("Bullet speed", bs, 1.0f, 4.0f, "x%.2f", 0.25f)) m_ui_cmds += fmt::format("bulletspeed {:.2f}\n", bs);
+                    hint("The game's bullets fly at about 300 m/s and drop (about 0.5 m at 100 m). x2 = 600 m/s: a quarter of the drop and half the lead on moving "
+                         "targets; x3 = 900 m/s, close to a real rifle. Rockets and arrows are not changed. Enemies firing the same kind of weapon get it too.");
                 }
             }
-            // Scopes: moved from Experimental (Homard 20 Oct); a section that opens on a click, closed at first (Homard 24 Oct).
-            ImGui::Dummy(ImVec2{ 0.0f, 4.0f });
-            if (ImGui::CollapsingHeader("Scopes")) {
-                // Every change goes through the command file's path (m_ui_cmds), which saves it.
-                bool sc = m_scope.load();
-                if (ImGui::Checkbox("Scopes: magnified picture when your eye is behind the scope", &sc)) m_ui_cmds += sc ? "scope on\n" : "scope off\n";
-                hint("Off (default): nothing changes. On: bring the scope to your dominant eye (about a hand's width or closer, looking along it) and that eye "
-                     "shows the lens: a magnified view around where the shots go, with a reticle. Only weapons with a scope entry (set below) do this.");
-                if (sc) {
-                    ImGui::Indent(24.0f);
-                    auto sw = [&](const char* label, std::atomic<bool>& val, const char* cmd) {
-                        bool b = val.load();
-                        if (ImGui::Checkbox(label, &b)) m_ui_cmds += fmt::format("{} {}\n", cmd, b ? "on" : "off");
-                    };
-                    sw("Step 1: lens picture (magnified view in the lens)", m_scope_lens, "scopelens");
-                    sw("Step 2: reticle at the aim point", m_scope_reticle, "scopereticle");
-                    sw("Step 2: dark crescent when the eye is off the scope's axis", m_scope_eyebox, "scopeeyebox");
-                    sw("Scope picture on the gun (in the scope's eyepiece)", m_scope_model, "scopemodel");
-                    hint("On (default): the picture is in the eyepiece of the gun's scope and moves with the gun, like a real scope; the gun "
-                         "stays drawn and you see around it. Off: a lens in front of the eye, the gun hidden in that eye.");
-                    if (m_scope_model.load()) {
-                        if (ImGui::Button("This gun: the eyepiece is where I look through")) m_ui_cmds += "scopelenshere\n";
-                        hint("Hold your eye behind the scope, looking through it at a target, and press: the picture moves onto this gun's "
-                             "eyepiece 6.6 cm in front of your eye (saved per gun).");
+        }
+        if (ImGui::CollapsingHeader("Sights")) {   // from Experimental > Unfinished features (Tests cleanup 19 Oct; HEADSET_QUEUE 53 passed)
+            {
+                bool sa = m_sight_aim.load();
+                if (ImGui::Checkbox("Shots go through the centre of the gun's sights (red dot, scope, iron sights)", &sa)) m_ui_cmds += sa ? "sightaim on\n" : "sightaim off\n";
+                hint("On (default): with your eye behind the sights, the shots, the red dot, the aim dot and the scope's crosshair are all at the "
+                     "sight's centre, at any distance. Each weapon's sight line is read from the game's own aim-down-sights pose (whenever you "
+                     "aim down sights; see the next setting for the automatic read). Off: the shots follow the controller's axis (before 18 Oct).");
+                int ap = std::clamp(m_ads_probe.load(), 0, 2);
+                if (combo("Automatic aim down sights near the eye", &ap, "Never\0Guns with a scope or red dot only\0Every new gun (before 29 Oct)\0"))
+                    m_ui_cmds += ap == 0 ? "adsprobe off\n" : ap == 2 ? "adsprobe all\n" : "adsprobe optic\n";
+                hint("adsprobe: the first time a new gun comes to your eye, the mod can press the game's aim down sights for up to a second to read "
+                     "its sight line and its zoom (the narrow view, blur and slow walk of the game's ADS). Guns with a scope or red dot only (default): "
+                     "iron-sight guns are never pressed (their line is the barrel's until you aim down sights yourself). Never: only your own aim "
+                     "down sights is read.");
+                if (ImGui::Button("Read this weapon's sights again")) m_ui_cmds += "sightforget\n";
+                hint("Forgets this weapon's sight line; it is read again the next time you bring the gun to your eye. Use it after changing its sight.");
+                // One choice for aimdot + reddot + reddotonly (Homard 19 Oct 17:25 for the last two; 24 Oct: the aim dot from Motion control
+                // joined it). Same commands and saved lines as before. The aim dot is the marker where the shots land on any gun; the red dot
+                // is drawn in reflex and holographic sights (and the aim dot is then drawn outside the sight's window only, by reddot_draw).
+                {
+                    const bool ad = m_aim_dot.load(), rdo = m_reddot.load(), only = m_reddot_only.load();
+                    int        rd = !rdo ? (ad ? 1 : 0) : !ad ? 4 : only ? 3 : 2;
+                    if (combo("Red dot", &rd, "Off\0Aim dot only (the game's own dot in reflex sights)\0In reflex sights, and an aim dot on every gun\0"
+                                              "Only in reflex sights; an aim dot on guns without one (realistic)\0Only in reflex sights; no aim dot at all\0")) {
+                        const bool want_ad = rd != 0, want_rd = rd >= 2, want_only = rd == 3;
+                        m_aim_dot = want_ad;
+                        keep("aimdot", want_ad ? "aimdot on" : "aimdot off");
+                        m_ui_cmds += want_rd ? "reddot on\n" : "reddot off\n";
+                        if (want_rd) m_ui_cmds += want_only ? "reddotonly on\n" : "reddotonly off\n";
                     }
-                    {
-                        // One box for scoperecoiloff (Homard 24 Oct: "keep the picture while firing"); same command and saved line.
-                        bool keepfire = !m_scope_recoil_off.load();
-                        if (ImGui::Checkbox("Keep the magnified picture while firing", &keepfire)) m_ui_cmds += keepfire ? "scoperecoiloff off\n" : "scoperecoiloff on\n";
-                        hint("On (default): the picture stays in the scope while you fire and moves with the gun's recoil. Off: while you fire and for "
-                             "0.6 s after each shot the scope shows the gun's own dark glass (the recoil glitch of 13 Oct hidden).");
-                    }
-                    sw("Right stick up / down zooms the scope in / out (gun held with two hands)", m_scope_zoom_stick, "scopezoomstick");
-                    {
-                        float k = 1.0f, optic = 0.0f;
-                        {
-                            std::lock_guard _{ m_scope_mtx };
-                            if (auto it = m_scope_zoom.find(m_weapon_sig.load()); it != m_scope_zoom.end()) k = it->second;
-                            if (auto it = m_scope_cal.find(m_weapon_sig.load()); it != m_scope_cal.end() && it->second.mag > 1.01f && optic_now(m_weapon_sig.load())) optic = it->second.mag;
-                        }
-                        if (optic > 0.0f) {
-                            ImGui::SameLine();
-                            ImGui::TextDisabled("(this gun: x%.0f, its scope x%.1f)", std::max(1.0f, std::round(optic * k)), optic);
-                        }
-                        if (k != 1.0f && ImGui::Button("This gun: back to its own zoom")) m_ui_cmds += "scopezoom reset\n";
-                    }
-                    hint("On (default): with the scope picture showing and the gun held with both hands, each push of the right stick up zooms in one "
-                         "step (x1, x4, x8, x16, x32) and each push down zooms out one step. Each gun keeps its zoom (saved).");
-                    sw("The gun is not drawn in the scoped eye (lens in front of the eye only)", m_scope_hide_gun, "scopehidegun");
-                    sw("Step 3: scope render pass (sharp far detail in the lens)", m_scope_pass, "scopepass");
-                    hint("Off (default): the lens shows a zoom of the eye's own picture. On: while your eye is behind a magnifying scope, the game also "
-                         "draws the view through the scope itself, so far things are as sharp in the lens as up close. Costs about one more eye "
-                         "of rendering, only while you look through the scope.");
-                    if (m_scope_pass.load() && m_scope_pass_broken) ImGui::TextDisabled("The scope pass turned itself off (see the log); switch it off and on to retry.");
-                    if (m_scope_pass.load()) {
-                        // Cost cuts for the scope pass (each its own switch, to compare in the headset).
+                    hint("The aim dot is a small dot where your shots land, on every gun. The red dot is drawn in reflex and holographic sights, at the "
+                         "target's distance, and stays on the target wherever your eye is behind the sight (the game's own dot is painted on the sight's "
+                         "glass and slides off the target). In reflex sights, and an aim dot: the aim dot also shows outside the sight's window. Only in "
+                         "reflex sights (realistic): a gun with a reflex sight shows its dot only through the window; other guns keep the aim dot. "
+                         "No aim dot at all: only the sights' dots. Off: neither, the game's own dot.");
+                }
+                int rg = std::clamp(m_reddot_glass.load(), 0, 2);
+                if (combo("Glass of closed red dot sights", &rg, "Game's (dark)\0Clear\0Clear, no reflection\0")) m_ui_cmds += fmt::format("reddotglass {}\n", rg);
+                hint("Closed red dot sights (a tube with glass at both ends, like the AR-C's) show a dark glass until the game aims down "
+                     "sights, which it never does in VR. Clear (default): the dark layer is left out, the glass keeps a faint reflection. "
+                     "Clear, no reflection: the glass is left out too. Magnifying scopes are not changed.");
+            }
+                {
+                    // The red dot's look (moved from Experimental, Homard 20 Oct).
+                    const bool rd = m_reddot.load();
+                    if (rd) {
                         ImGui::Indent(24.0f);
-                        int res = m_scope_res.load();
-                        int ri  = res == 0 ? 0 : res >= 1024 ? 1 : res >= 768 ? 2 : 3;
-                        if (combo("Cost: scope picture size", &ri, "Whole render size\0" "1024 x 1024\0" "768 x 768\0" "512 x 512\0"))
-                            m_ui_cmds += fmt::format("scoperes {}\n", ri == 0 ? 0 : ri == 1 ? 1024 : ri == 2 ? 768 : 512);
-                        hint("A smaller scope picture, drawn in a corner of the game's images: less to draw. The lens covers about 25-30 degrees, so 1024 is still sharper than the headset shows there.");
-                        const int skip = m_scope_skip.load();
-                        auto skipbox = [&](const char* label, int bit) {
-                            bool b = (skip & bit) != 0;
-                            if (ImGui::Checkbox(label, &b)) m_ui_cmds += fmt::format("scopeskip {}\n", b ? (skip | bit) : (skip & ~bit));
-                        };
-                        skipbox("Cost: scope view keeps the eyes' sun shadow maps", 1);
-                        skipbox("Cost: no reflections in the scope view", 2);
-                        skipbox("Cost: no ambient occlusion in the scope view", 4);
-                        skipbox("Cost: no volumetric fog in the scope view", 8);
-                        bool half = m_scope_every.load() > 1;
-                        if (ImGui::Checkbox("Cost: lens picture every other frame", &half)) m_ui_cmds += half ? "scopeevery 2\n" : "scopeevery 1\n";
-                        hint("Each one makes the scope view cheaper; compare the lens with it on and off.");
-                        bool hs = m_scope_hist_swap.load();
-                        if (ImGui::Checkbox("Fix: shadows outside the scope stay sharp while it draws", &hs)) m_ui_cmds += hs ? "scopehistswap on\n" : "scopehistswap off\n";
-                        hint("On (default): after the scope view is drawn, the game's frame-to-frame effects (sun shadows, reflections, fog) are put back as they "
-                             "were for the eyes. Off: the right eye's shadows outside the lens go soft and stick to the view while the scope view runs.");
+                        float moa = m_reddot_moa.load();
+                        if (slider("Dot size", moa, 2.0f, 20.0f, "%.0f MOA", 1.0f)) {
+                            m_reddot_moa = moa;
+                            keep("reddotsize", fmt::format("reddotsize {:.1f}", moa));
+                        }
+                        float br = m_reddot_bright.load();
+                        if (slider("Dot brightness", br, 0.2f, 1.0f, "%.2f", 0.05f)) {
+                            m_reddot_bright = br;
+                            keep("reddotbright", fmt::format("reddotbright {:.2f}", br));
+                        }
+                        bool gl = m_reddot_glow.load();
+                        if (ImGui::Checkbox("Soft glow around the dot", &gl)) m_ui_cmds += gl ? "reddotglow on\n" : "reddotglow off\n";
                         ImGui::Unindent(24.0f);
                     }
-                    if (!m_scope_model.load()) {
-                        // Shown only where it works (scope_src_eye: not with the picture on the gun; audit 16 Oct).
-                        bool own = m_scope_src.load() == 1;
-                        if (ImGui::Checkbox("Option: the scoped eye draws the scope view itself (no extra cost, black around the lens)", &own)) m_ui_cmds += own ? "scopesrc 1\n" : "scopesrc 0\n";
-                        hint("Instead of an extra render, the eye behind the scope draws only the scope's view: as sharp, free, but that eye sees nothing around the lens.");
-                    }
-                    int eye = m_scope_eye.load();
-                    if (combo("Dominant eye", &eye, "Left\0Right\0Automatic (the eye nearer the scope's axis)\0")) m_ui_cmds += eye == 0 ? "scopeeye left\n" : eye == 2 ? "scopeeye auto\n" : "scopeeye right\n";
-                    const auto& st  = m_scope_st;
-                    const UINT  sig = m_weapon_sig.load();
-                    ScopeCal    cal{};
-                    bool        have = false;
-                    {
-                        std::lock_guard _{ m_scope_mtx };
-                        if (auto it = m_scope_cal.find(sig); it != m_scope_cal.end()) { cal = it->second; have = true; }
-                        else cal = m_scope_default;
-                    }
-                    if (m_scope_auto.load())
-                        ImGui::TextDisabled("Weapon %u: %s. Eye %.0f cm from the barrel's line, head %.0f deg off the barrel: %s (x%.1f)", sig,
-                                            have ? (cal.mag > 1.01f ? "magnifying scope" : "no magnifying scope") : "not learned yet", st.dist * 100.0f, st.angle,
-                                            st.active ? "looking through" : "not looking through", st.mag);
-                    else
-                        ImGui::TextDisabled("Weapon %u: %s. Eye %.0f cm from the lens, %.0f deg off its axis: %s (x%.1f)", sig, have ? "scope entry set" : "no scope entry", st.dist * 100.0f,
-                                            st.angle, st.active ? "looking through" : "not looking through", st.mag);
-                    if (sig != 0) {
-                        // The gun in hand's magnification by hand (the mod also learns it from the game's aim-down-sights zoom).
-                        ImGui::TextUnformatted("This gun:");
-                        for (const float m : { 1.0f, 2.0f, 4.0f, 6.0f, 8.0f }) {
-                            ImGui::SameLine();
-                            if (ImGui::Button(m <= 1.0f ? "No scope##scm" : fmt::format("x{:.0f}##scm{}", m, m).c_str()))
-                                m_ui_cmds += fmt::format("scopecal {:.4f} {:.4f} {:.4f} {:.4f} {:.2f} {}\n", cal.off[0], cal.off[1], cal.off[2], cal.radius, m, sig);
-                        }
-                    }
-                    {
-                        bool b = m_scope_auto.load();
-                        if (ImGui::Checkbox("Lens follows the eye on the gun's sight line (no lens position to set)", &b)) m_ui_cmds += b ? "scopeauto on\n" : "scopeauto off\n";
-                        b = m_scope_learn.load();
-                        if (ImGui::Checkbox("Learn each gun's magnification from the game's aim down sights", &b)) m_ui_cmds += b ? "scopelearn on\n" : "scopelearn off\n";
-                        hint("The first time you bring a new gun to your eye, the mod aims down sights for half a second to read the scope's zoom (also when you aim down sights yourself). Red dots and iron sights are recognised and never get a lens.");
-                    }
-                    if (level >= 1) {
-                        float off[3]{ cal.off[0], cal.off[1], cal.off[2] };
-                        float rmm = cal.radius * 1000.0f, mag = cal.mag;
-                        bool  ch  = false;
-                        row("Ocular lens from the controller (m: right, up, back)");
-                        ch |= ImGui::SliderFloat3("##scopeoff", off, -0.4f, 0.4f, "%.3f");
-                        ch |= slider("Lens radius", rmm, 5.0f, 40.0f, "%.1f mm", 0.5f);
-                        // From x1.1 (Homard 19 Oct: "1.0 is dark"): an entry at x1 marks a red dot or iron sights, which never get the picture.
-                        if (slider("Magnification", mag, 1.1f, 12.0f, "x%.1f", 0.1f)) { mag = std::max(mag, 1.1f); ch = true; }
-                        if (ch && sig != 0) m_ui_cmds += fmt::format("scopecal {:.4f} {:.4f} {:.4f} {:.4f} {:.2f} {}\n", off[0], off[1], off[2], rmm / 1000.0f, mag, sig);
-                        if (have && ImGui::Button("Remove this weapon's scope entry")) m_ui_cmds += fmt::format("scopecal clear {}\n", sig);
-                        hint("Moving a slider creates or changes the scope entry of the weapon in hand (saved). Magnification starts at x1.1: x1 is how red dots and iron sights are marked (no scope picture).");
-                    }
-                    ImGui::Unindent(24.0f);
                 }
-            }
-        if (level >= 1) {
-        section("Weapon on the controller");
+                // Scopes: moved from Experimental (Homard 20 Oct); a section that opens on a click, closed at first (Homard 24 Oct).
+                ImGui::Dummy(ImVec2{ 0.0f, 4.0f });
+                if (ImGui::CollapsingHeader("Scopes")) {
+                    // Every change goes through the command file's path (m_ui_cmds), which saves it.
+                    bool sc = m_scope.load();
+                    if (ImGui::Checkbox("Scopes: magnified picture when your eye is behind the scope", &sc)) m_ui_cmds += sc ? "scope on\n" : "scope off\n";
+                    hint("Off (default): nothing changes. On: bring the scope to your dominant eye (about a hand's width or closer, looking along it) and that eye "
+                         "shows the lens: a magnified view around where the shots go, with a reticle. Only weapons with a scope entry (set below) do this.");
+                    if (sc) {
+                        ImGui::Indent(24.0f);
+                        auto sw = [&](const char* label, std::atomic<bool>& val, const char* cmd) {
+                            bool b = val.load();
+                            if (ImGui::Checkbox(label, &b)) m_ui_cmds += fmt::format("{} {}\n", cmd, b ? "on" : "off");
+                        };
+                        sw("Step 1: lens picture (magnified view in the lens)", m_scope_lens, "scopelens");
+                        sw("Step 2: reticle at the aim point", m_scope_reticle, "scopereticle");
+                        sw("Step 2: dark crescent when the eye is off the scope's axis", m_scope_eyebox, "scopeeyebox");
+                        sw("Scope picture on the gun (in the scope's eyepiece)", m_scope_model, "scopemodel");
+                        hint("On (default): the picture is in the eyepiece of the gun's scope and moves with the gun, like a real scope; the gun "
+                             "stays drawn and you see around it. Off: a lens in front of the eye, the gun hidden in that eye.");
+                        if (m_scope_model.load()) {
+                            if (ImGui::Button("This gun: the eyepiece is where I look through")) m_ui_cmds += "scopelenshere\n";
+                            hint("Hold your eye behind the scope, looking through it at a target, and press: the picture moves onto this gun's "
+                                 "eyepiece 6.6 cm in front of your eye (saved per gun).");
+                        }
+                        {
+                            // One box for scoperecoiloff (Homard 24 Oct: "keep the picture while firing"); same command and saved line.
+                            bool keepfire = !m_scope_recoil_off.load();
+                            if (ImGui::Checkbox("Keep the magnified picture while firing", &keepfire)) m_ui_cmds += keepfire ? "scoperecoiloff off\n" : "scoperecoiloff on\n";
+                            hint("On (default): the picture stays in the scope while you fire and moves with the gun's recoil. Off: while you fire and for "
+                                 "0.6 s after each shot the scope shows the gun's own dark glass (the recoil glitch of 13 Oct hidden).");
+                        }
+                        sw("Right stick up / down zooms the scope in / out (gun held with two hands)", m_scope_zoom_stick, "scopezoomstick");
+                        {
+                            float k = 1.0f, optic = 0.0f;
+                            {
+                                std::lock_guard _{ m_scope_mtx };
+                                if (auto it = m_scope_zoom.find(m_weapon_sig.load()); it != m_scope_zoom.end()) k = it->second;
+                                if (auto it = m_scope_cal.find(m_weapon_sig.load()); it != m_scope_cal.end() && it->second.mag > 1.01f && optic_now(m_weapon_sig.load())) optic = it->second.mag;
+                            }
+                            if (optic > 0.0f) {
+                                ImGui::SameLine();
+                                ImGui::TextDisabled("(this gun: x%.0f, its scope x%.1f)", std::max(1.0f, std::round(optic * k)), optic);
+                            }
+                            if (k != 1.0f && ImGui::Button("This gun: back to its own zoom")) m_ui_cmds += "scopezoom reset\n";
+                        }
+                        hint("On (default): with the scope picture showing and the gun held with both hands, each push of the right stick up zooms in one "
+                             "step (x1, x4, x8, x16, x32) and each push down zooms out one step. Each gun keeps its zoom (saved).");
+                        sw("The gun is not drawn in the scoped eye (lens in front of the eye only)", m_scope_hide_gun, "scopehidegun");
+                        sw("Step 3: scope render pass (sharp far detail in the lens)", m_scope_pass, "scopepass");
+                        hint("Off (default): the lens shows a zoom of the eye's own picture. On: while your eye is behind a magnifying scope, the game also "
+                             "draws the view through the scope itself, so far things are as sharp in the lens as up close. Costs about one more eye "
+                             "of rendering, only while you look through the scope.");
+                        if (m_scope_pass.load() && m_scope_pass_broken) ImGui::TextDisabled("The scope pass turned itself off (see the log); switch it off and on to retry.");
+                        if (m_scope_pass.load()) {
+                            // Cost cuts for the scope pass (each its own switch, to compare in the headset).
+                            ImGui::Indent(24.0f);
+                            int res = m_scope_res.load();
+                            int ri  = res == 0 ? 0 : res >= 1024 ? 1 : res >= 768 ? 2 : 3;
+                            if (combo("Cost: scope picture size", &ri, "Whole render size\0" "1024 x 1024\0" "768 x 768\0" "512 x 512\0"))
+                                m_ui_cmds += fmt::format("scoperes {}\n", ri == 0 ? 0 : ri == 1 ? 1024 : ri == 2 ? 768 : 512);
+                            hint("A smaller scope picture, drawn in a corner of the game's images: less to draw. The lens covers about 25-30 degrees, so 1024 is still sharper than the headset shows there.");
+                            const int skip = m_scope_skip.load();
+                            auto skipbox = [&](const char* label, int bit) {
+                                bool b = (skip & bit) != 0;
+                                if (ImGui::Checkbox(label, &b)) m_ui_cmds += fmt::format("scopeskip {}\n", b ? (skip | bit) : (skip & ~bit));
+                            };
+                            skipbox("Cost: scope view keeps the eyes' sun shadow maps", 1);
+                            skipbox("Cost: no reflections in the scope view", 2);
+                            skipbox("Cost: no ambient occlusion in the scope view", 4);
+                            skipbox("Cost: no volumetric fog in the scope view", 8);
+                            bool half = m_scope_every.load() > 1;
+                            if (ImGui::Checkbox("Cost: lens picture every other frame", &half)) m_ui_cmds += half ? "scopeevery 2\n" : "scopeevery 1\n";
+                            hint("Each one makes the scope view cheaper; compare the lens with it on and off.");
+                            bool hs = m_scope_hist_swap.load();
+                            if (ImGui::Checkbox("Fix: shadows outside the scope stay sharp while it draws", &hs)) m_ui_cmds += hs ? "scopehistswap on\n" : "scopehistswap off\n";
+                            hint("On (default): after the scope view is drawn, the game's frame-to-frame effects (sun shadows, reflections, fog) are put back as they "
+                                 "were for the eyes. Off: the right eye's shadows outside the lens go soft and stick to the view while the scope view runs.");
+                            ImGui::Unindent(24.0f);
+                        }
+                        if (!m_scope_model.load()) {
+                            // Shown only where it works (scope_src_eye: not with the picture on the gun; audit 16 Oct).
+                            bool own = m_scope_src.load() == 1;
+                            if (ImGui::Checkbox("Option: the scoped eye draws the scope view itself (no extra cost, black around the lens)", &own)) m_ui_cmds += own ? "scopesrc 1\n" : "scopesrc 0\n";
+                            hint("Instead of an extra render, the eye behind the scope draws only the scope's view: as sharp, free, but that eye sees nothing around the lens.");
+                        }
+                        int eye = m_scope_eye.load();
+                        if (combo("Dominant eye", &eye, "Left\0Right\0Automatic (the eye nearer the scope's axis)\0")) m_ui_cmds += eye == 0 ? "scopeeye left\n" : eye == 2 ? "scopeeye auto\n" : "scopeeye right\n";
+                        const auto& st  = m_scope_st;
+                        const UINT  sig = m_weapon_sig.load();
+                        ScopeCal    cal{};
+                        bool        have = false;
+                        {
+                            std::lock_guard _{ m_scope_mtx };
+                            if (auto it = m_scope_cal.find(sig); it != m_scope_cal.end()) { cal = it->second; have = true; }
+                            else cal = m_scope_default;
+                        }
+                        if (m_scope_auto.load())
+                            ImGui::TextDisabled("Weapon %u: %s. Eye %.0f cm from the barrel's line, head %.0f deg off the barrel: %s (x%.1f)", sig,
+                                                have ? (cal.mag > 1.01f ? "magnifying scope" : "no magnifying scope") : "not learned yet", st.dist * 100.0f, st.angle,
+                                                st.active ? "looking through" : "not looking through", st.mag);
+                        else
+                            ImGui::TextDisabled("Weapon %u: %s. Eye %.0f cm from the lens, %.0f deg off its axis: %s (x%.1f)", sig, have ? "scope entry set" : "no scope entry", st.dist * 100.0f,
+                                                st.angle, st.active ? "looking through" : "not looking through", st.mag);
+                        if (sig != 0) {
+                            // The gun in hand's magnification by hand (the mod also learns it from the game's aim-down-sights zoom).
+                            ImGui::TextUnformatted("This gun:");
+                            for (const float m : { 1.0f, 2.0f, 4.0f, 6.0f, 8.0f }) {
+                                ImGui::SameLine();
+                                if (ImGui::Button(m <= 1.0f ? "No scope##scm" : fmt::format("x{:.0f}##scm{}", m, m).c_str()))
+                                    m_ui_cmds += fmt::format("scopecal {:.4f} {:.4f} {:.4f} {:.4f} {:.2f} {}\n", cal.off[0], cal.off[1], cal.off[2], cal.radius, m, sig);
+                            }
+                        }
+                        {
+                            bool b = m_scope_auto.load();
+                            if (ImGui::Checkbox("Lens follows the eye on the gun's sight line (no lens position to set)", &b)) m_ui_cmds += b ? "scopeauto on\n" : "scopeauto off\n";
+                            b = m_scope_learn.load();
+                            if (ImGui::Checkbox("Learn each gun's magnification from the game's aim down sights", &b)) m_ui_cmds += b ? "scopelearn on\n" : "scopelearn off\n";
+                            hint("The first time you bring a new gun with a scope to your eye, the mod aims down sights for half a second to read the scope's zoom (also when you aim down sights yourself; Sights > Automatic aim down sights sets which guns). Red dots and iron sights are recognised and never get a lens.");
+                            b = m_scope_sticky_eye.load();
+                            if (ImGui::Checkbox("Scope picture kept through a bolt cycle only while the eye stays behind it", &b)) m_ui_cmds += b ? "scopesticky on\n" : "scopesticky off\n";
+                            hint("scopesticky: a rifle's id changes for a moment while its bolt cycles, so its scope entry is kept for 1.5 s. On (default): only "
+                                 "while your eye is behind the scope, so a gun taken next never shows the last scope's lens. Off: 1.5 s whatever the eye does.");
+                        }
+                        if (level >= 1) {
+                            float off[3]{ cal.off[0], cal.off[1], cal.off[2] };
+                            float rmm = cal.radius * 1000.0f, mag = cal.mag;
+                            bool  ch  = false;
+                            row("Ocular lens from the controller (m: right, up, back)");
+                            ch |= ImGui::SliderFloat3("##scopeoff", off, -0.4f, 0.4f, "%.3f");
+                            ch |= slider("Lens radius", rmm, 5.0f, 40.0f, "%.1f mm", 0.5f);
+                            // From x1.1 (Homard 19 Oct: "1.0 is dark"): an entry at x1 marks a red dot or iron sights, which never get the picture.
+                            if (slider("Magnification", mag, 1.1f, 12.0f, "x%.1f", 0.1f)) { mag = std::max(mag, 1.1f); ch = true; }
+                            if (ch && sig != 0) m_ui_cmds += fmt::format("scopecal {:.4f} {:.4f} {:.4f} {:.4f} {:.2f} {}\n", off[0], off[1], off[2], rmm / 1000.0f, mag, sig);
+                            if (have && ImGui::Button("Remove this weapon's scope entry")) m_ui_cmds += fmt::format("scopecal clear {}\n", sig);
+                            hint("Moving a slider creates or changes the scope entry of the weapon in hand (saved). Magnification starts at x1.1: x1 is how red dots and iron sights are marked (no scope picture).");
+                        }
+                        ImGui::Unindent(24.0f);
+                    }
+                }
+        }
+        if (level >= 1 && ImGui::CollapsingHeader("Weapon on the controller")) {
         float g[3]{ m_grip_off[0].load(), m_grip_off[1].load(), m_grip_off[2].load() };
         if ((row("Grip in the game's view (m)"), ImGui::SliderFloat3("##grip", g, -0.6f, 0.6f))) {
             m_grip_off[0] = g[0];
@@ -18329,12 +19493,23 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
         }
         hint("Where the gun's grip sits relative to the game's first-person camera.");
         float gp = m_grip_pitch.load();
-        if (slider("Weapon pitch on the controller", gp, -60.0f, 60.0f, "%.1f deg", 1.0f)) m_grip_pitch = gp;
+        // Saved (30 Oct: these three only changed the running game, so a value Homard set was lost at exit).
+        if (slider("Weapon pitch on the controller", gp, -60.0f, 60.0f, "%.1f deg", 1.0f)) {
+            m_grip_pitch = gp;
+            keep("grippitch", fmt::format("grippitch {:.1f}", gp));
+        }
         float my = m_model_yaw.load(), mp = m_model_pitch.load();
-        if (slider("Gun model yaw correction", my, -15.0f, 15.0f, "%.1f deg", 0.5f)) m_model_yaw = my;
-        if (slider("Gun model pitch correction", mp, -15.0f, 15.0f, "%.1f deg", 0.5f)) m_model_pitch = mp;
+        if (slider("Gun model yaw correction", my, -15.0f, 15.0f, "%.1f deg", 0.5f)) {
+            m_model_yaw = my;
+            keep("modelyaw", fmt::format("modelyaw {:.1f}", my));
+        }
+        if (slider("Gun model pitch correction", mp, -15.0f, 15.0f, "%.1f deg", 0.5f)) {
+            m_model_pitch = mp;
+            keep("modelpitch", fmt::format("modelpitch {:.1f}", mp));
+        }
         hint("Lines the drawn barrel up with where the shots go.");
-        section("Shots");
+        }
+        if (level >= 1 && ImGui::CollapsingHeader("Shots")) {
         v = m_converge_auto.load();
         if (ImGui::Checkbox("Shots meet the barrel where it points (depth)", &v)) m_converge_auto = v;
         float cv = m_converge_m.load();
@@ -18347,147 +19522,273 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
 
     if (ImGui::BeginTabItem("Comfort", nullptr, tab_flag(1))) {
         tab_body_begin();
-        section("Turning");
-        v = m_snap_turn.load();
-        if (ImGui::Checkbox("Snap turn (right stick)", &v)) {
-            m_snap_turn = v;
-            keep("snapturn", v ? "snapturn on" : "snapturn off");
-        }
-        hint("Turns in steps instead of smoothly: easier on the stomach.");
-        if (m_snap_turn.load()) {
-            int deg = (int)std::lround(m_snap_deg.load());
-            if (slider_int("Snap angle", deg, 15, 90, "%d deg", 5)) {
-                m_snap_deg = (float)deg;
-                keep("snapdeg", fmt::format("snapdeg {}", deg));
-            }
-        } else {
-            float ts = m_turn_speed.load();
-            if (slider("Smooth turn speed", ts, 30.0f, 360.0f, "%.0f deg/s", 10.0f)) m_turn_speed = ts;
-        }
-        section("Weapon");
-        v = m_gun_still.load();
-        if (ImGui::Checkbox("Gun moves only for reloads (no running, firing or vehicle animation)", &v)) {
-            m_gun_still = v;
-            keep("gunstill", v ? "gunstill on" : "gunstill off");
-        }
-        hint("The gun stays still in your hand: the game's running bob, sprint pose, recoil kick and bumps in vehicles no longer move it. Reloads still play "
-             "(magazines and hands move as the game animates them). Each weapon's pose is learned the first time you stand still with it. Off: the game's animation.");
-        if (m_gun_still.load() && ImGui::Button("A gun sits at a wrong angle: learn every gun's pose again")) {
-            if (m_gst) gun_still_forget();
-        }
-        hint("Hold the weapon in your hand and stand still for 3 s afterwards: its pose is taken from the game again.");
-        if (m_gun_still.load()) {
-            // "Stereo: both eyes show the same gun" (gunstillpair) and "Both eyes: the gun placed exactly" (gunstilllate): in Debug > Hands and
-            // weapon (Homard 24 Oct).
-            static const char* kFire[]{ "held still (no firing animation)", "held, only a recoil kick", "the game's firing animation (before 24 Oct)" };
-            const int          fm = m_gst_fire.load();
-            int                fi = fm == 2 ? 1 : fm == 0 ? 2 : 0;
-            if (combo_arr("While firing, the gun is", &fi, kFire, 3)) {
-                m_gst_fire = fi == 1 ? 2 : fi == 2 ? 0 : 1;
-                keep("gunstillfire", fi == 1 ? "gunstillfire kick" : fi == 2 ? "gunstillfire game" : "gunstillfire hold");
-            }
-            hint("gunstillfire. Held still (default): the gun stays where your hand holds it while you fire too; nothing of the game's firing stance, its way out of "
-                 "the sprint pose or its recoil moves it. Only a recoil kick: the same, plus a short kick back and up taken from the game's own recoil. "
-                 "The game's: the fast part of all the game does with the gun while firing shows (before 24 Oct).");
-        }
-        section("Cinematics and vehicles");
-        {
-            static const char* kCine[]{ "Flat screen in the room", "3D, steadied (level, heading held, bob smoothed)", "Unchanged" };
-            int                cm = std::clamp(m_cine_mode.load(), 0, 2);
-            if (combo_arr("Cinematics (cutscenes)", &cm, kCine, 3)) {
-                m_cine_mode = cm;
-                keep("cinematics", cm == 1 ? "cinematics 3d" : cm == 2 ? "cinematics off" : "cinematics flat");
-            }
-            hint("Scripted camera moves can make you queasy: show them on a big screen in the room, or keep them in 3D with the horizon held level.");
-            float cd = m_cine_delay.load();
-            if (slider("Cutscene starts after", cd, 0.0f, 8.0f, cd < 0.05f ? "at once (old)" : "%.1f s", 0.5f)) {
-                m_cine_delay = cd;
-                keep("cinedelay", fmt::format("cinedelay {:.1f}", cd));
-            }
-            hint("Takedowns take the camera for about 2 s, like a cutscene: anything shorter than this stays in 3D. Real cutscenes then start on the screen this much later.");
-            bool cf = m_cine_follow.load();
-            if (ImGui::Checkbox("3D cutscenes: look where the scene's camera looks", &cf)) {
-                m_cine_follow = cf;
-                keep("cinefollow", cf ? "cinefollow on" : "cinefollow off");
-            }
-            hint("The game only draws what its camera sees: off, the view keeps its heading and the scene can turn away from you into empty ground.");
+        if (ImGui::CollapsingHeader("Smooth motion")) {
             {
-                // One choice for vehicles + airfollow + groundfollow (Homard 24 Oct: "In vehicles the view turns with the vehicle" and Debug's
-                // "Vehicles: the view follows the vehicle's movement" brought together). airfollow without vehicles was a conflict: on the
-                // ground the view kept its own heading (stick turning on) and on lift-off it swung onto the vehicle's attitude, heading
-                // included, then back on landing; air_follow_now needs vehicles too now. Same commands and saved lines as before.
-                const bool vf = m_vehicle_follow.load(), af = m_air_follow.load(), gf = m_ground_follow.load();
-                int        vm = !vf ? 0 : !af ? 1 : gf ? 3 : 2;
-                static const char* kVeh[]{ "Stays put (the stick turns you)", "Turns with the vehicle, horizon always level",
-                                           "Turns with the vehicle; climbs, dives and banks with it when flying (default)",
-                                           "Turns, climbs and banks with every vehicle (cars, quads and boats too)" };
-                if (combo_arr("In vehicles, the view", &vm, kVeh, 4)) {
-                    m_vehicle_follow = vm != 0;
-                    m_air_follow     = vm >= 2;
-                    m_ground_follow  = vm == 3;
-                    keep("vehicles", vm != 0 ? "vehicles on" : "vehicles off");
-                    keep("airfollow", vm >= 2 ? "airfollow on" : "airfollow off");
-                    keep("groundfollow", vm == 3 ? "groundfollow on" : "groundfollow off");
+                bool fl = m_frame_lock.load() != 0;
+                if (ImGui::Checkbox("Even frame pacing##framelock", &fl)) {
+                    m_frame_lock                       = fl ? -1 : 0;
+                    runtimes::OpenXR::s_fc5_frame_lock = m_frame_lock.load();
+                    keep("framelock", fl ? "framelock auto" : "framelock off");
                 }
-                if (m_in_vehicle.load()) ImGui::TextDisabled("Now: %s", veh_flying() ? "flying" : m_chute_vehicle ? "under a parachute" : "on the ground");
-                hint("Turns with the vehicle: the cabin stays put around you and the road turns; stick turning pauses while you drive. When flying (a "
-                     "helicopter lifting off, a plane climbing or banking, a parachute) the view also climbs, dives, banks and loops with it, and you still "
-                     "look around freely; on the ground the horizon stays level and the cab tilts and bumps around you instead of the world. Every "
-                     "vehicle: cars, quads and boats tilt the whole view with each bump too (as before 24 Oct). Stays put: the view keeps its heading "
-                     "and the stick turns you, as on foot.");
-                draw_vehcomfort_menu(keep, hint, slider);   // vehvignette (FarCry5VehComfort.cpp)
-            }
-            bool vr2 = m_veh_auto_recenter.load();
-            if (ImGui::Checkbox("Recenter after getting in or out of a vehicle", &vr2)) {
-                m_veh_auto_recenter = vr2;
-                keep("vehrecenter", vr2 ? "vehrecenter on" : "vehrecenter off");
-            }
-            hint("Once the enter or exit animation is over, the view is recentred on where you look (like pressing Recenter).");
-            bool lr = m_load_recenter.load();
-            if (ImGui::Checkbox("Recenter when play starts after loading", &lr)) {
-                m_load_recenter = lr;
-                keep("loadrecenter", lr ? "loadrecenter on" : "loadrecenter off");
-            }
-            hint("After a loading screen that puts you somewhere else (a save, a respawn, fast travel), the view is recentred on where you look, "
-                 "your head height included. Pause menus and the map leave it as it is.");
-            bool hr = m_headset_recenter.load();
-            if (ImGui::Checkbox("Follow the headset's own recenter", &hr)) {
-                m_headset_recenter = hr;
-                keep("headsetrecenter", hr ? "headsetrecenter on" : "headsetrecenter off");
-            }
-            hint("Holding the Meta button (or Virtual Desktop's recenter) recentres the game view too, height included.");
-            bool ar = m_auto_recenter.load();
-            if (ImGui::Checkbox("Recenter when the headset strays from the centre", &ar)) {
-                m_auto_recenter = ar;
-                keep("autorecenter", ar ? "autorecenter on" : "autorecenter off");
-            }
-            hint("When your head stays further than the distance below from the centre (sideways or forwards; height does not count), "
-                 "the centre moves back under your head. Where you face stays as it is.");
-            if (ar) {
-                float ad = m_auto_recenter_dist.load();
-                if (slider("Recenter beyond", ad, 0.1f, 1.5f, "%.2f m", 0.05f)) {
-                    m_auto_recenter_dist = ad;
-                    keep("autorecenterdist", fmt::format("autorecenterdist {:.2f}", ad));
+                const int ln = runtimes::OpenXR::s_fc5_lock_n.load();
+                hint(fmt::format("Off by default (Homard 30 Oct). On (Homard 29 Oct: \"too juddery and janky for vr\"): every picture stays in the headset for the same number of refreshes. "
+                                 "When the game cannot make a picture every refresh at 90 Hz, it makes one every second refresh (45 a second), evenly, instead of "
+                                 "one or two refreshes in turn (the world stalls and jumps while you move). It goes back to 90 after a calm while, longer each "
+                                 "time it has to halve again soon after (up to a minute). Below 90 Hz it never halves. Now: {} refresh{} per "
+                                 "picture, {}% of pictures took longer than a refresh. Set Virtual Desktop to 72 Hz for AFW at a full, even rate.",
+                                 ln, ln == 1 ? "" : "es", runtimes::OpenXR::s_fc5_lock_over_pct.load()).c_str());
+                v = m_smooth_motion.load();
+                if (ImGui::Checkbox("Smooth walking and running##smoothmotion", &v)) {
+                    m_smooth_motion = v;
+                    keep("smoothmotion", v ? "smoothmotion on" : "smoothmotion off");
                 }
-                float aw = m_auto_recenter_wait.load();
-                if (slider("Recenter after", aw, 0.0f, 3.0f, aw < 0.05f ? "at once" : "%.1f s", 0.1f)) {
-                    m_auto_recenter_wait = aw;
-                    keep("autorecenterwait", fmt::format("autorecenterwait {:.1f}", aw));
+                hint("On (default; Homard 29 Oct): on foot, your position moves by the time each picture is shown in the headset, not by the game's uneven "
+                     "frame times and body updates, so walking and running glide instead of judder. It catches up quickly when you start, stop or turn. Your head's "
+                     "own movement and turning are not smoothed. Off: as before 29 Oct.");
+                v = m_body_view.load();
+                if (ImGui::Checkbox("Body-based view##bodyview", &v)) {
+                    bool saved = false;
+                    pivot_command("bodyview", v ? "on" : "off", saved);
+                    keep("bodyview", v ? "bodyview on" : "bodyview off");
                 }
-                hint("How long the head must stay beyond the distance first: a short lean out of cover does not recenter.");
+                hint("On (default; one switch since 29 Oct for five older ones): on foot your eyes stand on the player's body, not on the game's camera on "
+                     "the neck. Turning, raising or lowering the gun no longer swings the view, the game's up-and-down bob from each step is taken out "
+                     "(crouching, jumps, stairs and slopes still move you), and the body is read evenly while walking and running. Off: the eyes on the "
+                     "game's camera with its bob, as before 23 Oct.");
             }
-            bool vs = m_veh_stick.load();
-            if (ImGui::Checkbox("Vehicles: right stick turns a helicopter (left / right)", &vs)) {
-                m_veh_stick = vs;
-                keep("vehstick", vs ? "vehstick on" : "vehstick off");
+        }
+        if (ImGui::CollapsingHeader("Turning", ImGuiTreeNodeFlags_DefaultOpen)) {
+            v = m_snap_turn.load();
+            if (ImGui::Checkbox("Snap turn (right stick)", &v)) {
+                m_snap_turn = v;
+                keep("snapturn", v ? "snapturn on" : "snapturn off");
             }
-            hint("While piloting with head look the right stick's left / right goes to the game, which turns the helicopter (the head no longer does).");
-            bool vfd = m_veh_fade.load();
-            if (ImGui::Checkbox("Vehicles: fade to black while getting in or out", &vfd)) {
-                m_veh_fade = vfd;
-                keep("vehfade", vfd ? "vehfade on" : "vehfade off");
+            hint("Turns in steps instead of smoothly: easier on the stomach.");
+            if (m_snap_turn.load()) {
+                int deg = (int)std::lround(m_snap_deg.load());
+                if (slider_int("Snap angle", deg, 15, 90, "%d deg", 5)) {
+                    m_snap_deg = (float)deg;
+                    keep("snapdeg", fmt::format("snapdeg {}", deg));
+                }
+            } else {
+                float ts = m_turn_speed.load();
+                if (slider("Smooth turn speed", ts, 30.0f, 360.0f, "%.0f deg/s", 10.0f)) m_turn_speed = ts;
             }
-            hint("Black during the enter / exit animation, until the game draws around where you look again (at most 1 s after the animation).");
+        }
+        if (ImGui::CollapsingHeader("Weapon")) {
+            v = m_gun_still.load();
+            if (ImGui::Checkbox("Gun moves only for reloads (no running, firing or vehicle animation)", &v)) {
+                m_gun_still = v;
+                keep("gunstill", v ? "gunstill on" : "gunstill off");
+            }
+            hint("The gun stays still in your hand: the game's running bob, sprint pose, recoil kick and bumps in vehicles no longer move it. Reloads still play "
+                 "(magazines and hands move as the game animates them). Each weapon's pose is learned the first time you stand still with it. Off: the game's animation.");
+            if (m_gun_still.load() && ImGui::Button("A gun sits at a wrong angle: learn every gun's pose again")) {
+                if (m_gst) gun_still_forget();
+            }
+            hint("Hold the weapon in your hand and stand still for 3 s afterwards: its pose is taken from the game again.");
+            if (m_gun_still.load()) {
+                // "Stereo: both eyes show the same gun" (gunstillpair) and "Both eyes: the gun placed exactly" (gunstilllate): in Debug > Hands and
+                // weapon (Homard 24 Oct).
+                static const char* kFire[]{ "held still (no firing animation)", "held, only a recoil kick", "the game's firing animation (before 24 Oct)" };
+                const int          fm = m_gst_fire.load();
+                int                fi = fm == 2 ? 1 : fm == 0 ? 2 : 0;
+                if (combo_arr("While firing, the gun is", &fi, kFire, 3)) {
+                    m_gst_fire = fi == 1 ? 2 : fi == 2 ? 0 : 1;
+                    keep("gunstillfire", fi == 1 ? "gunstillfire kick" : fi == 2 ? "gunstillfire game" : "gunstillfire hold");
+                }
+                hint("gunstillfire. Held still (default): the gun stays where your hand holds it while you fire too; nothing of the game's firing stance, its way out of "
+                     "the sprint pose or its recoil moves it. Only a recoil kick: the same, plus a short kick back and up taken from the game's own recoil. "
+                     "The game's: the fast part of all the game does with the gun while firing shows (before 24 Oct).");
+            }
+        }
+        if (ImGui::CollapsingHeader("Cinematics and vehicles")) {
+            {
+                static const char* kCine[]{ "Flat screen in the room", "3D, steadied (level, heading held, bob smoothed)", "Unchanged" };
+                int                cm = std::clamp(m_cine_mode.load(), 0, 2);
+                if (combo_arr("Cinematics (cutscenes)", &cm, kCine, 3)) {
+                    m_cine_mode = cm;
+                    keep("cinematics", cm == 1 ? "cinematics 3d" : cm == 2 ? "cinematics off" : "cinematics flat");
+                }
+                hint("Scripted camera moves can make you queasy: show them on a big screen in the room, or keep them in 3D with the horizon held level.");
+                float cd = m_cine_delay.load();
+                if (slider("Cutscene starts after", cd, 0.0f, 8.0f, cd < 0.05f ? "at once (old)" : "%.1f s", 0.5f)) {
+                    m_cine_delay = cd;
+                    keep("cinedelay", fmt::format("cinedelay {:.1f}", cd));
+                }
+                hint("Takedowns take the camera for about 2 s, like a cutscene: anything shorter than this stays in 3D. Real cutscenes then start on the screen this much later.");
+                bool cs = m_cine_steer.load();
+                if (ImGui::Checkbox("3D cutscenes: turn with the scene's camera on cuts and big turns", &cs)) {
+                    m_cine_steer = cs;
+                    keep("cinesteer", cs ? "cinesteer on" : "cinesteer off");
+                }
+                hint("cinesteer. On (default): the horizon stays level and you look around freely; on a camera cut you face the new shot at once, and when the "
+                     "scene's camera turns further than the start angle the view is turned round smoothly. Small camera motion is not followed. "
+                     "While on, the next option has no effect.");
+                if (cs) {
+                    ImGui::Indent(24.0f);
+                    float ss = m_cine_steer_start.load();
+                    if (slider("Turn when the camera is this far round", ss, 10.0f, 90.0f, "%.0f deg", 5.0f)) {
+                        m_cine_steer_start = ss;
+                        keep("cinesteerstart", fmt::format("cinesteerstart {:.0f}", ss));
+                    }
+                    float st = m_cine_steer_time.load();
+                    if (slider("Turn time", st, 0.3f, 3.0f, "%.1f s", 0.1f)) {
+                        m_cine_steer_time = st;
+                        keep("cinesteertime", fmt::format("cinesteertime {:.1f}", st));
+                    }
+                    ImGui::Unindent(24.0f);
+                }
+                bool cf = m_cine_follow.load();
+                if (ImGui::Checkbox("3D cutscenes: look where the scene's camera looks", &cf)) {
+                    m_cine_follow = cf;
+                    keep("cinefollow", cf ? "cinefollow on" : "cinefollow off");
+                }
+                hint("The game only draws what its camera sees: off, the view keeps its heading and the scene can turn away from you into empty ground. "
+                     "No effect while 'turn with the scene's camera on cuts and big turns' is on.");
+                {
+                    // One choice for vehicles + airfollow + groundfollow (Homard 24 Oct: "In vehicles the view turns with the vehicle" and Debug's
+                    // "Vehicles: the view follows the vehicle's movement" brought together). airfollow without vehicles was a conflict: on the
+                    // ground the view kept its own heading (stick turning on) and on lift-off it swung onto the vehicle's attitude, heading
+                    // included, then back on landing; air_follow_now needs vehicles too now. Same commands and saved lines as before.
+                    const bool vf = m_vehicle_follow.load(), af = m_air_follow.load(), gf = m_ground_follow.load();
+                    int        vm = !vf ? 0 : !af ? 1 : gf ? 3 : 2;
+                    static const char* kVeh[]{ "Stays put (the stick turns you)", "Turns with the vehicle, horizon always level",
+                                               "Turns with the vehicle; climbs, dives and banks with it when flying (default)",
+                                               "Turns, climbs and banks with every vehicle (cars, quads and boats too)" };
+                    if (combo_arr("In vehicles, the view", &vm, kVeh, 4)) {
+                        m_vehicle_follow = vm != 0;
+                        m_air_follow     = vm >= 2;
+                        m_ground_follow  = vm == 3;
+                        keep("vehicles", vm != 0 ? "vehicles on" : "vehicles off");
+                        keep("airfollow", vm >= 2 ? "airfollow on" : "airfollow off");
+                        keep("groundfollow", vm == 3 ? "groundfollow on" : "groundfollow off");
+                    }
+                    if (m_in_vehicle.load()) ImGui::TextDisabled("Now: %s", veh_flying() ? "flying" : m_chute_vehicle ? "under a parachute" : "on the ground");
+                    hint("Turns with the vehicle: the cabin stays put around you and the road turns; stick turning pauses while you drive. When flying (a "
+                         "helicopter lifting off, a plane climbing or banking, a parachute) the view also climbs, dives, banks and loops with it, and you still "
+                         "look around freely; on the ground the horizon stays level and the cab tilts and bumps around you instead of the world. Every "
+                         "vehicle: cars, quads and boats tilt the whole view with each bump too (as before 24 Oct). Stays put: the view keeps its heading "
+                         "and the stick turns you, as on foot.");
+                    draw_vehcomfort_menu(keep, hint, slider);   // vehvignette (FarCry5VehComfort.cpp)
+                    draw_planelook_menu(keep, hint);            // planelook (FarCry5PlaneLook.cpp)
+                }
+                bool vr2 = m_veh_auto_recenter.load();
+                if (ImGui::Checkbox("Recenter after getting in or out of a vehicle", &vr2)) {
+                    m_veh_auto_recenter = vr2;
+                    keep("vehrecenter", vr2 ? "vehrecenter on" : "vehrecenter off");
+                }
+                hint("Once the enter or exit animation is over, the view is recentred on where you look (like pressing Recenter).");
+                bool lr = m_load_recenter.load();
+                if (ImGui::Checkbox("Recenter when play starts after loading", &lr)) {
+                    m_load_recenter = lr;
+                    keep("loadrecenter", lr ? "loadrecenter on" : "loadrecenter off");
+                }
+                hint("After a loading screen that puts you somewhere else (a save, a respawn, fast travel), the view is recentred on where you look, "
+                     "your head height included. Pause menus and the map leave it as it is.");
+                bool hr = m_headset_recenter.load();
+                if (ImGui::Checkbox("Follow the headset's own recenter", &hr)) {
+                    m_headset_recenter = hr;
+                    keep("headsetrecenter", hr ? "headsetrecenter on" : "headsetrecenter off");
+                }
+                hint("Holding the Meta button (or Virtual Desktop's recenter) recentres the game view too, height included.");
+                bool ar = m_auto_recenter.load();
+                if (ImGui::Checkbox("Recenter when the headset strays from the centre", &ar)) {
+                    m_auto_recenter = ar;
+                    keep("autorecenter", ar ? "autorecenter on" : "autorecenter off");
+                }
+                hint("When your head stays further than the distance below from the centre (sideways or forwards; height does not count), "
+                     "the centre moves back under your head. Where you face stays as it is.");
+                if (ar) {
+                    float ad = m_auto_recenter_dist.load();
+                    if (slider("Recenter beyond", ad, 0.1f, 1.5f, "%.2f m", 0.05f)) {
+                        m_auto_recenter_dist = ad;
+                        keep("autorecenterdist", fmt::format("autorecenterdist {:.2f}", ad));
+                    }
+                    float aw = m_auto_recenter_wait.load();
+                    if (slider("Recenter after", aw, 0.0f, 3.0f, aw < 0.05f ? "at once" : "%.1f s", 0.1f)) {
+                        m_auto_recenter_wait = aw;
+                        keep("autorecenterwait", fmt::format("autorecenterwait {:.1f}", aw));
+                    }
+                    hint("How long the head must stay beyond the distance first: a short lean out of cover does not recenter.");
+                }
+                bool vs = m_veh_stick.load();
+                if (ImGui::Checkbox("Vehicles: right stick turns a helicopter (left / right)", &vs)) {
+                    m_veh_stick = vs;
+                    keep("vehstick", vs ? "vehstick on" : "vehstick off");
+                }
+                hint("While piloting with head look the right stick's left / right goes to the game, which turns the helicopter (the head no longer does).");
+                bool hp = m_heli_pitch.load();
+                if (ImGui::Checkbox("Helicopter: right stick up / down pitches the nose", &hp)) {
+                    m_heli_pitch = hp;
+                    keep("helipitch", hp ? "helipitch on" : "helipitch off");
+                }
+                hint("Piloting a helicopter the right stick's up / down goes to the game as its own right stick (pushed forward = nose down, "
+                     "pulled back = nose up). Moving forward / back stays on the left stick. Off: the right stick's up / down does nothing, as before.");
+                bool sv = m_stick_view.load();
+                if (ImGui::Checkbox("Vehicles: the right stick never moves the view", &sv)) {
+                    m_stick_view = sv;
+                    keep("stickview", sv ? "stickview on" : "stickview off");
+                }
+                hint("The right stick reaches the game only in a helicopter or a plane, where it steers the aircraft; in cars, quads and boats it does "
+                     "nothing. Flying, the view hangs on the aircraft's body from take-off (not on the game's camera, which the stick turns first). "
+                     "Takes effect at the next get-in. Off: as before.");
+                bool vfd = m_veh_fade.load();
+                if (ImGui::Checkbox("Vehicles: fade to black while getting in or out", &vfd)) {
+                    m_veh_fade = vfd;
+                    keep("vehfade", vfd ? "vehfade on" : "vehfade off");
+                }
+                hint("Black during the enter / exit animation, until the game draws around where you look again (at most 1 s after the animation).");
+                bool vdg = m_veh_drive_gun.load();
+                if (ImGui::Checkbox("Vehicles: drawing the sidearm while driving, still driving##vehdrivegun", &vdg)) {
+                    m_veh_drive_gun = vdg;
+                    keep("vehdrivegun", vdg ? "vehdrivegun on" : "vehdrivegun off");
+                }
+                hint("vehdrivegun. On (default; Homard 30 Oct: \"I was not able to accelerate on the quad\"): the right trigger while driving is the game's driver fire, "
+                     "which draws the sidearm; the mod took the gun showing for a change to a passenger seat, so the left trigger stopped accelerating until the gun was put "
+                     "away. Now the game's own seat decides when it answers (its driver drives, gun out or not; its passenger rides); while it does not (getting in), a "
+                     "gun that shows within 1.5 s of that right trigger press is the driver's sidearm: you stay the driver until you leave the vehicle. Off: as before.");
+                draw_downview_menu(keep, hint);   // downview (FarCry5DownView.cpp)
+                bool vcm = m_chute_min.load();
+                if (ImGui::Checkbox("Parachute and falls: a jump off a balcony is not a parachute##chutemin", &vcm)) {
+                    m_chute_min = vcm;
+                    keep("chutemin", vcm ? "chutemin on" : "chutemin off");
+                }
+                hint("chutemin. On (default; Homard 30 Oct: \"a lot of false parachute detection from jumping balcony\"): a fall is held as a parachute (the view following the chute) only when you are still falling 0.8 s after the fall is seen, and, while the game says you are in the air, once that has lasted 1.5 s (a long free fall). A balcony jump has landed by then. Off: as before (a balcony jump held the view for 3-7 s).");
+                bool vcl = m_chute_land.load();
+                if (ImGui::Checkbox("Parachute and falls: hand the view back within a second of landing##chuteland", &vcl)) {
+                    m_chute_land = vcl;
+                    keep("chuteland", vcl ? "chuteland on" : "chuteland off");
+                }
+                hint("chuteland. On (default; Homard 30 Oct: \"It took a long time after my parachute until the game settle back on the actual camera\"): "
+                     "a parachute or fall counts as landed once the camera has not sunk faster than 1.6 m/s for 0.7 s (an open chute sinks about 2 m/s), "
+                     "also while you run on down a slope. Off: as before (3 s in a row sinking under 1 m/s, which running downhill kept restarting: up to 10 s).");
+                bool vco = m_chute_open.load();
+                if (ImGui::Checkbox("Parachute and wingsuit: the view stays put when the chute opens##chuteopen", &vco)) {
+                    m_chute_open = vco;
+                    keep("chuteopen", vco ? "chuteopen on" : "chuteopen off");
+                }
+                hint("chuteopen. On (default; Homard 30 Oct 13:25: \"parachute still have culling when they open\"): the game says wingsuit (or parachute) from the "
+                     "jump until you touch down, also with the chute open. All that time the view is held as a parachute: no recentre or turn when the wingsuit "
+                     "opens, none when the chute opens (it was taken for getting out of a vehicle: a 2-3 s wait with the culled camera 30-90 deg off), and "
+                     "the game draws where you look (also with the falls box off). When the game says the wingsuit is over on the ground, you have landed: "
+                     "the normal view at once. Off: as before.");
+                bool vcg = m_chute_ground.load();
+                if (ImGui::Checkbox("Parachute and falls: a jump ends when the game says you are on the ground##chuteground", &vcg)) {
+                    m_chute_ground = vcg;
+                    keep("chuteground", vcg ? "chuteground on" : "chuteground off");
+                }
+                hint("chuteground. On (default; Homard 30 Oct: \"The parachute was still on for too long once on the ground if I kept running downhill\"): "
+                     "a jump or fall with no wingsuit or parachute ends a quarter second after the game says you are on the ground, even running on downhill "
+                     "(today's jumps were held 4-9 s after touching down). Off: as before.");
+                bool vcp = m_chute_probe.load();
+                if (ImGui::Checkbox("Parachute: log what is drawn above you while falling (test)##chuteprobe", &vcp)) {
+                    m_chute_probe = vcp;
+                    keep("chuteprobe", vcp ? "chuteprobe on" : "chuteprobe off");
+                }
+                hint("chuteprobe (log only). On (for now): while falling or under a wingsuit or chute, each new draw within 8 m is written to the log once, to find "
+                     "the canopy's own draw. Nothing on screen changes.");
+            }
         }
         // World scale: in Display (Homard 24 Oct).
         ImGui::EndChild();
@@ -18514,35 +19815,58 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                 ImGui::EndTable();
             }
         };
-        section("Right controller");
-        static const char* const kRight[][3]{ { "Trigger", "Fire", "Throttle" },
-                                              { "Grip", "Hold the weapon (sling on)", "Brake / reverse" },
-                                              { "A", "Jump", "Change seat" },
-                                              { "B", "Previous weapon / hold: heal", "Change weapon / hold: heal" },
-                                              { "Stick", "Turn (left / right); in the weapon wheel: pick a slot", "Nothing (the head looks); helicopter with head look: turn" },
-                                              { "Stick click", "Melee / takedown", "Horn" } };
-        table("right", kRight, 6);
-        section("Left controller");
-        static const char* const kLeft[][3]{ { "Trigger", "Weapon wheel (hold, pick with the right stick)", "Shoot" },
-                                             { "X", "Crouch / slide", "Handbrake" },
-                                             { "Y", "Reload / hold: use", "Hold: get in / out" },
-                                             { "Stick", "Move", "Steer" },
-                                             { "Stick click", "Sprint", "Auto-drive" },
-                                             { "Menu button", "Pause", "Pause" } };
-        table("left", kLeft, 6);
-        section("Left grip held (not on the weapon)");
-        static const char* const kGrip[][3]{ { "+ either stick", "D-pad: up binoculars, left / right companion orders, down throw rock", "D-pad: up radio" },
-                                             { "+ right B", "Throw (RB)", "Throw" },
-                                             { "+ menu button", "Map", "Map" },
-                                             { "+ left stick click", "Flat screen on / off", "Flat screen on / off" } };
-        table("grip", kGrip, 4);
-        section("Gestures");
-        static const char* const kGesture[][3]{ { "Right hand at the right shoulder + grip", "Switch weapon", "-" },
-                                                { "Right hand on the slung weapon + grip held", "Weapon in hand (let go: back on the sling)", "-" } };
-        table("gesture", kGesture, 2);
-        hint("Holding the weapon with two hands (left grip at the fore-end) does not count as the modifier. Thumbrest and trigger touches do nothing. "
-             "Gestures work on foot only. Both stick clicks open and close this menu. In this menu: point and press A or the trigger, right stick up / down scrolls, left / right "
-             "nudges the slider under the pointer. Keys: F6 capture, F7 motion controls, F8 Stereo / AFW, F9 recenter, F11 this menu, F12 flat screen.");
+        const bool vt_on = m_veh_triggers.load();
+        if (ImGui::CollapsingHeader("Vehicles")) {
+            {
+                // vehtriggers (FarCry5VehTransition.cpp; Homard 29 Oct: the right trigger fired on foot but accelerated in vehicles).
+                bool vt = m_veh_triggers.load();
+                if (ImGui::Checkbox("Driving: the left hand drives, the right hand shoots", &vt)) {
+                    m_veh_triggers = vt;
+                    keep("vehtriggers", vt ? "vehtriggers left" : "vehtriggers right");
+                }
+                hint("On (default): in the driver's or pilot's seat the right trigger shoots (the game draws your sidearm and fires it, or fires the vehicle's guns, "
+                     "where the game camera aims), the left trigger is the throttle (planes: throttle up; helicopters: up) and the left grip the brake / reverse "
+                     "(planes: throttle down; helicopters: down). The right grip is free for holding the weapon. The left grip's combos still work (+ right stick: D-pad, "
+                     "+ right B: throw or rockets, + menu: map; they stop the braking until you let go), and the left stick keeps steering while you brake. "
+                     "Passengers shoot as on foot. A trigger or grip held when you get in or out does nothing until you let go. "
+                     "Off: as before 29 Oct (right trigger throttle, right grip brake, left trigger shoots).");
+            }
+        }
+        if (ImGui::CollapsingHeader("Right controller")) {
+            const char* const kRight[][3]{ { "Trigger", "Fire", vt_on ? "Shoot (driving)" : "Throttle" },
+                                           { "Grip", "Hold the weapon (sling on)", vt_on ? "Hold the weapon" : "Brake / reverse" },
+                                           { "A", "Jump", "Change seat" },
+                                           { "B", "Previous weapon / hold: heal; on a tutorial pop-up: close it (Esc)", "Change weapon / hold: heal" },
+                                           { "Stick", "Turn (left / right); in the weapon wheel: pick a slot", "Nothing (the head looks); helicopter with head look: turn" },
+                                           { "Stick click", "Melee / takedown", "Horn" } };
+            table("right", kRight, 6);
+        }
+        if (ImGui::CollapsingHeader("Left controller")) {
+            const char* const kLeft[][3]{ { "Trigger", "Weapon wheel (hold, pick with the right stick)", vt_on ? "Throttle (driving)" : "Shoot" },
+                                          { "X", "Crouch / slide", "Handbrake" },
+                                          { "Y", "Reload / hold: use", "Hold: get in / out" },
+                                          { "Stick", "Move", "Steer" },
+                                          { "Stick click", "Sprint", "Auto-drive" },
+                                          { "Menu button", "Pause", "Pause" } };
+            table("left", kLeft, 6);
+        }
+        if (ImGui::CollapsingHeader("Left grip held (not on the weapon)")) {
+            const char* const kGrip[][3]{ { "Alone", "-", vt_on ? "Brake / reverse (driving)" : "-" },
+                                          { "+ either stick", "D-pad: up binoculars, left / right companion orders, down throw rock",
+                                            vt_on ? "Right stick only (the left one steers): D-pad, up radio" : "D-pad: up radio" },
+                                          { "+ right B", "Throw (RB)", "Throw; aircraft: rockets" },
+                                          { "+ menu button", "Map", "Map" },
+                                          { "+ left stick click", "Flat screen on / off", "Flat screen on / off" } };
+            table("grip", kGrip, 5);
+        }
+        if (ImGui::CollapsingHeader("Gestures")) {
+            static const char* const kGesture[][3]{ { "Right hand at the right shoulder + grip", "Switch weapon", "-" },
+                                                    { "Right hand on the slung weapon + grip held", "Weapon in hand (let go: back on the sling)", "-" } };
+            table("gesture", kGesture, 2);
+            hint("Holding the weapon with two hands (left grip at the fore-end) does not count as the modifier. Thumbrest and trigger touches do nothing. "
+                 "Gestures work on foot only. Both stick clicks open and close this menu. In this menu: point and press A or the trigger, right stick up / down scrolls, left / right "
+                 "nudges the slider under the pointer. Keys: F6 capture, F7 motion controls, F8 Stereo / AFW, F9 recenter, F11 this menu, F12 flat screen.");
+        }
         ImGui::EndChild();
         ImGui::EndTabItem();
     }
@@ -18551,8 +19875,9 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
         tab_body_begin();
         // Experiments (Homard 2026-10-14): off by default or unfinished. Every switch keeps its command and saved setting.
         ImGui::TextDisabled("Off by default or unfinished. Turn on one at a time and compare.");
-        draw_fc2vr_menu(keep, hint, section);   // Research for alternatives (test): skelhand, skinpose, bulletaim (FarCry5Fc2Vr.cpp)
-        draw_throw_v2_menu(keep, hint, section);   // Throwables (test): throwv2 (FarCry5Throwable.cpp)
+        // "Research for alternatives (test)" (skelhand, skinpose, bulletaim) removed with its code (Homard 30 Oct).
+        // Throwables (throwv2, the pouch) and the weapon taken from the shoulder (shoulderdraw): in F11 Gestures (Homard 29 Oct 14:01).
+        if (ImGui::CollapsingHeader("Weapon switch (test)")) fc5::switchspeed::draw_menu(m_ui_cmds, hint);   // switchfast (FarCry5SwitchSpeed.cpp)
         auto rtoggle = [&](const char* label, bool cur, const char* key, auto&& set, const char* help) {
             bool b = cur;
             if (ImGui::Checkbox(label, &b)) {
@@ -18564,13 +19889,15 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             }
             hint(help);
         };
-        rtoggle("Hands open, fingers close while you hold the grip", m_finger_grip.load(), "fingergrip", [&](bool b) { m_finger_grip = b; },
-                "On (19 Oct): a hand that follows its controller (the free left hand, the right hand with the weapon on the sling) is open. "
-                "Grip: the hand closes as it holds the weapon, index pointing. Grip + trigger: closed, index too. The index and thumb also follow "
-                "your real ones (finger resting on the trigger, thumb on a button, the thumbrest or the stick). A hand on the weapon keeps the game's grip. "
-                "Off: the game's pose.");
-        rtoggle("Hands: index and thumb on the other side", m_finger_swap.load(), "fingerswap", [&](bool b) { m_finger_swap = b; m_hand_frames_reset = true; },
-                "If another finger than the index points (or the thumb is a finger), tick this: the mod picked the wrong side of the hand.");
+        if (ImGui::CollapsingHeader("Hands (test)")) {
+            rtoggle("Hands open, fingers close while you hold the grip", m_finger_grip.load(), "fingergrip", [&](bool b) { m_finger_grip = b; },
+                    "On (19 Oct): a hand that follows its controller (the free left hand, the right hand with the weapon on the sling) is open. "
+                    "Grip: the hand closes as it holds the weapon, index pointing. Grip + trigger: closed, index too. The index and thumb also follow "
+                    "your real ones (finger resting on the trigger, thumb on a button, the thumbrest or the stick). A hand on the weapon keeps the game's grip. "
+                    "Off: the game's pose.");
+            rtoggle("Hands: index and thumb on the other side", m_finger_swap.load(), "fingerswap", [&](bool b) { m_finger_swap = b; m_hand_frames_reset = true; },
+                    "If another finger than the index points (or the thumb is a finger), tick this: the mod picked the wrong side of the hand.");
+        }
         if (ImGui::CollapsingHeader("Optimisation")) {
             // Pipeline review 2026-10-10 (VRMod_dev\research\fc5_pipeline_review_improvements.md). Every switch starts off
             // (the build behaves as before); a switch turned on is saved.
@@ -18643,16 +19970,6 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                   "Needs Screen-space reflections on. The reflection passes get the game's motion, which leaves out your walk and head sway: near "
                   "reflections at the bank land beside their place (ghost reeds). On: they get the same exact per-eye motion as the shadow test above.");
             section("Clarity");
-            {
-                bool xh = m_xr_half.load();
-                if (ImGui::Checkbox("Steady 45 frames a second at 90 Hz (Stereo, test)", &xh)) {
-                    m_xr_half                         = xh;
-                    runtimes::OpenXR::s_fc5_xr_half   = xh && !afw_mode();
-                    keep("xrhalf", xh ? "xrhalf on" : "xrhalf off");
-                }
-                hint("Stereo shows about 30% of its pictures once and 70% twice at 90 Hz, uneven. On: every picture is shown exactly twice (a locked 45). "
-                     "Compare foliage while turning; the headset's own frame rate overlay should read a flat 45.");
-            }
             {
                 int ph = fc5::dlss::dlaa_phases() >= 16 ? 1 : 0;
                 if (combo("DLAA jitter phases", &ph, "8 (as before)\0" "16 (NVIDIA's guidance)\0")) {
@@ -18740,6 +20057,10 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             ImGui::SameLine();
             ImGui::TextDisabled("(%llu fixes)", (unsigned long long)m_tile_light_fixes);
             hint("Off: sunlight, bounce light and shadows use the game camera's positions (black walls and ground that differ per eye).");
+            v = fc5::locallights::enabled();
+            if (ImGui::Checkbox("Lamps and their shadows placed for each eye", &v)) fc5::locallights::command("lampeye", 0.0f, v);
+            hint("Indoor lamps and the shadows they cast are given to the lighting relative to the game camera. Off: each eye "
+                 "sees every lamp, its light pool and its shadows shifted by that eye's offset, so interior shadows differ between the eyes.");
             v = m_eye_gi_volumes.load();
             if (ImGui::Checkbox("Indoor lighting and tiled lights placed with each eye's view", &v)) m_eye_gi_volumes = v;
             ImGui::SameLine();
@@ -18816,19 +20137,6 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                   "From Far Cry 3 VR: the game can hide water and objects from the result of a visibility test drawn earlier, which with two eyes per "
                   "frame can be the other eye's or a frame late (a dark bar popping on and off while turning). On: every such test answers "
                   "\"visible\". Costs a little frame rate. The log's \"water:\" line shows whether the game uses these tests at all.");
-            xtoggle("Soften the white rim at the water's edge", m_shore_blur, "shoreblur",
-                  "The pale stepped line where the water meets the bank is the game's own (the untouched game shows it too), drawn from coarse lake "
-                  "images; the headset makes it bigger and sharper. On: only pale pixels at the water's edge, brighter than the water next to them, take the water's colour; grass and the bank stay sharp.");
-            if (m_shore_blur.load()) {
-                ImGui::Indent(24.0f);
-                float px = m_shore_blur_px.load();
-                if (slider("Rim width", px, 1.0f, 8.0f, "%.0f px", 1.0f)) {
-                    m_shore_blur_px = px;
-                    keep("shoreblurpx", fmt::format("shoreblurpx {:.0f}", px));
-                }
-                hint("How far from the water's edge pale pixels are corrected, in eye pixels. Wider catches a thicker rim.");
-                ImGui::Unindent(24.0f);
-            }
             v = m_lake_eye.load();
             if (ImGui::Checkbox("Lake water normals rebuilt for each eye", &v)) m_lake_eye = v;
             ImGui::SameLine();
@@ -18874,6 +20182,14 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             hint("The reflection pass does not redraw every part of the picture each frame. On: those parts start with no reflection. Off: they keep "
                  "whatever was in the picture, often the other eye's (a 16 px square in one eye at the waterline). Before 19 Oct a separate "
                  "switch kept this eye's last picture there instead, which stuck squares to the screen on wet roads and glossy crates.");
+            v = m_ssr_retry.load();
+            if (ImGui::Checkbox("Reflections follow each eye's own movement from the start (no jitter while turning)", &v)) { m_ssr_retry = v; keep("ssrretry", v ? "ssrretry on" : "ssrretry off"); }
+            ImGui::SameLine();
+            ImGui::TextDisabled(m_ssr_form >= 0 ? "(found)" : "(not found yet)");
+            hint("Reflections are blended over frames, and each eye's earlier frames are moved by that eye's own head movement once the mod "
+                 "has recognised how the game stores that movement. Off: the old search, which could take minutes or give up for good "
+                 "after the map was open (28 Oct: reflections jittering on the lake while turning). On: searched in both eyes' frames, "
+                 "not while the map or a menu is shown, and again later if not found.");
         }
         if (ImGui::CollapsingHeader("Fog, blood and other effects")) {
             v = m_sky_eye.load();
@@ -18962,6 +20278,14 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                 hint("Some objects (a parked tractor's harrow) carry motion in the game's data while standing still, so DLSS put their "
                      "history beside them (smear). On: an object's own motion is used only where each eye's previous depth confirms it moved. "
                      "Needs the switch above.");
+                bool sw = fc5::dlss::motion_sway() > 0.0f;
+                if (ImGui::Checkbox("DLSS follows leaves and grass swaying in the wind (test)", &sw)) {
+                    fc5::dlss::set_motion_sway(sw ? 0.5f : 0.0f);
+                    keep("dlssmvsway", sw ? "dlssmvsway on" : "dlssmvsway off");
+                }
+                hint("Off: the game's own motion of swaying leaves and grass under 2 px a frame was dropped, so DLSS blended each leaf with "
+                     "where it had been: foliage smeared even standing still. On: their motion counts from 0.5 px. Needs the first switch above. "
+                     "Command dlssmvsway on/off/<px>.");
             }
             v = m_taa_mv.load();
             if (ImGui::Checkbox("Game TAA follows each eye's exact movement", &v)) { m_taa_mv = v; keep("taamv", v ? "taamv on" : "taamv off"); }
@@ -19041,6 +20365,13 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                     keep("snapready", v ? "snapready on" : "snapready off");
                 }
                 hint("With a weapon in hand the game's aim stays on the barrel; on: a snap turn waits for the game camera there too (not while the trigger is held). Off: as before 23 Oct.");
+                v = m_snap_stick.load();
+                if (ImGui::Checkbox("Snap turn: no pop-in with the stick aim picked by hand too", &v)) {
+                    m_snap_stick = v;
+                    keep("snapstick", v ? "snapstick on" : "snapstick off");
+                }
+                hint("With Debug > Hands and weapon > Aim through the pad's right stick ticked, a snap turn still goes to the game camera through the mouse "
+                     "and the view waits for it. Off: as before 28 Oct (the view turns at once and the stick catches the game camera up over a fraction of a second).");
                 bool cs = m_cine_strict.load();
                 if (ImGui::Checkbox("Stricter cutscene detection", &cs)) {
                     m_cine_strict = cs;
@@ -19090,13 +20421,47 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                     m_veh_playerfov = vpf;
                     keep("vehplayerfov", vpf ? "vehplayerfov on" : "vehplayerfov off");
                 }
-                hint("The game draws vehicles 65-99 deg wide, so buildings and props pop at the sides. On: in a vehicle the mod asks the game itself (its own SetPlayerFOV) for 120 deg. The game keeps that afterwards: if aiming down sights or a scope stops zooming, untick this and restart the game.");
-                bool vcl = m_chute_look.load();
+                hint("The game draws vehicles 65-99 deg wide, so buildings and props pop at the sides. On: in a vehicle the mod asks the game itself (its own SetPlayerFOV) for 120 deg. The game keeps that afterwards: if aiming down sights or a scope stops zooming, untick this and restart the game.");                bool vcl = m_chute_look.load();
                 if (ImGui::Checkbox("Parachute and falls: the game draws where you look", &vcl)) {
                     m_chute_look = vcl;
                     keep("chutelook", vcl ? "chutelook on" : "chutelook off");
                 }
                 hint("Falling or under a parachute the game's camera follows the chute and ignores the mouse: the head look turns it onto your head instead, and the view no longer jumps when the chute is taken for a vehicle for a moment.");
+                bool vlv = m_chute_level.load();
+                if (ImGui::Checkbox("Parachute and falls: the horizon stays level", &vlv)) {
+                    m_chute_level = vlv;
+                    keep("chutelevel", vlv ? "chutelevel on" : "chutelevel off");
+                }
+                hint("On (default; Homard 29 Oct: \"the camera became weird when looking down\" after bailing out of the plane): falling or under a parachute the view turns "
+                     "with the chute's heading only. The game's falling camera points at the ground, and the view used to tilt with it (about 50 deg). Off: the view also "
+                     "takes the fall's pitch and roll, as before 29 Oct.");
+                bool vdf = m_downed_foot.load();
+                if (ImGui::Checkbox("Knocked down: stay on foot##downedfoot", &vdf)) {
+                    m_downed_foot = vdf;
+                    keep("downedfoot", vdf ? "downedfoot on" : "downedfoot off");
+                }
+                hint("On (default; Homard 29 Oct: \"a lot of camera bug (after being down and revived)\"): the mod takes the hands' view going away as getting into "
+                     "a vehicle only when a vehicle's model is within 4 m or the camera moves faster than 3 m/s, so being knocked down, a death or an animation "
+                     "no longer turns, recentres and tilts the view like a car. On foot, a drop or rise of the camera over 0.5 m (knocked down, getting up) "
+                     "reaches the eyes at once. Off: as before.");
+                bool vsc = m_veh_script.load();
+                if (ImGui::Checkbox("Vehicles: ask the game##vehscript", &vsc)) {
+                    m_veh_script = vsc;
+                    keep("vehscript", vsc ? "vehscript on" : "vehscript off");
+                }
+                hint("On (default; Homard 29 Oct: \"go to game-script route\"): whether you are in a vehicle comes from the game itself (the GetPawnVehicle its "
+                     "scripts use, asked several times a second), not from the hands going away, so getting in and out is seen at once and being knocked down, "
+                     "a death or an animation is never taken for a car. Falls and parachutes are as before. When the game gives no answer, the rules above decide. "
+                     "Off: only the rules above.");
+                bool gst = m_gamestate.load();
+                if (ImGui::Checkbox("Log the game's own state (test)##gamestate", &gst)) {
+                    m_gamestate = gst;
+                    keep("gamestate", gst ? "gamestate on" : "gamestate off");
+                }
+                hint("Log only, changes nothing in play (Homard 30 Oct: the play session for the engine research). On: fc5vr_log.txt gets a "
+                     "[GameState] line whenever the game's own state changes: vehicle and its type (car, boat, parachute, motorcycle, helicopter, "
+                     "plane, wingsuit), seat, stance, takedown (QTE), knocked down, dead, in the air, in water, the active camera, the pause "
+                     "byte (menus and map), and the game's scripts starting or stopping cutscenes. Kept on across restarts until switched off.");
             }
         }
         if (ImGui::CollapsingHeader("Hands and weapon")) {
@@ -19104,8 +20469,20 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                 // Moved here from Controls > Body (Homard 21 Oct 19:00: it changed nothing for the prompts' icons and brought the
                 // shot delay back).
                 bool sa = m_stick_aim.load();
-                if (ImGui::Checkbox("Aim through the pad's right stick (instead of the mouse)", &sa)) m_stick_aim = sa;
-                hint("Used automatically when the game stops listening to the mouse. On by hand: slower shots (the shot delay comes back).");
+                if (ImGui::Checkbox("Aim through the pad's right stick (instead of the mouse)", &sa)) {
+                    m_stick_aim  = sa;
+                    m_stick_auto = false;
+                    note_stick_by_hand("F11 Debug > Hands and weapon");
+                }
+                hint("Used automatically when the game stops listening to the mouse. On by hand (not saved): slower shots (the shot delay comes back) "
+                     "and the game camera trails the head by several degrees, so things pop in at the edges of the view.");
+                int sr = m_stick_retry_s.load();
+                if (ImGui::SliderInt("Automatic stick aim: try the mouse again after", &sr, 0, 60, sr > 0 ? "%d s" : "never")) {
+                    m_stick_retry_s = sr;
+                    keep("aimstickretry", fmt::format("aimstickretry {}", sr));
+                }
+                hint("When the game ignored the mouse for a moment the mod aims with the stick; after this many seconds (trigger up) it tries "
+                     "the mouse again. 0 = stay on the stick for the session (the old way: a tester's trigger stopped working, 28 Oct).");
             }
             {
                 if (m_gun_still.load()) {
@@ -19204,7 +20581,29 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
                 }
                 hint("Measured from the game's own right hand on each weapon, a second after you take it out. Off: one grip point for all weapons "
                      "(the SMG and its hand then float about 16 cm ahead of your hand, the old way).");
+                v = m_gun_axes.load();
+                if (ImGui::Checkbox("Each gun lies along your controller by its own axes (barrel forward, top up)", &v)) m_ui_cmds += v ? "gunaxes on\n" : "gunaxes off\n";
+                hint("gunaxes: each gun's angle in your hand comes from the gun's own model (its barrel, or its sight line once read), about the "
+                     "game's right hand on it, so no gun is held turned or tilted, pistols included. Bows, launchers and melee weapons keep "
+                     "the game's pose. Off: the angle learned from the game's animation standing still (before 29 Oct).");
+                v = m_weapon_id_split.load();
+                if (ImGui::Checkbox("Tell apart big guns whose model is split in pieces", &v)) m_ui_cmds += v ? "weaponidsplit on\n" : "weaponidsplit off\n";
+                hint("weaponidsplit: a weapon is known by its largest piece; some big guns share a 65535-index piece, so they shared one id (one "
+                     "pose, one sight, one scope). On (default): such a gun is known by its next largest piece. Its settings are learned again once.");
                 if (const uint32_t ws = m_weapon_sig.load(); ws != 0) {
+                    if (m_gun_axes.load()) {
+                        v = !gun_axes_game(ws);
+                        if (ImGui::Checkbox(fmt::format("The weapon in your hand (id {}) lies by its own axes: {}###gunaxeshand", ws, gun_axes_status()).c_str(), &v)) {
+                            {
+                                std::lock_guard _{ m_weapon_cal_mtx };
+                                if (v) m_gun_axes_game.erase(ws);
+                                else m_gun_axes_game.insert(ws);
+                            }
+                            const std::string line = gun_axes_game_line();
+                            keep("gunaxesgame", line);
+                        }
+                        hint("Untick for a gun that looks wrong held by its axes: it then keeps the angle learned from the game. The setting is kept for each gun.");
+                    }
                     v = !two_hand_blocked(ws);
                     if (ImGui::Checkbox(fmt::format("The weapon in your hand (id {}) can be held with two hands", ws).c_str(), &v)) {
                         {
@@ -19298,6 +20697,16 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
             hint("On (default since 25 Oct): where a nearer surface sits right beside the rebuild's starting point (a wire, a fence rail, a car's "
                  "pillar or mirror arm, the gun's sight), the rebuild also tries from there, so thin things the coarse grid missed are kept. "
                  "Command afwrail on/off.");
+            v = m_afw_foliage.load();
+            if (ImGui::Checkbox("AFW: trees and grass steady (no shimmer)", &v)) { m_afw_foliage = v; keep("afwfoliage", v ? "afwfoliage on" : "afwfoliage off"); }
+            hint("On (default since 29 Oct): the eye rebuilt this frame keeps its own needles, leaves and grass blades. Off: as before, the rebuild "
+                 "took them for moved (the other eye sees past them, between the needles) and showed what is behind them, the tree's dark inside, "
+                 "every other frame: foliage shimmered. With the AFW debug tint, the kept plants are pink. Command afwfoliage on/off.");
+            v = m_afw_copies.load();
+            if (ImGui::Checkbox("AFW: weapons on the body and the pouch drawn for each eye", &v)) { m_afw_copies = v; keep("afwcopies", v ? "afwcopies on" : "afwcopies off"); }
+            hint("On (default since 29 Oct): the weapons the mod draws on the sling, on the hip or in the hand during a switch, the throwable on the "
+                 "chest or in the hand and the pouch are drawn for the rebuilt eye too, like the weapon in hand. Off: as before, only the eye drawn "
+                 "this frame had them (they looked see-through). Needs 'hands and weapon drawn for each eye'. Command afwcopies on/off.");
             float vb = m_afw_veh_body.load();
             if (slider("AFW: vehicle cab carried with the car (m)", vb, 0.0f, 3.0f, vb <= 0.001f ? "off" : "%.1f m", 0.1f)) {
                 m_afw_veh_body = vb;
@@ -19401,12 +20810,7 @@ void FarCry5Stereo::draw_menu(int phase, bool* open, const std::function<void()>
         ImGui::EndChild();
         ImGui::EndTabItem();
     }
-    if (ImGui::BeginTabItem("Tests", nullptr, tab_flag(6))) {
-        tab_body_begin();
-        draw_tests_tab();
-        ImGui::EndChild();
-        ImGui::EndTabItem();
-    }
+    // The "Tests" tab (HEADSET_QUEUE's open checks with Pass / Fail / Unsure) was removed (Homard 30 Oct); HEADSET_QUEUE.md keeps the list.
     ImGui::EndTabBar();
 }
 
@@ -19439,97 +20843,6 @@ void FarCry5Stereo::prune_captures()
             }
         }
         if (removed) spdlog::info("[Probe] {} old capture files removed from {} (kept the newest 60, at most 3 GB)", removed, dir);
-    }
-}
-
-// F11 "Tests" tab: the open headset checks (bin\fc5vr_tests.txt, written from VRMod_dev\HEADSET_QUEUE.md by
-// tools\fc5_queue.ps1; one per line: id|check|where in F11|what good looks like|switches) with Pass / Fail / Unsure.
-// Each answer goes to bin\fc5vr_test_results.txt with the time and the current settings; Fail also starts the
-// stereo pair check and saves a picture of both eyes (snappair) for the builder.
-void FarCry5Stereo::draw_tests_tab()
-{
-    struct Item { std::string id, check, where, good, sw; };   // sw: "command opt1/opt2" (a switch the check needs)
-    static std::vector<Item>                     items;
-    static std::map<std::string, std::string>    answered;   // this session's answers, shown next to the item
-    static std::map<std::string, std::string>    tab_set;    // switches set from this tab this session
-    static auto                                  last_load = std::chrono::steady_clock::time_point{};
-    const auto                                   now       = std::chrono::steady_clock::now();
-    if (now - last_load > std::chrono::seconds(2)) {
-        last_load = now;
-        items.clear();
-        if (std::ifstream f{ fc5::mod_file("fc5vr_tests.txt") }; f) {
-            std::string line;
-            while (std::getline(f, line)) {
-                if (line.empty() || line[0] == '#') continue;
-                Item it;
-                std::stringstream ss{ line };
-                std::getline(ss, it.id, '|');
-                std::getline(ss, it.check, '|');
-                std::getline(ss, it.where, '|');
-                std::getline(ss, it.good, '|');
-                std::getline(ss, it.sw, '|');
-                if (!it.id.empty()) items.push_back(std::move(it));
-            }
-        }
-    }
-    ImGui::TextWrapped("Checks only the headset can settle. Try each one, then answer. Fail also saves a picture of both eyes and starts the stereo pair check.");
-    if (items.empty()) {
-        ImGui::TextDisabled("No open checks (bin\\fc5vr_tests.txt is missing or empty).");
-        return;
-    }
-    for (const auto& it : items) {
-        ImGui::Separator();
-        ImGui::TextWrapped("%s. %s", it.id.c_str(), it.check.c_str());
-        if (!it.where.empty()) ImGui::TextDisabled("Where: %s", it.where.c_str());
-        if (!it.good.empty()) ImGui::TextDisabled("Good: %s", it.good.c_str());
-        // The switches this check needs ("name a/b", several separated by ';'), right here: one button per
-        // setting (the same commands as fc5vr_cmd.txt).
-        std::stringstream sws{ it.sw };
-        for (std::string sw; std::getline(sws, sw, ';');) {
-            const auto sp = sw.find(' ');
-            if (sp == std::string::npos) continue;
-            const std::string base = sw.substr(0, sp);
-            std::stringstream opts{ sw.substr(sp + 1) };
-            ImGui::TextUnformatted("Switch:");
-            std::string opt;
-            while (std::getline(opts, opt, '/')) {
-                if (opt.empty()) continue;
-                ImGui::SameLine();
-                if (ImGui::Button(fmt::format("{} {}##sw{}{}", base, opt, it.id, opt).c_str())) {
-                    m_ui_cmds += base + ' ' + opt + '\n';
-                    tab_set[base] = base + ' ' + opt;
-                    spdlog::info("[Tests] item {}: switch '{} {}' from the Tests tab", it.id, base, opt);
-                }
-            }
-            ImGui::SameLine();
-            if (auto t = tab_set.find(base); t != tab_set.end()) ImGui::TextDisabled("(set here: %s)", t->second.c_str());
-            else if (auto p = m_persist.find(base); p != m_persist.end()) ImGui::TextDisabled("(now: %s)", p->second.c_str());
-            else ImGui::TextDisabled("(now: default)");
-        }
-        for (const char* verdict : { "Pass", "Fail", "Unsure" }) {
-            if (ImGui::Button(fmt::format("{}##t{}", verdict, it.id).c_str())) {
-                std::string settings;
-                for (const auto& [k, val] : m_persist) settings += val + "; ";
-                if (std::ofstream out{ fc5::mod_file("fc5vr_test_results.txt"), std::ios::app }; out) {
-                    const auto t  = std::time(nullptr);
-                    std::tm    tm{};
-                    localtime_s(&tm, &t);
-                    char ts[32]{};
-                    std::strftime(ts, sizeof ts, "%Y-%m-%d %H:%M:%S", &tm);
-                    out << ts << " | " << it.id << " | " << verdict << " | " << it.check << " | settings: " << settings << "\n";
-                }
-                answered[it.id] = verdict;
-                spdlog::info("[Tests] item {} answered {} ({})", it.id, verdict, it.check);
-                if (std::string{ verdict } == "Fail") {
-                    m_pair_check = true;
-                    m_snap_pair  = 2;
-                    spdlog::info("[Tests] item {} failed: stereo pair check on, both eyes saved (snappair)", it.id);
-                }
-            }
-            ImGui::SameLine();
-        }
-        if (auto a = answered.find(it.id); a != answered.end()) ImGui::TextDisabled("answered: %s", a->second.c_str());
-        else ImGui::NewLine();
     }
 }
 
@@ -20487,8 +21800,7 @@ bool FarCry5Stereo::set_game_patch(int which, bool on)
 glm::mat4 FarCry5Stereo::gun_steady(int frame, const glm::vec3& cam)
 {
     gun_still_pace(cam);   // speed and sprint, with or without a gun (emptyhandstill)
-    // skelhand: the game holds the gun itself (skelhand 3 with skelhandstill: at gunstill's pose, the correction going to the game's matrix)
-    return (m_gun_still.load() && (!skel_hand_active() || skel_hand_still())) ? gun_still(frame, cam) : glm::mat4{ 1.0f };
+    return m_gun_still.load() ? gun_still(frame, cam) : glm::mat4{ 1.0f };
 }
 
 // Steady view while shooting (F11 Weapon, cmd steadyview on|off): the eyes hang on the game camera's position,
@@ -20567,6 +21879,11 @@ void FarCry5Stereo::gun_anchor_apply(int frame, const glm::vec3& cam, const glm:
             if (m_mo.ctrl_valid) m_mo.ctrl_pos_world += d;
             if (m_mo.other_valid) m_mo.other_pos_world += d;
             if (m_mo.slung) m_mo.hand_pos_world += d;
+            if (m_mo.carry_valid) {   // sidearm: the copies on the sling and the hip go with the slung weapon
+                m_mo.sling_pos_world += d;
+                m_mo.hip_pos_world += d;
+            }
+            if (m_mo.chest_valid) m_mo.chest_pos_world += d;   // throwable: the chest copy too
             m_mo.draw_shift = want;
         }
         m_mo.muzzle_drawn = m_mo.barrel_origin + m_mo.draw_shift;
@@ -21547,7 +22864,7 @@ void WINAPI asm_hk_exec(ID3D11DeviceContext* ctx, ID3D11CommandList* cl, BOOL re
     call_orig<void>(g_asm_exec_hook, 58, ctx, cl, restore);
 }
 
-// skinposelog (FarCry5SkinPose.cpp): the palette writer's call order.
+// poseprobe: the palette writer's call order.
 namespace fc5::skinorder
 {
     bool install(const std::atomic<int>* frame)

@@ -22,6 +22,29 @@
 //    put back into the HUD panel image pixel for pixel (kPanel; Homard 23 Oct 10:33: drawn into each eye picture where the
 //    panel hangs, every second button icon of the truck's command list was missing). With DLSS upscaling (the panel composed
 //    into the eye picture before this pass) they are still drawn into the eye picture where the panel shows them.
+//  - hudmarkcap (Homard 29 Oct 14:50: "Some in-world hud elements were also very big (C4, some enemy marks)"; his headset
+//    picture: a red target reticle 10 deg wide next to a normal pickup label, its 28 texels each 14 pixels wide): the game draws
+//    a few markers several times bigger than the rest, so the common hudmarksize shrink left them huge. The grouping pass
+//    measures each marker's box as an angle through the game camera (times hudmarksize) and shrinks it further about its icon
+//    to hudmarkmax degrees; a lone icon that went to the panel only because it came after a prompt (the "rest of the call is
+//    HUD" rule) is limited the same way where the panel shows it. Its numbers come back a few calls later (the probe line).
+//  - hudmarkicon (Homard 29 Oct 16:00 in the headset with hudmarkcap: "marker were still big"; his log: 57-77 calls a second
+//    had a marker of 6-13 deg, all made 4 deg, the ordinary ones 1-4 deg with their text): the 4 deg limit is on the whole
+//    marker, icon and distance, so a big icon alone still came out 4 deg, twice an ordinary marker. The icon (the group's
+//    first box) is now measured on its own and kept to hudmarkicon degrees too; the larger of the two shrinks wins.
+//  - hudprim (Homard 30 Oct 12:29 F6: a white and a red chevron 8 deg wide on a rock, big pixel blocks): neither in the marker
+//    image nor on the panel, so none of the above touched them. They were two draws of the game's plain 2D primitive shader with
+//    a picture (#4BA2D4B5 CScenePrimitive + DiffuseSampler0, the HUD's samplers), painted straight into the eye picture at the
+//    game's screen size: each 115x93 eye pixels, one texel 6x6 pixels. Such draws now join the HUD (weapon_draw_impl), so they
+//    take the marker shrink and limits (or the panel's size) like the CSceneFireUi draws (hudmarksize 0.21: about 5 texels of
+//    the picture to one eye pixel, no longer magnified). A draw whose target is not the HUD image's size is left as it was.
+//  - hudprimcam (Homard 30 Oct 13:27 with hudprim: "a lot smaller, but only in one eye and not in the right place in the world"):
+//    those draws read the world camera's buffer (census pass M), which the mod fills with this eye's camera, so they landed in
+//    the marker image where this eye sees the enemy, not where the game camera does. Read as the game camera's picture, his F6
+//    showed the red pair ~20 deg up and right of the enemies: the blue objective marker went from marker pixel (1480,2066) to eye
+//    pixel (1800,1610), and the red chevron from (1790,1740) to (2290,1190), moved the same way; in the marker image the chevron sat
+//    near the enemy as the eye sees it, ~300 marker pixels from where the game camera saw it (by the blue marker). They now get a copy of the game's own
+//    upload of that buffer (hud_prim_cb_swap), so they are placed for the game camera like every other marker.
 #include "FarCry5Stereo.h"
 #include "FarCry5Record.h"
 #include "FarCry5Dlss.h"
@@ -55,7 +78,7 @@ namespace
 Texture2D<float4>         g_src    : register(t0);   // this eye's picture
 Texture2D<float4>         g_mul    : register(t1);   // multiplying HUD draws, white = no change
 Texture2D<float4>         g_mark   : register(t2);   // world markers, premultiplied
-StructuredBuffer<float4>  g_groups : register(t3);   // [0].x = markers; per marker: box (x0, y0, x1, y1), anchor (x, y), shown at (x, y), in marker pixels
+StructuredBuffer<float4>  g_groups : register(t3);   // [0].x = markers; per marker: box (x0, y0, x1, y1), anchor (x, y), shown at (x, y) and hudmarkcap's further shrink (z, >= 1), in marker pixels
 SamplerState              g_lin    : register(s0);
 RWTexture2D<float4>       g_dst    : register(u0);
 cbuffer P : register(b0) {
@@ -67,10 +90,10 @@ cbuffer P : register(b0) {
     float4 m[4];     // markers: rows of this eye's NDC -> the game camera's clip
     float4 msize;    // the marker image's size in pixels (x, y), 1 / scale (z), scaled (w)
 };
-float4 mark_at(float2 px)
+float4 mark_at(float2 px, float z)
 {
-    // A 2x2 box around the point (the markers are shrunk: about one marker pixel per eye pixel at 0.5).
-    float2 d = 0.25f * msize.z / msize.xy;
+    // A 2x2 box around the point (the markers are shrunk: about one marker pixel per eye pixel at 0.5); z = marker pixels per eye pixel.
+    float2 d = 0.25f * z / msize.xy;
     float2 c = px / msize.xy;
     return 0.25f * (g_mark.SampleLevel(g_lin, c + float2(-d.x, -d.y), 0) + g_mark.SampleLevel(g_lin, c + float2(d.x, -d.y), 0) +
                     g_mark.SampleLevel(g_lin, c + float2(-d.x, d.y), 0) + g_mark.SampleLevel(g_lin, c + float2(d.x, d.y), 0));
@@ -103,8 +126,12 @@ void main(uint2 p : SV_DispatchThreadID)
             float2 hp  = huv * msize.xy;
             uint   cnt = (uint)g_groups[0].x;
             for (uint j = 0; j < cnt; ++j) {
-                float4 b = g_groups[1 + 3 * j];
-                if (g_groups[2 + 3 * j].z != 0.0f && all(hp >= b.xy) && all(hp <= b.zw)) { k = g_mark.SampleLevel(g_lin, huv, 0); hint = true; break; }
+                float4 b  = g_groups[1 + 3 * j];
+                float4 an = g_groups[2 + 3 * j];
+                if (an.z == 0.0f) continue;
+                // hudmarkcap: a lone icon too big for the panel shrunk about its centre (1 = as the panel shows it).
+                float2 sp = an.xy + (hp - an.xy) * max(g_groups[3 + 3 * j].z, 1.0f);
+                if (all(sp >= b.xy) && all(sp <= b.zw)) { k = g_mark.SampleLevel(g_lin, sp / msize.xy, 0); hint = true; break; }
             }
         }
         if (!hint && g.w > 1e-6f) {
@@ -121,9 +148,10 @@ void main(uint2 p : SV_DispatchThreadID)
                     float4 b  = g_groups[1 + 3 * j];
                     float4 an = g_groups[2 + 3 * j];
                     if (an.z != 0.0f) continue;
-                    float2 sh = g_groups[3 + 3 * j].xy;
-                    float2 sp = an.xy + (gp - sh) * msize.z;
-                    if (all(sp >= b.xy) && all(sp <= b.zw)) { k = mark_at(sp); break; }
+                    float4 sh = g_groups[3 + 3 * j];
+                    float  z  = msize.z * max(sh.z, 1.0f);   // hudmarkcap: shrunk further when too big
+                    float2 sp = an.xy + (gp - sh.xy) * z;
+                    if (all(sp >= b.xy) && all(sp <= b.zw)) { k = mark_at(sp, z); break; }
                 }
             }
         }
@@ -150,15 +178,28 @@ void main(uint2 p : SV_DispatchThreadID)
     float4 c  = g_src.Load(int3(p, 0));
     float2 hp = float2(p) + 0.5f;
     bool   on = all_on != 0;
+    float  e  = 1.0f;     // hudmarkcap: a lone icon too big for the panel, shrunk e times about its centre
+    float2 sp = hp;
     if (!on) {
         uint cnt = (uint)g_groups[0].x;
         for (uint j = 0; j < cnt; ++j) {
-            float4 b = g_groups[1 + 3 * j];
-            if (g_groups[2 + 3 * j].z != 0.0f && all(hp >= b.xy) && all(hp <= b.zw)) { on = true; break; }
+            float4 b  = g_groups[1 + 3 * j];
+            float4 an = g_groups[2 + 3 * j];
+            if (an.z == 0.0f) continue;
+            float  ej = max(g_groups[3 + 3 * j].z, 1.0f);
+            float2 sj = an.xy + (hp - an.xy) * ej;
+            if (all(sj >= b.xy) && all(sj <= b.zw)) { on = true; e = ej; sp = sj; break; }
         }
     }
     if (on) {
-        float4 k = g_mark.Load(int3(p, 0));
+        float4 k;
+        if (e <= 1.0f) {
+            k = g_mark.Load(int3(p, 0));
+        } else {
+            float d = 0.25f * e;
+            k = 0.25f * (g_mark.Load(int3(int2(sp + float2(-d, -d)), 0)) + g_mark.Load(int3(int2(sp + float2(d, -d)), 0)) +
+                         g_mark.Load(int3(int2(sp + float2(-d, d)), 0)) + g_mark.Load(int3(int2(sp + float2(d, d)), 0)));
+        }
         c = k + c * (1.0f - saturate(k.a));
     }
     g_dst[p] = c;
@@ -184,18 +225,21 @@ void main(float4 pos : SV_Position)
     // marker just started when it touches that marker's icon (within the margin), else starts its own. A marker's anchor is
     // its first box's centre (the icon). hudmarksmooth: each anchor is followed as a world direction (camera-relative,
     // rotation only) from call to call, matched to the nearest followed one within the snap angle, eased toward the new
-    // direction over tau seconds (faster for bigger moves), and the marker is shown where that direction is now.
+    // direction over tau seconds (faster for bigger moves), and the marker is shown where that direction is now. hudmarkcap: each
+    // marker's box measured as an angle (times hudmarksize) and its further shrink written next to where it is shown; a group
+    // made of one icon that is screen-fixed only by the "rest of the call is HUD" rule is measured on the panel the same way.
     const char* kGroups = R"(
 Buffer<uint>                g_box   : register(t0);
 RWStructuredBuffer<float4>  g_out   : register(u0);
 RWStructuredBuffer<float4>  g_state : register(u1);   // 64 followed directions (xyz), calls since last matched (w; 1000 = free)
 cbuffer P : register(b0) {
-    uint n; float margin; uint smooth_on; uint pad0;
+    uint n; float margin; uint smooth_on; uint cap_world;   // cap_world: the game camera is known (world markers measured)
     float dt; float tau; float snap_cos; float follow;   // seconds, seconds, cos(snap angle), the move (rad) followed at once
-    float2 msize; float2 pad;
+    float2 msize; float cap; float size;                 // hudmarkcap: largest marker (rad, 0 = off), hudmarksize
     uint4 masks;    // slots drawn from the glyph atlas (x: 0-31, y: 32-63), slots whose icon is no marker's (z, w)
     float4 G[4];    // camera-relative position -> the game camera's clip (rows)
     float4 Gi[4];   // its inverse
+    float4 pnl;     // x: the panel's angle per marker pixel (rad), y: hudmarkicon, the largest icon (rad, 0 = off)
 };
 bool bit(uint2 m, uint i) { return ((i < 32 ? m.x >> i : m.y >> (i - 32)) & 1u) != 0; }
 float3 dir_of(float2 px)
@@ -226,6 +270,7 @@ void main()
     uint   cnt = 0;
     float4 lb = 0.0f, lf = 0.0f;
     bool   ls = false;
+    bool   ll = false;   // hudmarkcap: this group is one icon, screen-fixed only because it came after a prompt
     // The game draws the world markers first; from the first screen-fixed group on, the rest of the call is HUD (the vehicle
     // command list, prompts, the ammo counter in a vehicle), whatever its pictures look like (Homard 21 Oct 18:55 F6: the
     // command list's button icons start each line and were taken for markers, their labels with them).
@@ -243,6 +288,7 @@ void main()
                 if (!ls && (scr || !above)) { ls = true; hud = true; }
                 if (ls || !scr) {
                     lb = float4(min(lb.xy, b.xy), max(lb.zw, b.zw));
+                    ll = false;
                     continue;
                 }
             }
@@ -253,19 +299,24 @@ void main()
         if (!text && cnt > 0 && ls) {
             if (b.x - margin <= lb.z && b.z + margin >= lb.x && b.y - margin <= lb.w && b.w + margin >= lb.y) {
                 lb = float4(min(lb.xy, b.xy), max(lb.zw, b.zw));
+                ll = false;
                 continue;
             }
         }
         if (cnt > 0) g_out[1 + 3 * (cnt - 1)] = lb;
         g_out[2 + 3 * cnt] = float4(0.5f * (b.xy + b.zw), 0, 0);
-        if (cnt > 0) g_out[2 + 3 * (cnt - 1)].z = ls ? 1.0f : 0.0f;
+        g_out[3 + 3 * cnt] = float4(0.5f * (b.zw - b.xy), 0, 0);   // hudmarkicon: the icon's half size (read below, then replaced)
+        if (cnt > 0) { g_out[2 + 3 * (cnt - 1)].z = ls ? 1.0f : 0.0f; g_out[2 + 3 * (cnt - 1)].w = ll ? 1.0f : 0.0f; }
+        ll = !text && hud && !bit(masks.zw, i);
         lb = b; lf = b; ls = text || scr; hud = hud || ls; cnt++;
     }
-    if (cnt > 0) { g_out[1 + 3 * (cnt - 1)] = lb; g_out[2 + 3 * (cnt - 1)].z = ls ? 1.0f : 0.0f; }
-    g_out[0] = float4(cnt, 0, 0, 0);
+    if (cnt > 0) { g_out[1 + 3 * (cnt - 1)] = lb; g_out[2 + 3 * (cnt - 1)].z = ls ? 1.0f : 0.0f; g_out[2 + 3 * (cnt - 1)].w = ll ? 1.0f : 0.0f; }
     uint2 taken = 0;
+    float capped = 0.0f, big_w = 0.0f, big_p = 0.0f;   // hudmarkcap: markers made smaller, the largest in the world and on the panel (rad)
+    float big_i  = 0.0f;                                 // hudmarkicon: the largest icon in the world (rad)
     for (uint k = 0; k < cnt; ++k) {
         float4 an    = g_out[2 + 3 * k];
+        float2 ih    = g_out[3 + 3 * k].xy;   // the icon's half size
         float2 shown = an.xy;
         if (smooth_on != 0 && an.z == 0.0f) {
             float3 d    = dir_of(an.xy);
@@ -293,8 +344,32 @@ void main()
             float2 p;
             if (px_of(sm, p)) shown = p;
         }
-        g_out[3 + 3 * k] = float4(shown, 0, 0);
+        // hudmarkcap: how much smaller than hudmarksize this marker is shown (1 = not).
+        float  ext = 1.0f;
+        float4 bb  = g_out[1 + 3 * k];
+        if (an.z == 0.0f && cap_world != 0) {
+            float2 c  = 0.5f * (bb.xy + bb.zw);
+            float  aw = acos(saturate(dot(dir_of(float2(bb.x, c.y)), dir_of(float2(bb.z, c.y)))));
+            float  ah = acos(saturate(dot(dir_of(float2(c.x, bb.y)), dir_of(float2(c.x, bb.w)))));
+            float  a  = max(aw, ah) * size;
+            big_w = max(big_w, a);
+            if (cap > 0.0f && a > cap) ext = a / cap;
+            // hudmarkicon: the icon alone (the box's first draw, about the anchor).
+            float  iw = acos(saturate(dot(dir_of(an.xy - float2(ih.x, 0.0f)), dir_of(an.xy + float2(ih.x, 0.0f)))));
+            float  ii = acos(saturate(dot(dir_of(an.xy - float2(0.0f, ih.y)), dir_of(an.xy + float2(0.0f, ih.y)))));
+            float  ai = max(iw, ii) * size;
+            big_i = max(big_i, ai);
+            if (pnl.y > 0.0f && ai > pnl.y) ext = max(ext, ai / pnl.y);
+        } else if (an.z != 0.0f && an.w != 0.0f) {
+            float a = max(bb.z - bb.x, bb.w - bb.y) * pnl.x;
+            big_p = max(big_p, a);
+            if (cap > 0.0f && a > cap) ext = a / cap;
+        }
+        if (ext > 1.0f) capped += 1.0f;
+        g_out[3 + 3 * k] = float4(shown, ext, 0);
     }
+    // x: the count, with the largest panel icon (deg / 100) as its fraction (every reader takes the count as (uint) / (int)).
+    g_out[0] = float4(cnt + min(degrees(big_p), 99.0f) / 100.0f, capped, degrees(big_w), degrees(big_i));
     if (smooth_on != 0) {
         for (uint s3 = 0; s3 < 64; ++s3) {
             if (!taken_at(taken, s3)) g_state[s3].w = min(g_state[s3].w + 1.0f, 1000.0f);
@@ -313,12 +388,13 @@ void main()
         float msize[4];
     };
     struct GroupCb {
-        UINT  n; float margin; UINT smooth_on; UINT pad0;
+        UINT  n; float margin; UINT smooth_on; UINT cap_world;
         float dt, tau, snap_cos, follow;
-        float msize[2]; float pad[2];
+        float msize[2]; float cap; float size;   // hudmarkcap: largest marker (rad, 0 = off), hudmarksize
         UINT  masks[4];   // text slots (0-31, 32-63), slots whose icon is no marker's (0-31, 32-63)
         float G[16];
         float Gi[16];
+        float pnl[4];     // the panel's angle per marker pixel (rad), hudmarkicon (rad, 0 = off)
     };
 
     struct PanelCb { UINT w, h, all_on, pad; };
@@ -373,6 +449,10 @@ void main()
     int                        g_dumps_left = 0;                    // hudmarkdump N (off by default: the read-backs stall the frame)
     std::chrono::steady_clock::time_point g_dump_last{};
     std::chrono::steady_clock::time_point g_last_group{};
+    // hudmarkcap: the groups' first element (markers + largest on the panel / 100, made smaller, largest in the world, largest icon) copied each call and
+    // read two calls later without waiting (for the probe line).
+    ID3D11Buffer*              g_cap_stage[3]{};
+    int                        g_cap_frame[3]{ -1, -1, -1 };
     // hudmarklog N (test): one marker's direction in the world per call, as found and as shown (read back a call later).
     ID3D11Buffer*              g_log_stage[2]{};
     glm::mat4                  g_log_ginv[2]{};
@@ -560,7 +640,7 @@ void FarCry5Stereo::hud_mark_box_draw(ID3D11DeviceContext* ctx)
         g_box_text = 0;
         g_box_hint = 0;
     }
-    if (std::abs(m_hud_mark_size.load() - 1.0f) < 0.01f && m_hud_mark_smooth.load() <= 0.0f) return;
+    if (std::abs(m_hud_mark_size.load() - 1.0f) < 0.01f && m_hud_mark_smooth.load() <= 0.0f && !m_hud_mark_cap.load()) return;
     // A draw with no box is drawn into the marker image but belongs to no marker or hint, so it is never shown (the instanced
     // draws went this way until 23 Oct: the prompts' button pictures; Homard 23 Oct 08:54: "button prompt were still not
     // working"). Counted in the probe line.
@@ -679,6 +759,41 @@ void FarCry5Stereo::hud_mark_log(ID3D11DeviceContext* ctx, const glm::mat4& ginv
     if (--m_hud_mark_log <= 0) g_log_have = false;   // the next log picks its marker afresh
 }
 
+// hudmarkcap: this call's numbers (the groups' first element) copied out; the copy of two calls before read if it is ready
+// (no wait), and the largest marker sizes kept for the probe line.
+void FarCry5Stereo::hud_mark_cap_read(ID3D11DeviceContext* ctx)
+{
+    if (!g_cap_stage[0]) {
+        ID3D11Device* dev = nullptr;
+        ctx->GetDevice(&dev);
+        if (!dev) return;
+        D3D11_BUFFER_DESC bd{};
+        bd.ByteWidth = 16; bd.Usage = D3D11_USAGE_STAGING; bd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED; bd.StructureByteStride = 16;
+        for (auto*& s : g_cap_stage) if (!s) dev->CreateBuffer(&bd, nullptr, &s);
+        dev->Release();
+        if (!g_cap_stage[0] || !g_cap_stage[1] || !g_cap_stage[2]) return;
+    }
+    const int fr = m_frame.load();
+    const int i  = ((fr % 3) + 3) % 3;
+    const int j  = (i + 1) % 3;   // written two calls ago
+    if (g_cap_frame[j] >= 0) {
+        D3D11_MAPPED_SUBRESOURCE m{};
+        if (SUCCEEDED(call_orig<HRESULT>(m_map_hook, 14, ctx, g_cap_stage[j], 0, D3D11_MAP_READ, (UINT)D3D11_MAP_FLAG_DO_NOT_WAIT, &m))) {
+            const float* f = static_cast<const float*>(m.pData);
+            if (f[1] > 0.0f) m_hud_cap_frames++;
+            m_hud_cap_world_max = std::max(m_hud_cap_world_max, f[2]);
+            m_hud_cap_icon_max  = std::max(m_hud_cap_icon_max, f[3]);
+            m_hud_cap_panel_max = std::max(m_hud_cap_panel_max, 100.0f * (f[0] - std::floor(f[0])));
+            call_orig<void>(m_unmap_hook, 15, ctx, g_cap_stage[j], 0);
+        }
+        g_cap_frame[j] = -1;
+    }
+    const D3D11_BOX box{ 0, 0, 0, 16, 1, 1 };
+    ctx->CopySubresourceRegion(g_cap_stage[i], 0, 0, 0, 0, g_group_buf, 0, &box);
+    g_cap_frame[i] = fr;
+}
+
 void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* eye)
 {
     if (!ctx || !eye || m_menu_screen_on || m_hud_mode.load() != 1) return;
@@ -717,7 +832,8 @@ void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* ey
     // Scaled or smoothed markers: this call's boxes, all of its marker draws boxed.
     const float size   = std::clamp(m_hud_mark_size.load(), 0.2f, 2.0f);
     const float smooth = std::clamp(m_hud_mark_smooth.load(), 0.0f, 1.0f);
-    const bool  scaled = mark_on && (std::abs(size - 1.0f) >= 0.01f || smooth > 0.0f) && g_box_call == fr && g_box_used > 0 && !g_box_over;
+    const bool  cap_on = m_hud_mark_cap.load();
+    const bool  scaled = mark_on && (std::abs(size - 1.0f) >= 0.01f || smooth > 0.0f || cap_on) && g_box_call == fr && g_box_used > 0 && !g_box_over;
     if (mark_on) {
         // This eye's NDC -> world direction (rotation-only camera) -> the game camera's clip (all zero without them: no point
         // in front of the game camera, no world marker drawn).
@@ -784,6 +900,12 @@ void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* ey
         gc.follow    = glm::radians(3.0f);
         gc.msize[0]  = cb.msize[0];
         gc.msize[1]  = cb.msize[1];
+        gc.cap_world = mark_world ? 1u : 0u;
+        gc.cap       = cap_on ? glm::radians(std::clamp(m_hud_mark_max.load(), 1.0f, 20.0f)) : 0.0f;
+        gc.size      = size;
+        // The panel: hudscale wide at huddist across the panel image's width (the marker image has its size).
+        gc.pnl[0]    = cb.msize[0] > 0.0f ? 2.0f * std::atan(cb.panel[0]) / cb.msize[0] : 0.0f;
+        gc.pnl[1]    = cap_on ? glm::radians(std::clamp(m_hud_mark_icon.load(), 0.5f, 10.0f)) : 0.0f;   // hudmarkicon
         const glm::mat4 gi = mark_world ? glm::inverse(game_vrp) : glm::mat4(1.0f);
         for (int r = 0; r < 4; ++r)
             for (int c = 0; c < 4; ++c) { gc.G[r * 4 + c] = game_vrp[c][r]; gc.Gi[r * 4 + c] = gi[c][r]; }
@@ -802,6 +924,7 @@ void FarCry5Stereo::hud_world_draw(ID3D11DeviceContext* ctx, ID3D11Texture2D* ey
         ctx->CSSetShaderResources(0, 1, &null_srv);
         ctx->CSSetUnorderedAccessViews(0, 2, null_uav, nullptr);
         if (m_hud_mark_log.load() > 0 && mark_world) hud_mark_log(ctx, gi, cb.msize[0], cb.msize[1]);
+        if (cap_on) hud_mark_cap_read(ctx);
         // hudmarkdump: a call with many marker draws (control hints on screen) logs every draw's box, texture and shader and
         // the groups made of them, a call later, and the call after it is scanned (hudscan).
         if (g_dump_frame >= 0 && g_dump_stage) {

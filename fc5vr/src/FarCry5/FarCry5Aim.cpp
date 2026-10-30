@@ -17,13 +17,13 @@ cbuffer R : register(b0) {
     float4 org;              // ray origin, camera-relative (xyz)
     float4 dir;              // ray direction (xyz), depth a (w)
     float4 prm;              // depth b, width, height, nearest scene depth counted (m: nearer is the gun)
-    float4 lim;              // first and last distance marched (m)
+    float4 lim;              // first and last distance marched (m); arc: gravity (z), time step (w)
 };
 float4 vsmain(uint id : SV_VertexID) : SV_Position { return float4(id == 1 ? 3.0 : -1.0, id == 2 ? -3.0 : 1.0, 0.5, 1.0); }
 float psmain(float4 pos : SV_Position) : SV_Target {
     float t = lim.x;
     [loop] for (int i = 0; i < 160; ++i) {
-        float3 p = org.xyz + dir.xyz * t;
+        float3 p = org.xyz + dir.xyz * t + float3(0.0, 0.0, -0.5 * lim.z * t * t);
         float4 c = float4(dot(r0.xyz, p) + r0.w, dot(r1.xyz, p) + r1.w, dot(r2.xyz, p) + r2.w, dot(r3.xyz, p) + r3.w);
         if (c.w > 0.05) {
             float2 n = c.xy / c.w;
@@ -36,8 +36,8 @@ float psmain(float4 pos : SV_Position) : SV_Target {
                 }
             }
         }
-        t *= 1.045;
-        t += 0.02;
+        if (lim.z > 0.0) t += lim.w;
+        else { t *= 1.045; t += 0.02; }
         if (t > lim.y) break;
     }
     return -1.0;
@@ -47,7 +47,7 @@ float psmain(float4 pos : SV_Position) : SV_Target {
     ID3D11VertexShader*       g_vs{ nullptr };
     ID3D11PixelShader*        g_ps{ nullptr };
     ID3D11Buffer*             g_cb{ nullptr };
-    // Two marches with their own results: 0 the barrel ray, 1 meleeswing's hand-motion ray.
+    // Marches with their own results: 0 the barrel ray, 1 meleeswing's hand-motion ray, 2 throwv2's trajectory.
     struct Chan
     {
         ID3D11Texture2D*        rt{ nullptr };
@@ -60,7 +60,7 @@ float psmain(float4 pos : SV_Position) : SV_Target {
         int                     since_n{ 0 };
         float                   since_min{ -1.0f };
     };
-    Chan                      g_ch[2]{};
+    Chan                      g_ch[3]{};
     ID3D11ShaderResourceView* g_srv{ nullptr };
     ID3D11Texture2D*          g_srv_of{ nullptr };
     ID3DDeviceContextState*   g_state{ nullptr };
@@ -123,7 +123,7 @@ void march(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* depth, 
     if (depth == nullptr || !init(dev)) {
         return;
     }
-    auto& ch = g_ch[chan & 1];
+    auto& ch = g_ch[chan < 0 || chan > 2 ? 0 : chan];
     // Collect a finished result first (never wait on the GPU).
     for (int k = 0; k < 3; ++k) {
         const int s = (ch.slot + 1 + k) % 3;
@@ -165,7 +165,7 @@ void march(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* depth, 
     cb[4][0] = ray.origin_rel.x; cb[4][1] = ray.origin_rel.y; cb[4][2] = ray.origin_rel.z;
     cb[5][0] = ray.dir.x; cb[5][1] = ray.dir.y; cb[5][2] = ray.dir.z; cb[5][3] = ray.depth_a;
     cb[6][0] = ray.depth_b; cb[6][1] = float(dd.Width); cb[6][2] = float(dd.Height); cb[6][3] = ray.near_skip;
-    cb[7][0] = ray.start; cb[7][1] = ray.stop;
+    cb[7][0] = ray.start; cb[7][1] = ray.stop; cb[7][2] = ray.gravity; cb[7][3] = ray.tstep;
 
     ID3D11DeviceContext1*   ctx1 = nullptr;
     ID3DDeviceContextState* prev = nullptr;
@@ -201,17 +201,18 @@ void march(ID3D11Device* dev, ID3D11DeviceContext* ctx, ID3D11Texture2D* depth, 
     ch.slot             = (ch.slot + 1) % 3;
 }
 
-float last_hit(int chan) { return g_ch[chan & 1].last; }
+float last_hit(int chan) { return g_ch[chan < 0 || chan > 2 ? 0 : chan].last; }
 void  mark(int chan)
 {
-    auto& ch     = g_ch[chan & 1];
+    auto& ch     = g_ch[chan < 0 || chan > 2 ? 0 : chan];
     ch.mark_seq  = ch.seq;
     ch.since_n   = 0;
     ch.since_min = -1.0f;
 }
 float hit_since_mark(int chan, int& results)
 {
-    results = g_ch[chan & 1].since_n;
-    return g_ch[chan & 1].since_min;
+    const int c = chan < 0 || chan > 2 ? 0 : chan;
+    results     = g_ch[c].since_n;
+    return g_ch[c].since_min;
 }
 }
