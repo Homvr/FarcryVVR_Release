@@ -2,11 +2,13 @@
 # GitHub repository (it is not in this repository: NVIDIA's licence), and packages FC5VR_<release>.zip.
 # Every push to main: the zip as a build artifact. Run by hand with a release name (Actions > Build > Run workflow):
 # also a GitHub pre-release of that name, tagged on the built commit, with the zip and SHA256.txt attached.
+# Pushing a tag alpha_* does the same with the tag as the release name (title from release\RELEASE_TITLE_<tag>.txt).
 name: Build
 
 on:
   push:
     branches: [main]
+    tags: ['alpha_*']
   workflow_dispatch:
     inputs:
       release:
@@ -26,6 +28,9 @@ env:
   # against (the 3.7 API: nvsdk_ngx.h and nvsdk_ngx_helpers.h as on the builder's PC).
   DLSS_RUNTIME_TAG: v310.9.1
   DLSS_SDK_TAG: v3.7.10
+  # The release name: the Run workflow input, or the pushed tag (empty = build only).
+  REL_NAME: ${{ inputs.release || (github.ref_type == 'tag' && github.ref_name) || '' }}
+  REL_TITLE: ${{ inputs.title }}
 
 jobs:
   build:
@@ -61,9 +66,13 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $rel = if ('${{ inputs.release }}') { '${{ inputs.release }}' } else { "build_$($env:GITHUB_SHA.Substring(0, 7))" }
-          .\release\package.ps1 -Release $rel -Title '${{ inputs.title }}' -Commit $env:GITHUB_SHA.Substring(0, 7)
+          $rel = if ($env:REL_NAME) { $env:REL_NAME } else { "build_$($env:GITHUB_SHA.Substring(0, 7))" }
+          $title = $env:REL_TITLE
+          $tfile = "release\RELEASE_TITLE_$rel.txt"
+          if (-not $title -and (Test-Path $tfile)) { $title = (Get-Content $tfile -Raw).Trim() }
+          .\release\package.ps1 -Release $rel -Title $title -Commit $env:GITHUB_SHA.Substring(0, 7)
           "REL=$rel" >> $env:GITHUB_ENV
+          "TITLE=$title" >> $env:GITHUB_ENV
 
       - uses: actions/upload-artifact@v4
         with:
@@ -74,12 +83,12 @@ jobs:
             fc5vr/build/build-release-msvc/dxgi.pdb
 
       - name: Release
-        if: ${{ inputs.release != '' }}
+        if: ${{ env.REL_NAME != '' }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $notes = "release\RELEASE_NOTES_${{ inputs.release }}.md"
+          $notes = "release\RELEASE_NOTES_$($env:REL).md"
           if (-not (Test-Path $notes)) { $notes = 'CHANGELOG.md' }
-          $title = if ('${{ inputs.title }}') { 'Far Cry 5 VR ${{ inputs.title }}' } else { '${{ inputs.release }}' }
-          gh release create '${{ inputs.release }}' "out\FC5VR_${{ inputs.release }}.zip" out\SHA256.txt --target $env:GITHUB_SHA --title $title --notes-file $notes --prerelease
+          $title = if ($env:TITLE) { "Far Cry 5 VR $($env:TITLE)" } else { $env:REL }
+          gh release create $env:REL "out\FC5VR_$($env:REL).zip" out\SHA256.txt --target $env:GITHUB_SHA --title $title --notes-file $notes --prerelease
